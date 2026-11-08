@@ -6,17 +6,21 @@
 
 - 목표: 단일 사용자 decode **20~60 tok/s**, 품질은 FP4 원본 대비 최소 손실.
 - 제약: **클라우드 사용 금지**, **Windows 11에서 완결**(네이티브 + WSL2 허용).
-- 하드웨어 [확인]
+- 하드웨어 [확인, 2026-11-08 측정, `bench/`]
 
-| 자원 | 사양 | 실효 대역폭 |
+| 자원 | 사양 | 실측 |
 |---|---|---|
-| GPU | RTX 5080 16GB, PCIe 5.0 x16, NVFP4 | VRAM 약 900GB/s, PCIe 약 50GB/s [추정] |
-| RAM | 96GB (16+32 혼합 4장) DDR5-4200 듀얼채널 | 약 55~60GB/s [추정, Phase 0 측정] |
-| CPU | Ryzen 7 9800X3D 8C/16T, AVX-512, L3 96MB | 단일 CCD 읽기 상한 약 64GB/s [추정] |
-| SSD | Solidigm P44 Pro 2TB (C:, 여유 753GB) | 약 7GB/s 순차 |
-| 기타 | H: 150GB ReFS 가상 디스크(프로젝트), D: HDD, WSL2 Ubuntu 24.04, CUDA 13.4 | |
+| GPU | RTX 5080 16GB, PCIe 5.0 x16, NVFP4 | VRAM 복사 758GB/s(읽기+쓰기 합산), 화면 연결 상태 가용 14.6GiB |
+| PCIe | pinned | H2D/D2H 56GB/s (1MiB 이상), 64KiB는 10~12GB/s, pageable 16.7GB/s |
+| 동기화 | WDDM | launch+sync 9.4µs, 40KiB 왕복+sync 14.4µs, **mapped 메모리 ping-pong 1.1µs** |
+| RAM | 96GB (16+32 혼합 4장) DDR5-4200 듀얼채널 | CPU 읽기 **50~54GB/s** (1스레드도 50, CCD 연결 상한), 쓰기 28GB/s |
+| RAM 동시 | CPU 읽기 + H2D DMA | **합계 58~59GB/s** (CPU 27~28 + DMA 31) |
+| CPU | Ryzen 7 9800X3D 8C/16T, AVX-512 | L3 읽기 743GB/s (8스레드) |
+| SSD | Solidigm P44 Pro 2TB (C:, 여유 753GB) | 순차 7.4GB/s, 4KiB 랜덤 QD1 1.45만 / QD32 53만 IOPS |
+| pinned 한도 | Windows | 48GiB 할당 성공 (탐색 상한까지) |
+| 기타 | H:는 `C:\devdrive.vhdx`(ReFS Dev Drive, C:와 공간 공유), D: HDD, WSL2 Ubuntu 24.04, CUDA 13.4, VS 18 | |
 
-**전체 병목은 RAM 대역폭이다.** RAM→GPU DMA도 같은 대역폭을 소비하므로 expert의 GPU 승격은 재사용될 때만 이득이다.
+**전체 병목은 RAM 대역폭이다.** CPU 코어만으로는 50GB/s에서 막히지만 DMA는 IO die에서 DRAM을 직접 읽어 56GB/s가 나오고, 둘을 섞으면 합계 58~59GB/s까지 올라간다. 따라서 R7 스케줄러는 CPU 계산과 GPU 승격을 섞어서 DRAM을 채우는 것을 목표로 한다. 측정 당시 백그라운드 앱이 RAM 약 29GB를 점유하고 있었으므로 실행 시에는 정리가 필요하다.
 
 ## 2. 모델 사실
 
@@ -26,14 +30,15 @@
 - [확인] KV 원천 층 `[2, 8, 14, 20]`, Engram 층 `[1, 14]`, MTP 3층(DSpark: block 5, 128 experts top-3, markov head).
 - [추정] expert 1개 35.4M → routed 총 543.6B. decode 토큰당 routed 8.5B + 상시(attention·shared·head) 약 7B ≈ 15.6B.
 - [추정] prefill은 앞쪽 약 20층만 필요(YOCO식 KV 재사용).
-- [추정] Engram 테이블 약 200GB, 토큰 id로 주소 결정, 토큰당 약 12KB 조회.
+- [확인] 샤드 구성: 층마다 7.4GB 샤드 1개(dense+routed, 총 296GB), Engram 2개(층 1, 14, 각 101.5GB, 총 203GB), MTP 7.9GB, vision 2.3GB, embed/head 각 1.3GB.
+- [추정] Engram 행 하나가 약 264B(FP8 256차원 + scale). 토큰당 수십 회 4KiB 랜덤 읽기 → QD32에서 0.1ms 수준.
 
 ## 3. 메모리 계층
 
 ```
 GPU 16GB : 상시 경로(NVFP4/3bit) ~3.8GB · DSpark ~2.5GB · hot expert 캐시 ~6.5GB · KV/작업 ~1.5GB
 RAM 96GB : 압축 routed expert 전체 (Plan C 약 50GB) · codebook/LUT는 L3 상주
-SSD (C:) : Engram 원본 그대로 · FP4 원본(teacher, 압축 원천)
+SSD (C:) : 압축 Engram · student 파일 (FP4 원본은 Pass 1 중에만 샤드 단위로 존재, 8.1절)
 ```
 - 화면 출력은 메인보드(내장 Radeon)에 연결해 5080 VRAM을 전부 확보한다.
 
@@ -56,7 +61,7 @@ SSD (C:) : Engram 원본 그대로 · FP4 원본(teacher, 압축 원천)
 
 | ID | 내용 | 비용 [추정] |
 |---|---|---|
-| L0 | Teacher 데이터 생성: FP4 원본을 SSD에서 큰 배치로 스트리밍해 top-k logit 저장 | 패스당 약 45~60s, 패스당 16~32K 토큰 → 하루 수천만 토큰 |
+| L0 | Teacher 데이터 생성: Pass 1(8.1절)에서 층 단위로 N 토큰을 통과시켜 top-k logit 저장 | N=50만 기준 hidden state 40GB, logit 1GB 미만 |
 | L2 | 다층 슬라이딩 블록 증류 (연속 2~4층 공동 최적화) | 층당 원본 약 14GB, 로컬 가능 |
 | L4 | **오프로딩 end-to-end 증류**: 학생(약 50GB)을 RAM에 두고 층 단위로 GPU에 흘려 codebook·scale·Q4 보정항만 KL로 학습 | 스텝당 수~수십 초, 하루 수천만 토큰 규모. Phase 1에서 실측 |
 | L3 | DSpark drafter 도메인 자기 증류 (채택률 향상, 무손실) | drafter만 학습, 로컬 가능 |
@@ -100,16 +105,45 @@ L4가 클라우드 증류를 대신하는 품질의 핵심 지렛대다. 비용 
 - **OS 설정**: HAGS 켜기, "메모리에 페이지 잠금" 권한 + `MEM_LARGE_PAGES`, 고성능 전원 계획, 스레드 고정(`SetThreadAffinityMask`), 모델 폴더 Defender 실시간 검사 제외.
 - **I/O**: Engram은 IoRing 또는 unbuffered overlapped I/O.
 - **동기화**: T2 메가커널로 WDDM 지연을 상쇄한다.
-- **저장 위치**: 모델 원본은 C:(NVMe)에 둔다. H:는 150GB라 코드와 소형 산출물만 둔다. 원본 510GB를 받으면 C: 여유가 약 243GB로 줄어드므로 압축 산출물과 teacher 데이터 용량을 관리해야 한다.
+- **저장 위치**: 모델 관련 파일은 C:(NVMe)에 둔다. H:도 같은 NVMe 위의 VHDX라 공간을 공유한다. 원본 510GB를 통째로 받지 않는다(8.1절).
+- **다운로드**: HF 파일은 CDN(`us.aws.cdn.hf.co`)에서 내려받는데, Claude 샌드박스에서는 이 호스트 접속이 막혀 있다. 다운로드 단계는 사용자가 직접 실행하거나 샌드박스 해제 승인이 필요하다.
+
+## 8.1 디스크 최소화 파이프라인
+
+원칙: **원본은 샤드 단위로 받아 처리하고 바로 지운다.** 한 번의 순차 패스(Pass 1)에서 teacher 계산, 라우팅 통계, 압축을 모두 끝낸다.
+
+1. embed → 층 0 → … → 층 39 → head → MTP 순서로 샤드를 받는다. 다음 샤드는 처리 중에 미리 받는다.
+2. 층 L마다 다음을 수행한다.
+   - 보정 토큰 N개의 teacher hidden state를 층 L에 통과시킨다.
+   - 라우팅 통계(빈도, 연속 재사용률, gate 분포, 다음 층 예측 정확도)를 기록한다.
+   - 층 L을 압축한다(C1~C5, Q1, Q4, L2). 입력은 teacher 스트림과 student 스트림을 모두 쓴다.
+   - student 층을 저장하고 원본 샤드를 지운다.
+3. Engram 샤드는 해당 층(1, 14) 차례 전에 받는다. 4bit 또는 2bit로 양자화하고(필요하면 사용 빈도 기반 행 정리), 원본을 지운다. 품질은 같은 패스에서 FP8 대비 KL로 확인한다.
+4. 마지막 층 다음에 teacher top-k logit(N 토큰)을 저장한다. L4 증류는 이것만으로 진행한다.
+
+층 사이의 의존성(KV 원천 층 2/8/14/20, indexer, candidate 층 20)도 hidden state와 함께 보관해야 한다. 크기는 작다.
+
+| 항목 | 용량 [추정] |
+|---|---|
+| hidden state (mHC 4×5120 bf16) | 토큰당 40KB. N=50만이면 스트림당 20GB, teacher+student 40GB. RAM 우선, 넘치면 디스크 |
+| 처리 중인 층 샤드 + 미리 받는 샤드 | 약 15GB |
+| Engram 원본 1개 (처리 중) | 101.5GB |
+| **피크** | Engram 14층 처리 시점 약 200~230GB |
+| **최종** | student expert 약 50GB + dense/attention 약 4GB + MTP 약 3GB + Engram 55~105GB → **약 110~160GB** |
+
+대가:
+- 압축 설정을 처음부터 다시 하려면 원본을 다시 받아야 한다(디스크 대신 네트워크 비용).
+- L4에 쓰는 teacher 토큰 수가 Pass 1의 N으로 제한된다. 부족하면 Pass 2(재다운로드)로 늘린다.
+- 층당 압축 계산 시간(특히 벡터 양자화 탐색)이 길 수 있다. 층 0에서 실측하고 N과 기법을 조정한다.
 
 ## 9. 속도 추산 [추정]
 
 | | Plan A | Plan B | **Plan C** |
 |---|---|---|---|
 | 평균 bpw | 1.6 | 0.8 | 약 0.9 (사용 빈도 가중) |
-| 예상 tok/s | 약 40 | 약 60~70 | **약 50~75** |
+| 예상 tok/s | 약 35~40 | 약 55~65 | **약 45~70** |
 
-전제: RAM 55GB/s, GPU 캐시 적중 35~45%, DSpark 단계당 약 3토큰 채택. 모두 Phase 0 측정 전 가설이다.
+전제: RAM은 실측값(CPU 50GB/s, CPU+DMA 혼합 58GB/s), GPU 캐시 적중 35~45%, DSpark 단계당 약 3토큰 채택. 대역폭은 측정이 끝났고, 적중률과 채택률은 Pass 1 라우팅 통계 전까지 가설이다. 동기화 비용은 launch+sync 9.4µs × 토큰당 약 80회 ≈ 0.75ms로 예상보다 작았고, T2 메일박스(1.1µs)로 더 줄일 수 있다.
 
 ## 10. 평가 기준
 
@@ -122,7 +156,7 @@ L4가 클라우드 증류를 대신하는 품질의 핵심 지렛대다. 비용 
 1. 1bit 미만 품질 붕괴 → Q1 배분 + L4 증류로 완화, 실패 시 Plan A로 후퇴.
 2. 신규 아키텍처(mHC, CSA2, Engram, DSpark)를 직접 구현 → 모듈별로 레퍼런스와 출력 일치 테스트를 먼저 만든다.
 3. 적중률·CPU 커널 효율·채택률 가정이 틀릴 수 있음 → Phase 0 측정으로 확정.
-4. 디스크 여유 부족 → 산출물 용량 예산을 Phase 0에서 확정.
+4. 디스크 → 8.1절 스트리밍 파이프라인으로 피크 약 200~230GB, 최종 약 110~160GB. Engram 양자화 품질이 나쁘면 최종 용량이 최대 203GB 늘어난다.
 
 ## 12. 단계
 

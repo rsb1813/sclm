@@ -7,16 +7,20 @@
 - [x] 설계 문서 작성 (design.md)
 
 ## Phase 0 — 측정
-- [ ] RAM 실효 대역폭 측정 (읽기, 단일 CCD 상한 확인)
-- [ ] PCIe H2D/D2H 대역폭과 pinned 메모리 할당 한도 측정 (Windows)
-- [ ] SSD 순차·랜덤 읽기 측정 (C:)
-- [ ] 내장 그래픽으로 화면 출력 전환, 5080 가용 VRAM 확인
+- [x] RAM 실효 대역폭 측정 (CPU 50~54GB/s, CCD 상한 확인)
+- [x] CPU 읽기 + DMA 동시 대역폭 측정 (합계 58~59GB/s)
+- [x] PCIe H2D/D2H 대역폭과 pinned 메모리 할당 한도 측정 (56GB/s, 48GiB 성공)
+- [x] CPU-GPU 동기화 지연 측정 (launch+sync 9.4µs, mapped ping-pong 1.1µs)
+- [x] SSD 순차·랜덤 읽기 측정 (7.4GB/s, QD32 53만 IOPS)
+- [ ] 내장 그래픽으로 화면 출력 전환, 5080 가용 VRAM 재확인 (사용자 작업)
 - [ ] PyTorch가 지원하는 Python 버전으로 venv 구성 (현재 시스템 Python 3.14.6)
-- [ ] 모델 원본 다운로드 위치 확정 (C:) 및 용량 예산 작성
-- [ ] 원본 510GB 다운로드
-- [ ] safetensors 헤더로 텐서 shape 확인 (attention 파라미터 수, Engram 크기 추정 검증)
+- [x] 디스크 용량 예산 작성 (design.md 8.1, 피크 약 200~230GB)
+- [x] 샤드 구성 확인 (층당 7.4GB, Engram 203GB)
+- [ ] 다운로드 방식 결정 (CDN이 샌드박스에서 차단됨 → 사용자 실행 또는 승인)
+- [ ] 샤드 하나(층 0)만 받아 텐서 shape 확인 (attention 파라미터 수 검증)
 - [ ] HF transformers 구현 확인 (Windows 네이티브 동작 여부, FP4 expert 처리 경로)
-- [ ] 층 단위 오프로딩 레퍼런스 실행, 기준 logits 생성
+- [ ] 층 단위 레퍼런스 실행 코드 작성 (Pass 1 골격, 층 간 KV/indexer 의존성 포함)
+- [ ] 층 0에서 압축 계산 시간 실측, N과 기법 조정
 - [ ] 평가 세트 고정 (도메인 프롬프트)
 - [ ] 라우팅 로그 수집: expert 빈도 편중, 연속 토큰 재사용률, 다음 층 예측 정확도, gate 분포
 - [ ] 측정값으로 속도 추산(design.md 9절) 갱신
