@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+import weakref
 
 import numpy as np
 import torch
@@ -30,7 +31,9 @@ CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had"
            "proj256": ("proj", 256), "proj512": ("proj", 512),
            "proj512_in": ("proj", 512, "in"), "proj512_out": ("proj", 512, "out"),
            # per-expert bits from scripts/allocate_bits.py (data/alloc_<name>.json); 4 keeps the original FP4 expert
-           "alloc_2p75": ("alloc", "2p75")}
+           "alloc_2p75": ("alloc", "2p75"),
+           # GPTQ per expert from calibration sequences (GPTQExperts)
+           "gptq2": ("gptq", 2), "gptq3": ("gptq", 3)}
 
 
 class DenseFP4Linear(torch.nn.Module):
@@ -111,6 +114,97 @@ def quantize_experts_(block, bits, group: int, use_rot: bool, unbiased: bool = F
             del lin, w
 
 
+def rotate_h(h: torch.Tensor, rot: quant.BlockHadamard) -> torch.Tensor:
+    """R^T H R for Hessians [E, K, K] (the Hadamard basis the weights are quantized in)."""
+    from scripts.gptq_probe import rot_cols
+
+    return rot_cols(rot, rot_cols(rot, h).transpose(-1, -2))
+
+
+def gptq_unbiased(w: torch.Tensor, hr: torch.Tensor, bits: int, rot: quant.BlockHadamard):
+    """GPTQ of w [E, N, K] in the Hadamard basis under Hessians hr [E, K, K] already in that basis (rotate_h), rows
+    rescaled by the output shrinkage <w_hat, w>_H / <w, w>_H. Returns codes and steps (rotated basis) and the
+    dequantized weight (original basis)."""
+    from scripts.gptq_probe import rot_cols
+
+    wr = rot_cols(rot, w)
+    codes, steps = quant.gptq_codes(wr, hr, bits, 64)
+    wq = quant.rtn_dequant(codes, steps, bits, 64)
+    beta = (((wq @ hr) * wr).sum(-1) / ((wr @ hr) * wr).sum(-1)).clamp_min(0.05)
+    return codes, steps / beta[..., None], rot_cols(rot, wq / beta[..., None], inverse=True)
+
+
+class GPTQExperts:
+    """Collects a layer's FFN inputs and routing while the calibration batches pass, then, right before the first eval
+    batch, replaces its routed experts by GPTQ codes: Hadamard basis, per-expert gate^2-weighted X^T X mixed with the
+    layer covariance (beta), H-metric unbiasing. The calibration stream stays the uncompressed model's."""
+
+    def __init__(self, bits: int, n_cal: int, beta: float = 0.5, batch: int = 8):
+        self.bits, self.n_cal, self.beta, self.batch = bits, n_cal, beta, batch
+        self.block, self.store, self.cur, self.t0 = None, [], 0, time.time()
+        self.rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (5120, 2304)}  # quant_eval's usual seeds
+
+    def before_block(self, i: int, block) -> None:
+        self.layer, self.block, self.store = i, weakref.ref(block), []  # weak: the runner frees each block itself
+        block.ffn.gate.register_forward_hook(self.on_gate)
+
+    def on_gate(self, _mod, inp, out) -> None:
+        if self.cur < self.n_cal:
+            self.store.append((inp[0].detach().to(torch.bfloat16), out[0].float(), out[1]))
+
+    def before_batch(self, i: int, j: int) -> None:
+        self.cur = j
+        if j == self.n_cal:
+            self.quantize_(self.block())
+            self.store = []
+
+    def quantize_(self, block) -> None:
+        from scripts.gptq_probe import tr_norm
+        from scripts.quant_probe import SWIGLU_LIMIT
+
+        t0 = time.time()
+        xq = act_q(torch.cat([s[0] for s in self.store]))
+        gw = torch.cat([s[1] for s in self.store])
+        idx = torch.cat([s[2] for s in self.store]).long()
+        self.store = []
+        h_layer = tr_norm(xq.t() @ xq)
+        eye = torch.eye(2304, device=DEV, dtype=torch.float32)
+        experts = block.ffn.experts
+        experts.to("cpu")  # frees ~7GB of FP4 weights for the Hessians; each batch is copied back for its GPTQ
+        torch.cuda.empty_cache()
+        for e0 in range(0, len(experts), self.batch):
+            es = list(range(e0, min(e0 + self.batch, len(experts))))
+            toks = [torch.where(idx == e) for e in es]
+            w1, w2, w3 = (torch.stack([fp4_dense(getattr(experts[e], n).to(DEV)) for e in es])
+                          for n in ("w1", "w2", "w3"))
+            h1 = []
+            for rows, slot in toks:
+                xr = xq[rows]
+                h_e = tr_norm(xr.t() @ (gw[rows, slot].pow(2)[:, None] * xr)) if rows.numel() else h_layer
+                h1.append((1 - self.beta) * h_e + self.beta * h_layer)
+            h1 = rotate_h(torch.stack(h1), self.rots[5120])
+            c1, s1, q1 = gptq_unbiased(w1, h1, self.bits, self.rots[5120])
+            c3, s3, q3 = gptq_unbiased(w3, h1, self.bits, self.rots[5120])
+            del h1, w1, w3
+            h2 = []
+            for k, (rows, slot) in enumerate(toks):
+                if not rows.numel():
+                    h2.append(eye)
+                    continue
+                xr = xq[rows]
+                g, u = xr @ q1[k].t(), (xr @ q3[k].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+                hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[rows, slot, None])
+                h2.append((1 - self.beta) * tr_norm(hid.t() @ hid) + self.beta * eye)
+            c2, s2, _ = gptq_unbiased(w2, rotate_h(torch.stack(h2), self.rots[2304]), self.bits, self.rots[2304])
+            del h2, w2, q1, q3
+            for k, e in enumerate(es):
+                for name, c, st, rot in (("w1", c1, s1, 5120), ("w2", c2, s2, 2304), ("w3", c3, s3, 5120)):
+                    setattr(experts[e], name, quant.RTNLinear.from_codes(c[k], st[k], self.bits, 64, self.rots[rot]))
+        print(f"gptq layer {self.layer:2d}: {xq.size(0)} calib tokens, {time.time() - t0:.0f}s, "
+              f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB, total {(time.time() - self.t0) / 60:.0f} min",
+              flush=True)
+
+
 def freeze_routing_(block, layer: int, ref_idx: list, cur: dict) -> None:
     """Make the gate pick the reference model's experts (from data/routing_v1.npz) while computing their weights from
     its own scores, so routing flips caused by upstream error are removed and only expert-output error remains."""
@@ -156,6 +250,8 @@ def main() -> None:
         with open(os.path.join(DATA, f"alloc_{cfg[1]}.json")) as f:
             alloc = json.load(f)["bits"]
         before_block = lambda i, block: quantize_experts_(block, alloc[i], 64, True, True)  # noqa: E731
+    elif isinstance(cfg, tuple) and cfg[0] == "gptq":
+        before_block = None  # set below with the calibration batches
     else:
         before_block = (lambda i, block: quantize_experts_(block, *cfg)) if cfg else None
     t0 = time.time()
@@ -185,7 +281,17 @@ def main() -> None:
         def before_batch(i, j):
             cur["batch"] = j
 
-    hidden = runner.hidden_batches(list(seqs.split(2)), before_block=before_block, before_batch=before_batch)
+    batches = list(seqs.split(2))
+    n_cal = 0
+    if isinstance(cfg, tuple) and cfg[0] == "gptq":
+        assert not (cli.freeze_routing or cli.record_routing)
+        from scripts.collect_bases import calib_indices
+
+        cal = list(tokens[calib_indices(tokens.size(0), 16)].split(2))  # 15 sequences, none of them eval
+        n_cal, batches = len(cal), cal + batches
+        gq = GPTQExperts(cfg[1], n_cal)
+        before_block, before_batch = gq.before_block, gq.before_batch
+    hidden = runner.hidden_batches(batches, before_block=before_block, before_batch=before_batch)[n_cal:]
     t_fwd = time.time() - t0
 
     norm = m.RMSNorm(runner.args.dim, runner.args.norm_eps).to(DEV)
