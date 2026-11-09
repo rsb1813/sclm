@@ -5,3 +5,12 @@ __pycache__/
 .pytest_cache/
 data/*
 !data/*.json
+
+# never commit weights or tensors, wherever they land
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.gguf
+*.npz
+*.npy
