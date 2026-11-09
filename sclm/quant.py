@@ -49,10 +49,18 @@ def rtn_codes(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8) -> tup
     step per group (fp32 [N, K/group]). Storage: bits + 16/group bpw."""
     n, k = w.shape
     g = w.float().reshape(n, k // group, group)
+    half = 2 ** (bits - 1)
+    best_step = _best_step(g, bits, clip_grid)
+    codes = (torch.floor(g / best_step).clamp(-half, half - 1) + half).to(torch.uint8)
+    return codes.reshape(n, k), best_step.squeeze(-1)
+
+
+def _best_step(g: torch.Tensor, bits: int, clip_grid: int = 8) -> torch.Tensor:
+    """Per-group step [..., 1] (fp16-representable) minimizing the group's RTN MSE over a grid of clip ratios."""
     amax = g.abs().amax(-1, keepdim=True).clamp_min(1e-12)
     half = 2 ** (bits - 1)  # levels at (i + 0.5) * step for i in [-half, half)
     best_step, best_err = None, None
-    for r in torch.linspace(0.5, 1.0, clip_grid, device=w.device):
+    for r in torch.linspace(0.5, 1.0, clip_grid, device=g.device):
         step = (amax * r / (half - 0.5)).half().float()  # the step is stored as fp16
         q = (torch.floor(g / step).clamp(-half, half - 1) + 0.5) * step
         err = (q - g).pow(2).sum(-1, keepdim=True)
@@ -61,8 +69,42 @@ def rtn_codes(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8) -> tup
         else:
             take = err < best_err
             best_step, best_err = torch.where(take, step, best_step), torch.minimum(err, best_err)
-    codes = (torch.floor(g / best_step).clamp(-half, half - 1) + half).to(torch.uint8)
-    return codes.reshape(n, k), best_step.squeeze(-1)
+    return best_step
+
+
+def gptq_codes(
+    w: torch.Tensor, h: torch.Tensor, bits: int, group: int, damp: float = 0.01, block: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GPTQ with static groups: quantize columns in order, pushing each column's error onto the not-yet-quantized
+    columns through the Cholesky factor of H^-1 (H = X^T X of the layer input), so the error lands where inputs
+    rarely point. Same output format as rtn_codes. `block` must be a multiple of `group`."""
+    assert block % group == 0
+    n, k = w.shape
+    W, H = w.float().clone(), h.float().clone()
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    W[:, dead] = 0
+    H += damp * torch.diag(H).mean() * torch.eye(k, device=H.device, dtype=H.dtype)
+    u = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
+    half = 2 ** (bits - 1)
+    codes = torch.empty(n, k, dtype=torch.uint8, device=w.device)
+    steps = torch.empty(n, k // group, device=w.device)
+    for b0 in range(0, k, block):
+        b1 = min(b0 + block, k)
+        w1, err = W[:, b0:b1].clone(), torch.zeros(n, b1 - b0, device=w.device)
+        ub = u[b0:b1, b0:b1]
+        for i in range(b1 - b0):
+            col = b0 + i
+            if col % group == 0:  # the group's step comes from its columns after earlier error feedback
+                step = _best_step(w1[:, i : i + group], bits)
+                steps[:, col // group] = step.squeeze(-1)
+            idx = torch.floor(w1[:, i : i + 1] / step).clamp(-half, half - 1)
+            codes[:, col] = (idx + half).squeeze(-1).to(torch.uint8)
+            e = (w1[:, i : i + 1] - (idx + 0.5) * step) / ub[i, i]
+            w1[:, i:] -= e * ub[i : i + 1, i:]
+            err[:, i : i + 1] = e
+        W[:, b1:] -= err @ u[b0:b1, b1:]
+    return codes, steps
 
 
 def rtn_dequant(codes: torch.Tensor, step: torch.Tensor, bits: int, group: int) -> torch.Tensor:

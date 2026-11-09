@@ -49,6 +49,19 @@ def test_rtn_codes_roundtrip_and_packing():
     assert torch.equal(quant.rtn(w, 3, 64), quant.rtn_dequant(codes, step, 3, 64))
 
 
+def test_gptq_beats_rtn_on_correlated_inputs():
+    torch.manual_seed(6)
+    k, n, m = 256, 64, 4096
+    x = torch.randn(m, 32, device=DEV) @ torch.randn(32, k, device=DEV) + 0.1 * torch.randn(m, k, device=DEV)
+    w = torch.randn(n, k, device=DEV)
+    h = x.t() @ x
+    out_err = lambda wq: ((wq - w) @ x.t()).pow(2).sum() / (w @ x.t()).pow(2).sum()  # noqa: E731
+    codes, step = quant.gptq_codes(w, h, 3, 64)
+    assert codes.dtype == torch.uint8 and int(codes.max()) < 8 and step.shape == (n, 4)
+    e_gptq, e_rtn = out_err(quant.rtn_dequant(codes, step, 3, 64)), out_err(quant.rtn(w, 3, 64))
+    assert e_gptq < 0.5 * e_rtn, (e_gptq, e_rtn)
+
+
 def test_rtn_linear_matches_dense_rotated_weight():
     """y = Q(W R) (R^T act_q(x)) must equal the dense dequantized weight R-unrotated, applied to act_q(x)."""
     import sclm.upstream  # noqa: F401
