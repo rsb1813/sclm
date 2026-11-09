@@ -24,6 +24,8 @@ CHUNK = 256
 # uncompressed FP4 weights through the same fp32 path RTNLinear uses (isolates the GEMM path from compression)
 CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had": (2, 64, True),
            "rtn3": (3, 64, False), "rtn2": (2, 64, False),
+           # rows rescaled by 1/beta so rounding does not shrink them (RTNLinear unbiased)
+           "rtn3_had_ub": (3, 64, True, True), "rtn2_had_ub": (2, 64, True, True),
            # routed experts restricted to the per-layer top-r activation subspaces (scripts/collect_bases.py)
            "proj256": ("proj", 256), "proj512": ("proj", 512),
            "proj512_in": ("proj", 512, "in"), "proj512_out": ("proj", 512, "out")}
@@ -90,7 +92,7 @@ def project_experts_(layer: int, block, r: int, sides: str = "inout") -> None:
             expert.w2 = ProjOut(fp4_dense(expert.w2), v)
 
 
-def quantize_experts_(block, bits: int, group: int, use_rot: bool) -> None:
+def quantize_experts_(block, bits: int, group: int, use_rot: bool, unbiased: bool = False) -> None:
     """Replace every routed expert Linear of `block` by an RTNLinear, one at a time so peak VRAM stays near one layer."""
     rots = {}
     for expert in block.ffn.experts:
@@ -99,7 +101,7 @@ def quantize_experts_(block, bits: int, group: int, use_rot: bool) -> None:
             w = (kernel.unpack_fp4(lin.weight).unflatten(-1, (-1, 32)) * lin.scale.float().unsqueeze(-1)).flatten(-2)
             k = w.size(1)
             rot = rots.setdefault(k, quant.BlockHadamard(k, seed=17 + k)) if use_rot else None
-            setattr(expert, name, quant.RTNLinear(w, bits, group, rot))
+            setattr(expert, name, quant.RTNLinear(w, bits, group, rot, unbiased))
             del lin, w
 
 

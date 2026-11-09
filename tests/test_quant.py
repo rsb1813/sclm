@@ -89,6 +89,20 @@ def test_gptq_ignores_bf16_default_dtype():
     assert torch.equal(got[0], ref[0]) and got[1].dtype == torch.float32 and torch.equal(got[1], ref[1])
 
 
+def test_rtn_linear_unbiased_restores_row_gain():
+    torch.manual_seed(9)
+    w = torch.randn(64, 256, device=DEV)
+    rot = quant.BlockHadamard(256, seed=3)
+    for unbiased in (False, True):
+        lin = quant.RTNLinear(w, 2, 64, rot, unbiased=unbiased)
+        wq = rot.unrotate(lin.weight_dequant())
+        beta = (wq * w).sum(1) / (w * w).sum(1)
+        if unbiased:
+            assert torch.allclose(beta, torch.ones_like(beta), atol=2e-3), beta
+        else:
+            assert beta.mean() < 0.95  # 2-bit rounding shrinks rows
+
+
 def test_rtn_linear_matches_dense_rotated_weight():
     """y = Q(W R) (R^T act_q(x)) must equal the dense dequantized weight R-unrotated, applied to act_q(x)."""
     import sclm.upstream  # noqa: F401

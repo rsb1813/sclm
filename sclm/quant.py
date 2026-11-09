@@ -132,13 +132,23 @@ class RTNLinear(torch.nn.Module):
     """Drop-in for an upstream expert Linear: RTN codes packed 4-bit with per-group fp16 steps, optionally kept in a
     block-Hadamard-rotated basis (activations are rotated instead of the weight). Applies the same fp8 activation
     fake-quant upstream uses before its quantized GEMMs, then an fp32 GEMM (rotated activations are not exact in
-    bf16, and a measurement tool should not add its own rounding)."""
+    bf16, and a measurement tool should not add its own rounding).
 
-    def __init__(self, w: torch.Tensor, bits: int, group: int, rot: "BlockHadamard | None" = None):
+    unbiased: write w_hat = beta * w + n per output row (n orthogonal to w) and store w_hat / beta, so the row keeps
+    its full gain. Low-bit rounding shrinks rows (beta ~0.89 at 2 bits), and SwiGLU multiplies the shrinkage of
+    w1, w3 and w2 into the expert output (~0.70 at 2 bits). Costs nothing: 1/beta is folded into the row's steps."""
+
+    def __init__(self, w: torch.Tensor, bits: int, group: int, rot: "BlockHadamard | None" = None,
+                 unbiased: bool = False):
         super().__init__()
         assert bits <= 4
         self.bits, self.group, self.rot = bits, group, rot
-        codes, step = rtn_codes(rot.rotate(w) if rot else w.float(), bits, group)
+        wr = rot.rotate(w) if rot else w.float()
+        codes, step = rtn_codes(wr, bits, group)
+        if unbiased:
+            wq = rtn_dequant(codes, step, bits, group)
+            beta = (wq * wr).sum(1) / (wr * wr).sum(1).clamp_min(1e-30)
+            step = step / beta.clamp_min(0.05)[:, None]
         self.register_buffer("packed", pack_nibbles(codes))
         self.register_buffer("step", step.half())
 
