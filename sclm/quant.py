@@ -1,5 +1,6 @@
 # Weight quantizers for compression experiments: grouped RTN, block Hadamard rotation, and shared-codebook vector quantization.
 import torch
+import torch.nn.functional as F
 
 
 def largest_pow2_divisor(n: int, cap: int = 1024) -> int:
@@ -42,24 +43,74 @@ class BlockHadamard:
         return self._h(w.float()) * self.signs
 
 
-def rtn(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8) -> torch.Tensor:
+def rtn_codes(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric mid-rise uniform quantization to 2**bits levels per `group` weights along K, with the clip ratio
-    searched per group for minimum MSE. Returns the dequantized weight (fp32). Storage: bits + 16/group bpw."""
+    searched per group for minimum MSE. Returns codes (uint8 [N, K], in [0, 2**bits)) and the fp16-representable
+    step per group (fp32 [N, K/group]). Storage: bits + 16/group bpw."""
     n, k = w.shape
     g = w.float().reshape(n, k // group, group)
     amax = g.abs().amax(-1, keepdim=True).clamp_min(1e-12)
     half = 2 ** (bits - 1)  # levels at (i + 0.5) * step for i in [-half, half)
-    best, best_err = None, None
+    best_step, best_err = None, None
     for r in torch.linspace(0.5, 1.0, clip_grid, device=w.device):
-        step = amax * r / (half - 0.5)
+        step = (amax * r / (half - 0.5)).half().float()  # the step is stored as fp16
         q = (torch.floor(g / step).clamp(-half, half - 1) + 0.5) * step
         err = (q - g).pow(2).sum(-1, keepdim=True)
-        if best is None:
-            best, best_err = q, err
+        if best_step is None:
+            best_step, best_err = step, err
         else:
             take = err < best_err
-            best, best_err = torch.where(take, q, best), torch.minimum(err, best_err)
-    return best.reshape(n, k)
+            best_step, best_err = torch.where(take, step, best_step), torch.minimum(err, best_err)
+    codes = (torch.floor(g / best_step).clamp(-half, half - 1) + half).to(torch.uint8)
+    return codes.reshape(n, k), best_step.squeeze(-1)
+
+
+def rtn_dequant(codes: torch.Tensor, step: torch.Tensor, bits: int, group: int) -> torch.Tensor:
+    half = 2 ** (bits - 1)
+    return (codes.float() - half + 0.5) * step.float().repeat_interleave(group, -1)
+
+
+def rtn(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8) -> torch.Tensor:
+    """Dequantized result of rtn_codes (fp32)."""
+    return rtn_dequant(*rtn_codes(w, bits, group, clip_grid), bits, group)
+
+
+def pack_nibbles(codes: torch.Tensor) -> torch.Tensor:
+    """uint8 codes < 16, [..., K] -> [..., K/2] (even index in the low nibble)."""
+    return codes[..., 0::2] | (codes[..., 1::2] << 4)
+
+
+def unpack_nibbles(packed: torch.Tensor) -> torch.Tensor:
+    return torch.stack([packed & 0x0F, packed >> 4], dim=-1).flatten(-2)
+
+
+class RTNLinear(torch.nn.Module):
+    """Drop-in for an upstream expert Linear: RTN codes packed 4-bit with per-group fp16 steps, optionally kept in a
+    block-Hadamard-rotated basis (activations are rotated instead of the weight). Applies the same fp8 activation
+    fake-quant upstream uses before its quantized GEMMs, then an fp32 GEMM (rotated activations are not exact in
+    bf16, and a measurement tool should not add its own rounding)."""
+
+    def __init__(self, w: torch.Tensor, bits: int, group: int, rot: "BlockHadamard | None" = None):
+        super().__init__()
+        assert bits <= 4
+        self.bits, self.group, self.rot = bits, group, rot
+        codes, step = rtn_codes(rot.rotate(w) if rot else w.float(), bits, group)
+        self.register_buffer("packed", pack_nibbles(codes))
+        self.register_buffer("step", step.half())
+
+    def weight_dequant(self) -> torch.Tensor:
+        """The effective weight in the rotated basis (fp32)."""
+        return rtn_dequant(unpack_nibbles(self.packed), self.step, self.bits, self.group)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from . import upstream  # noqa: F401  (puts kernel on sys.path)
+        import kernel
+
+        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+        xq = xq.float()
+        if self.rot is not None:
+            xq = self.rot.rotate(xq.reshape(-1, xq.size(-1))).reshape(xq.shape)
+        return F.linear(xq, self.weight_dequant()).to(torch.get_default_dtype())
 
 
 def kmeanspp_init(x: torch.Tensor, n_codes: int, seed: int = 0, max_points: int = 64) -> torch.Tensor:

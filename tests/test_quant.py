@@ -33,6 +33,31 @@ def test_rtn_error_drops_with_bits():
     assert errs[2] < 0.02  # 4-bit Gaussian RTN NMSE is ~0.01
 
 
+def test_rtn_codes_roundtrip_and_packing():
+    w = torch.randn(32, 256, device=DEV)
+    codes, step = quant.rtn_codes(w, 3, 64)
+    assert codes.dtype == torch.uint8 and int(codes.max()) < 8 and step.shape == (32, 4)
+    assert torch.equal(quant.unpack_nibbles(quant.pack_nibbles(codes)), codes)
+    assert torch.equal(quant.rtn(w, 3, 64), quant.rtn_dequant(codes, step, 3, 64))
+
+
+def test_rtn_linear_matches_dense_rotated_weight():
+    """y = Q(W R) (R^T act_q(x)) must equal the dense dequantized weight R-unrotated, applied to act_q(x)."""
+    import sclm.upstream  # noqa: F401
+    import kernel
+
+    torch.manual_seed(5)
+    w, x = torch.randn(64, 512, device=DEV) * 0.02, torch.randn(10, 512, device=DEV)
+    for rot in (None, quant.BlockHadamard(512, seed=3)):
+        lin = quant.RTNLinear(w, 3, 64, rot)
+        w_eff = rot.unrotate(lin.weight_dequant()) if rot else lin.weight_dequant()
+        xq = kernel.act_quant(x.to(torch.bfloat16).clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True).float()
+        want = xq @ w_eff.t()
+        got = lin(x).float()
+        assert torch.allclose(got, want, rtol=1e-4, atol=1e-5), (got - want).abs().max()
+        assert ((w_eff - w).pow(2).mean() / w.pow(2).mean()) < 0.06  # 3-bit RTN error, rotated or not
+
+
 def test_kmeans_recovers_clusters_and_vq_error():
     torch.manual_seed(0)
     centers = torch.randn(16, 4, device=DEV) * 5
