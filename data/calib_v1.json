@@ -1,0 +1,61 @@
+{
+  "seq_len": 2048,
+  "doc_max": 1024,
+  "categories": {
+    "en_web": {
+      "source": "HuggingFaceFW/fineweb-edu sample-10BT",
+      "license": "ODC-By",
+      "sequences": 10,
+      "documents": 36
+    },
+    "ko_wiki": {
+      "source": "wikimedia/wikipedia 20231101.ko",
+      "license": "CC BY-SA 3.0",
+      "sequences": 6,
+      "documents": 13
+    },
+    "multi_wiki": {
+      "source": "wikimedia/wikipedia 20231101.{ja,zh,de,fr}",
+      "license": "CC BY-SA 3.0",
+      "sequences": 4,
+      "documents": 8
+    },
+    "chat_en": {
+      "source": "HuggingFaceH4/ultrachat_200k train_sft",
+      "license": "MIT",
+      "sequences": 6,
+      "documents": 14
+    },
+    "chat_ko": {
+      "source": "nlpai-lab/kullm-v2",
+      "license": "Apache-2.0",
+      "sequences": 6,
+      "documents": 51
+    },
+    "code_inst": {
+      "source": "m-a-p/CodeFeedback-Filtered-Instruction",
+      "license": "Apache-2.0",
+      "sequences": 6,
+      "documents": 25
+    },
+    "code_raw": {
+      "source": "local CPython 3.14 standard library sources",
+      "license": "PSF-2.0",
+      "sequences": 4,
+      "documents": 10
+    },
+    "math": {
+      "source": "openai/gsm8k main",
+      "license": "MIT",
+      "sequences": 5,
+      "documents": 52
+    },
+    "tools": {
+      "source": "glaiveai/glaive-function-calling-v2",
+      "license": "Apache-2.0",
+      "sequences": 4,
+      "documents": 18
+    }
+  },
+  "total_tokens": 104448
+}
