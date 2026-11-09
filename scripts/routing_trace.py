@@ -87,7 +87,8 @@ def main() -> None:
     def before_block(i, block):
         if i:
             print(f"layer {i - 1:2d} done {time.time() - t_layer[0]:5.0f}s "
-                  f"vram_peak={torch.cuda.max_memory_allocated() / 2**30:.1f}GB", flush=True)
+                  f"vram_peak={torch.cuda.max_memory_allocated() / 2**30:.1f}GB "
+                  f"reserved={torch.cuda.memory_reserved() / 2**30:.1f}GB", flush=True)
         t_layer[0] = time.time()
         torch.cuda.reset_peak_memory_stats()
         col.before_block(i, block)

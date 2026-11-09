@@ -12,6 +12,7 @@ from .upstream import CONFIG_PATH, engram, model as m
 QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e8m0fnu, torch.float4_e2m1fn_x2)
 # cross-layer attention state upstream hands down the stack through its global `shared_attn`
 SHARED_ATTN_FIELDS = ("compress_kv", "index_k", "topk_idxs", "candidates")
+VRAM_MARGIN = 512 << 20  # left free for the driver and other processes
 
 
 class _NoTable(torch.nn.Module):
@@ -53,6 +54,13 @@ class LayerwiseRunner:
         m.world_size, m.rank = 1, 0
         m.default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         self.ckpt, self.args, self.device = ckpt, args, device
+        if device.startswith("cuda"):
+            # Windows (WDDM) pages over-subscribed VRAM out to system RAM instead of failing, so PyTorch's caching
+            # allocator never hits an OOM, never trims its cache, and slows to a crawl. Cap it below free VRAM.
+            index = torch.device(device).index
+            index = torch.cuda.current_device() if index is None else index
+            free, total = torch.cuda.mem_get_info(index)
+            torch.cuda.set_per_process_memory_fraction((free - VRAM_MARGIN) / total, index)
         self.layout = engram.EngramLayout.from_args(args)
         with torch.device(device):
             self.hash = engram.NgramHashState(args, self.layout, tokenizer)
