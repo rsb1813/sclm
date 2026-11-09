@@ -13,12 +13,16 @@
 - [x] CPU-GPU 동기화 지연 측정 (launch+sync 9.4µs, mapped ping-pong 1.1µs)
 - [x] SSD 순차·랜덤 읽기 측정 (7.4GB/s, QD32 53만 IOPS)
 - [ ] 내장 그래픽으로 화면 출력 전환, 5080 가용 VRAM 재확인 (사용자 작업)
-- [ ] PyTorch가 지원하는 Python 버전으로 venv 구성 (현재 시스템 Python 3.14.6)
+- [x] venv 구성 (`.venv`, Python 3.14.6, torch 2.15.0+cu134, transformers 5.22.2, 5080 동작 확인)
+- [x] 공식 추론 코드 확보와 분석 (`ref/deepseek_v41`, git 제외). transformers에 `deepseek_v41` 없음
+- [ ] 백그라운드 정리 후 RAM 가용량 재확인 (사용자 작업: Docker Desktop 종료, `wsl --shutdown`)
 - [x] 디스크 용량 예산 작성 (design.md 8.1, 피크 약 200~230GB)
 - [x] 샤드 구성 확인 (층당 7.4GB, Engram 203GB)
 - [ ] 다운로드 방식 결정 (CDN이 샌드박스에서 차단됨 → 사용자 실행 또는 승인)
-- [ ] 샤드 하나(층 0)만 받아 텐서 shape 확인 (attention 파라미터 수 검증)
-- [ ] HF transformers 구현 확인 (Windows 네이티브 동작 여부, FP4 expert 처리 경로)
+- [ ] range 요청으로 safetensors 헤더 읽기 (텐서 offset·shape 확인, 사용자 실행 또는 승인)
+- [ ] 순수 PyTorch 레퍼런스 작성 (`kernel.py` 수치 그대로: act_quant, fp4/fp8 GEMM, sparse_attn, hc sinkhorn)
+- [ ] 작은 무작위 모델로 공식 구현과 수치 비교 (WSL2 + tilelang)
+- [ ] Engram 해시 구현 이식과 토크나이저 압축 어휘 크기(99,092) 검증
 - [ ] 층 단위 레퍼런스 실행 코드 작성 (Pass 1 골격, 층 간 KV/indexer 의존성 포함)
 - [ ] 층 0에서 압축 계산 시간 실측, N과 기법 조정
 - [ ] 평가 세트 고정 (도메인 프롬프트)
