@@ -15,7 +15,8 @@
 - [ ] 내장 그래픽으로 화면 출력 전환, 5080 가용 VRAM 재확인 (사용자 작업)
 - [x] venv 구성 (`.venv`, Python 3.14.6, torch 2.15.0+cu134, transformers 5.22.2, 5080 동작 확인)
 - [x] 공식 추론 코드 확보와 분석 (`ref/deepseek_v41`, git 제외). transformers에 `deepseek_v41` 없음
-- [ ] 백그라운드 정리 후 RAM 가용량 재확인 (사용자 작업: Docker Desktop 종료, `wsl --shutdown`)
+- [x] Docker 종료와 시작 프로그램 등록 제거, WSL 종료, 전원 계획 고성능 → RAM 가용 54.1 → 67.9GB
+- [ ] 실행 직전 Chrome(약 11GB), Steam, EA, Epic 등 정리 (사용자 작업)
 - [x] 디스크 용량 예산 작성 (design.md 8.1, 피크 약 200~230GB)
 - [x] 샤드 구성 확인 (층당 7.4GB, Engram 203GB)
 - [ ] 다운로드 방식 결정 (CDN이 샌드박스에서 차단됨 → 사용자 실행 또는 승인)

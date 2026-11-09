@@ -27,3 +27,4 @@
 - **디스크 0 스트리밍**: 원본은 range 요청으로 RAM에 직접 받는다. 층 샤드 7.4GB가 RAM에 들어가고, 텐서 offset은 헤더로 알 수 있다. 최종 = 피크 약 70~85GB.
 - **drafter는 무손실 검증이라 품질 걱정 없이 극단 압축**할 수 있다(C9). confidence head로 검증 길이를 조절한다(S5).
 - **다중 토큰 검증과 롤백은 공식 코드에 없다.** 직접 구현한다.
+- **환경 정리**: 사용자 요청으로 Docker Desktop을 종료하고 `HKCU\...\Run`의 "Docker Desktop" 등록을 지웠다(원래 값: `C:\Users\jolib\AppData\Local\Programs\DockerDesktop\Docker Desktop.exe`). Docker 자체 설정의 AutoStart는 원래 false였다. 전원 계획은 고성능으로 바꿨다. RAM 가용량은 54.1GB에서 67.9GB로 늘었다.
