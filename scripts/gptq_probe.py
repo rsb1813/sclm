@@ -23,6 +23,21 @@ CONFIGS = {
     "gptq2_nrd_b1": ("gptq", 2, 1.0, "nrd"),
     "rtn3": ("rtn", 3, None, None),
     "gptq3_nrd_b05": ("gptq", 3, 0.5, "nrd"),
+    # optional (levels, group): 1 bit, ternary and coarser groups for the tiered allocation (design.md T3)
+    "rtn1_g128": ("rtn", 1, None, None, 2, 128),
+    "rtnt_g128": ("rtn", 2, None, None, 3, 128),
+    "gptq1_g128": ("gptq", 1, 0.5, "plain", 2, 128),
+    "gptqt_g128": ("gptq", 2, 0.5, "plain", 3, 128),
+    "gptq2_g128": ("gptq", 2, 0.5, "plain", 4, 128),
+    "gptq3_g128": ("gptq", 3, 0.5, "plain", 8, 128),
+    # optional unbiasing metric: "fit" (the GPTQ Hessian), "prior" (layer covariance / identity), "none"
+    "gptq1_g128_ubprior": ("gptq", 1, 0.5, "plain", 2, 128, "prior"),
+    "gptq1_g128_ubnone": ("gptq", 1, 0.5, "plain", 2, 128, "none"),
+    "gptqt_g128_ubprior": ("gptq", 2, 0.5, "plain", 3, 128, "prior"),
+    "gptq2_g128_ubprior": ("gptq", 2, 0.5, "plain", 4, 128, "prior"),
+    "gptqt_g128_ubnone": ("gptq", 2, 0.5, "plain", 3, 128, "none"),
+    "gptq2_g128_ubnone": ("gptq", 2, 0.5, "plain", 4, 128, "none"),
+    "gptq3_g128_ubnone": ("gptq", 3, 0.5, "plain", 8, 128, "none"),
 }
 
 
@@ -44,15 +59,20 @@ def unbias(wq: torch.Tensor, w: torch.Tensor, h: torch.Tensor | None = None) -> 
     return wq / ((wq * hw).sum(-1, keepdim=True) / (w * hw).sum(-1, keepdim=True)).clamp_min(0.05)
 
 
-def quantize(w: torch.Tensor, h: torch.Tensor | None, bits: int, rot: quant.BlockHadamard) -> torch.Tensor:
-    """w [E, N, K] -> unbiased dequantized weight in the original basis; GPTQ when h [E, K, K] is given."""
+def quantize(w: torch.Tensor, h: torch.Tensor | None, bits: int, rot: quant.BlockHadamard, levels: int | None = None,
+             group: int = GROUP, h_ub: "torch.Tensor | str" = "fit") -> torch.Tensor:
+    """w [E, N, K] -> unbiased dequantized weight in the original basis; GPTQ when h [E, K, K] is given. h_ub is the
+    unbiasing metric: "fit" (h itself), "none", or a [K, K] matrix."""
     wr, hr = rot_cols(rot, w), None
     if h is None:
-        wq = quant.rtn(wr.reshape(-1, wr.size(-1)), bits, GROUP).reshape(wr.shape)
+        wq = quant.rtn(wr.reshape(-1, wr.size(-1)), bits, group, levels=levels).reshape(wr.shape)
     else:
         hr = rot_cols(rot, rot_cols(rot, h).transpose(-1, -2))  # R^T H R
-        wq = quant.rtn_dequant(*quant.gptq_codes(wr, hr, bits, GROUP), bits, GROUP)
-    return rot_cols(rot, unbias(wq, wr, hr), inverse=True)
+        wq = quant.rtn_dequant(*quant.gptq_codes(wr, hr, bits, group, levels=levels), bits, group, levels)
+    if isinstance(h_ub, str) and h_ub == "none":
+        return rot_cols(rot, wq, inverse=True)
+    hu = hr if isinstance(h_ub, str) else rot_cols(rot, rot_cols(rot, h_ub).transpose(-1, -2))
+    return rot_cols(rot, unbias(wq, wr, hu), inverse=True)
 
 
 def main() -> None:
@@ -94,9 +114,11 @@ def main() -> None:
                 y.index_add_(0, rows, expert_out(xe[rows], w1, w2, w3, gwe[rows, slot, None]))
         return y
 
-    def compressed(method: str, bits: int, beta, weighting):
+    def compressed(method: str, bits: int, beta, weighting, levels: int | None = None, group: int = GROUP,
+                   ub: str = "fit"):
         rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (5120, 2304)}
         eye = torch.eye(2304, device=DEV, dtype=torch.float32)
+        ub1, ub2 = (h_layer[weighting], eye) if ub == "prior" else (ub, ub)
         for e0 in range(0, N_EXP, BATCH):
             es = list(range(e0, min(e0 + BATCH, N_EXP)))
             ws = [ref(e) for e in es]
@@ -111,7 +133,7 @@ def main() -> None:
                     h_e = tr_norm(xr.t() @ (wt[:, None] * xr)) if rows.numel() else h_layer[weighting]
                     h1.append((1 - beta) * h_e + beta * h_layer[weighting])
                 h1 = torch.stack(h1)
-            w1q, w3q = quantize(w1, h1, bits, rots[5120]), quantize(w3, h1, bits, rots[5120])
+            w1q, w3q = (quantize(w, h1, bits, rots[5120], levels, group, ub1) for w in (w1, w3))
             del h1
             h2 = None
             if method == "gptq":
@@ -127,7 +149,7 @@ def main() -> None:
                     wt = omega[fit[rows]] if weighting == "nrd" else torch.ones(rows.numel(), device=DEV, dtype=torch.float32)
                     h2.append((1 - beta) * tr_norm(hid.t() @ (wt[:, None] * hid)) + beta * eye)
                 h2 = torch.stack(h2)
-            w2q = quantize(w2, h2, bits, rots[2304])
+            w2q = quantize(w2, h2, bits, rots[2304], levels, group, ub2)
             for i, e in enumerate(es):
                 yield e, w1q[i], w2q[i], w3q[i]
 
