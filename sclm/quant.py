@@ -152,6 +152,17 @@ class RTNLinear(torch.nn.Module):
         self.register_buffer("packed", pack_nibbles(codes))
         self.register_buffer("step", step.half())
 
+    @classmethod
+    def from_codes(cls, codes: torch.Tensor, step: torch.Tensor, bits: int, group: int,
+                   rot: "BlockHadamard | None" = None) -> "RTNLinear":
+        """Wrap codes and steps made elsewhere (e.g. gptq_codes; in the rotated basis when rot is given)."""
+        self = cls.__new__(cls)
+        torch.nn.Module.__init__(self)
+        self.bits, self.group, self.rot = bits, group, rot
+        self.register_buffer("packed", pack_nibbles(codes))
+        self.register_buffer("step", step.half())
+        return self
+
     def weight_dequant(self) -> torch.Tensor:
         """The effective weight in the rotated basis (fp32)."""
         return rtn_dequant(unpack_nibbles(self.packed), self.step, self.bits, self.group)

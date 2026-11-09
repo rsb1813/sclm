@@ -103,6 +103,16 @@ def test_rtn_linear_unbiased_restores_row_gain():
             assert beta.mean() < 0.95  # 2-bit rounding shrinks rows
 
 
+def test_rtn_linear_from_codes_matches_constructor():
+    torch.manual_seed(10)
+    w = torch.randn(32, 256, device=DEV)
+    rot = quant.BlockHadamard(256, seed=4)
+    a = quant.RTNLinear(w, 3, 64, rot)
+    b = quant.RTNLinear.from_codes(*quant.rtn_codes(rot.rotate(w), 3, 64), 3, 64, rot)
+    x = torch.randn(5, 256, device=DEV)
+    assert torch.equal(a.packed, b.packed) and torch.equal(a.step, b.step) and torch.equal(a(x), b(x))
+
+
 def test_rtn_linear_matches_dense_rotated_weight():
     """y = Q(W R) (R^T act_q(x)) must equal the dense dequantized weight R-unrotated, applied to act_q(x)."""
     import sclm.upstream  # noqa: F401
