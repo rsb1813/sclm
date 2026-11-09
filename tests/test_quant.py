@@ -26,6 +26,14 @@ def test_block_hadamard_is_orthogonal_and_preserves_products():
     assert torch.allclose(r.rotate(w) @ r.rotate(x.t()).t(), w @ x, atol=1e-2, rtol=1e-4)
 
 
+def test_seeded_helpers_work_under_cuda_default_device():
+    # the layerwise runner executes blocks inside torch.device("cuda"); CPU-generator draws must still work there
+    with torch.device(DEV):
+        r = quant.BlockHadamard(2304, seed=1)
+        cb = quant.kmeans(torch.randn(4096, 8), 16, iters=2)
+    assert r.signs.device.type == "cuda" and cb.shape == (16, 8)
+
+
 def test_rtn_error_drops_with_bits():
     w = torch.randn(64, 512, device=DEV)
     errs = [((quant.rtn(w, b, 64) - w).pow(2).mean() / w.pow(2).mean()).item() for b in (2, 3, 4)]

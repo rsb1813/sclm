@@ -30,7 +30,7 @@ class BlockHadamard:
     def __init__(self, k: int, seed: int, device="cuda"):
         self.b = largest_pow2_divisor(k)
         g = torch.Generator(device="cpu").manual_seed(seed)
-        self.signs = (torch.randint(0, 2, (k,), generator=g) * 2 - 1).float().to(device)
+        self.signs = (torch.randint(0, 2, (k,), generator=g, device="cpu") * 2 - 1).float().to(device)
 
     def _h(self, w: torch.Tensor) -> torch.Tensor:
         n, k = w.shape
@@ -116,8 +116,8 @@ class RTNLinear(torch.nn.Module):
 def kmeanspp_init(x: torch.Tensor, n_codes: int, seed: int = 0, max_points: int = 64) -> torch.Tensor:
     """k-means++ seeding on a random subsample of at most max_points * n_codes rows."""
     g = torch.Generator(device="cpu").manual_seed(seed)
-    sub = x[torch.randperm(x.size(0), generator=g)[: max_points * n_codes].to(x.device)]
-    codes = [sub[torch.randint(0, sub.size(0), (1,), generator=g).item()]]
+    sub = x[torch.randperm(x.size(0), generator=g, device="cpu")[: max_points * n_codes].to(x.device)]
+    codes = [sub[torch.randint(0, sub.size(0), (1,), generator=g, device="cpu").item()]]
     d2 = (sub - codes[0]).pow(2).sum(-1)
     for _ in range(n_codes - 1):
         nxt = sub[torch.multinomial(d2 / d2.sum(), 1).item()]
