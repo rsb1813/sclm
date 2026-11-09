@@ -36,7 +36,7 @@ CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had"
            # GPTQ per expert from calibration sequences (GPTQExperts); the last field is the H-metric unbiasing
            "gptq2": ("gptq", 2, True), "gptq3": ("gptq", 3, True),
            # per-expert GPTQ option or the original FP4 expert (the SSD tier) from scripts/allocate_tiers.py
-           "tier20": ("gptq_alloc", "tier20", False)}
+           "tier20": ("gptq_alloc", "tier20", False), "tier20g": ("gptq_alloc", "tier20g", False)}
 # GPTQ storage options: name -> (bits, levels, group); "orig" keeps the original FP4 expert
 GPTQ_OPTIONS = {"1b128": (1, 2, 128), "t128": (2, 3, 128), "2b128": (2, 4, 128), "2b64": (2, 4, 64),
                 "3b64": (3, 8, 64), "3b128": (3, 8, 128)}
@@ -172,11 +172,15 @@ class GPTQExperts:
         from scripts.gptq_probe import tr_norm
 
         t0 = time.time()
-        xq = act_q(torch.cat([s[0] for s in self.store]))
+        xq = torch.cat([act_q(s[0]).bfloat16() for s in self.store])  # fp8 values with power-of-two scales: exact
         gw = torch.cat([s[1] for s in self.store])
         idx = torch.cat([s[2] for s in self.store]).long()
         self.store = []
-        h_layer = tr_norm(xq.t() @ xq)
+        h_layer = 0
+        for chunk in xq.split(8192):  # fp32 accumulation without an fp32 copy of every token
+            chunk = chunk.float()
+            h_layer = h_layer + chunk.t() @ chunk
+        h_layer = tr_norm(h_layer)
         experts = block.ffn.experts
         experts.to("cpu")  # frees ~7GB of FP4 weights for the Hessians; each batch is copied back for its GPTQ
         torch.cuda.empty_cache()
@@ -207,7 +211,7 @@ class GPTQExperts:
                           for n in ("w1", "w2", "w3"))
             h1 = []
             for rows, slot in toks:
-                xr = xq[rows]
+                xr = xq[rows].float()
                 h_e = tr_norm(xr.t() @ (gw[rows, slot].pow(2)[:, None] * xr)) if rows.numel() else h_layer
                 h1.append((1 - self.beta) * h_e + self.beta * h_layer)
             h1 = rotate_h(torch.stack(h1), self.rots[5120])
@@ -219,7 +223,7 @@ class GPTQExperts:
                 if not rows.numel():
                     h2.append(eye)
                     continue
-                xr = xq[rows]
+                xr = xq[rows].float()
                 g, u = xr @ q1[k].t(), (xr @ q3[k].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
                 hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[rows, slot, None])
                 h2.append((1 - self.beta) * tr_norm(hid.t() @ hid) + self.beta * eye)
@@ -262,6 +266,8 @@ def main() -> None:
     ap.add_argument("--freeze-routing", action="store_true", help="force the reference model's expert choices")
     ap.add_argument("--record-routing", action="store_true", help="with --config none: save the expert choices")
     ap.add_argument("--layers", help="lo:hi, compress only layers lo..hi-1 (per-block configs; layer sensitivity)")
+    ap.add_argument("--calib-seqs", type=int, help="GPTQ calibration sequences, spread over the non-eval ones "
+                    "(default: the 15 of collect_bases.calib_indices)")
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)
 
@@ -322,7 +328,13 @@ def main() -> None:
         assert not (cli.freeze_routing or cli.record_routing)
         from scripts.collect_bases import calib_indices
 
-        cal = list(tokens[calib_indices(tokens.size(0), 16)].split(2))  # 15 sequences, none of them eval
+        if cli.calib_seqs:
+            pool = [i for i in range(tokens.size(0)) if i % 6 != 3]  # every sequence but the eval ones
+            chosen = pool[:: max(1, len(pool) // cli.calib_seqs)][: cli.calib_seqs]
+            tag += f"_cal{len(chosen)}"
+        else:
+            chosen = calib_indices(tokens.size(0), 16)  # 15 sequences, none of them eval
+        cal = list(tokens[chosen].split(2))
         n_cal, batches = len(cal), cal + batches
         if cfg[0] == "gptq":
             plan = lambda i: [f"{cfg[1]}b64"] * runner.args.n_routed_experts  # noqa: E731
