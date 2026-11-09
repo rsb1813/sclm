@@ -128,11 +128,20 @@ def unpack_nibbles(packed: torch.Tensor) -> torch.Tensor:
     return torch.stack([packed & 0x0F, packed >> 4], dim=-1).flatten(-2)
 
 
+def pack_crumbs(codes: torch.Tensor) -> torch.Tensor:
+    """uint8 codes < 4, [..., K] -> [..., K/4] (index 4i in the lowest two bits)."""
+    return codes[..., 0::4] | (codes[..., 1::4] << 2) | (codes[..., 2::4] << 4) | (codes[..., 3::4] << 6)
+
+
+def unpack_crumbs(packed: torch.Tensor) -> torch.Tensor:
+    return torch.stack([packed & 3, (packed >> 2) & 3, (packed >> 4) & 3, packed >> 6], dim=-1).flatten(-2)
+
+
 class RTNLinear(torch.nn.Module):
-    """Drop-in for an upstream expert Linear: RTN codes packed 4-bit with per-group fp16 steps, optionally kept in a
-    block-Hadamard-rotated basis (activations are rotated instead of the weight). Applies the same fp8 activation
-    fake-quant upstream uses before its quantized GEMMs, then an fp32 GEMM (rotated activations are not exact in
-    bf16, and a measurement tool should not add its own rounding).
+    """Drop-in for an upstream expert Linear: RTN codes (packed 4 per byte up to 2 bits, else 2 per byte) with
+    per-group fp16 steps, optionally kept in a block-Hadamard-rotated basis (activations are rotated instead of the
+    weight). Applies the same fp8 activation fake-quant upstream uses before its quantized GEMMs, then an fp32 GEMM
+    (rotated activations are not exact in bf16, and a measurement tool should not add its own rounding).
 
     unbiased: write w_hat = beta * w + n per output row (n orthogonal to w) and store w_hat / beta, so the row keeps
     its full gain. Low-bit rounding shrinks rows (beta ~0.89 at 2 bits), and SwiGLU multiplies the shrinkage of
@@ -149,7 +158,7 @@ class RTNLinear(torch.nn.Module):
             wq = rtn_dequant(codes, step, bits, group)
             beta = (wq * wr).sum(1) / (wr * wr).sum(1).clamp_min(1e-30)
             step = step / beta.clamp_min(0.05)[:, None]
-        self.register_buffer("packed", pack_nibbles(codes))
+        self.register_buffer("packed", pack_crumbs(codes) if bits <= 2 else pack_nibbles(codes))
         self.register_buffer("step", step.half())
 
     @classmethod
@@ -159,13 +168,14 @@ class RTNLinear(torch.nn.Module):
         self = cls.__new__(cls)
         torch.nn.Module.__init__(self)
         self.bits, self.group, self.rot = bits, group, rot
-        self.register_buffer("packed", pack_nibbles(codes))
+        self.register_buffer("packed", pack_crumbs(codes) if bits <= 2 else pack_nibbles(codes))
         self.register_buffer("step", step.half())
         return self
 
     def weight_dequant(self) -> torch.Tensor:
         """The effective weight in the rotated basis (fp32)."""
-        return rtn_dequant(unpack_nibbles(self.packed), self.step, self.bits, self.group)
+        codes = unpack_crumbs(self.packed) if self.bits <= 2 else unpack_nibbles(self.packed)
+        return rtn_dequant(codes, self.step, self.bits, self.group)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from . import upstream  # noqa: F401  (puts kernel on sys.path)

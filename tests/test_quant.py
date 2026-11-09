@@ -103,6 +103,16 @@ def test_rtn_linear_unbiased_restores_row_gain():
             assert beta.mean() < 0.95  # 2-bit rounding shrinks rows
 
 
+def test_two_bit_codes_pack_four_per_byte():
+    torch.manual_seed(11)
+    codes = torch.randint(0, 4, (6, 256), device=DEV, dtype=torch.uint8)
+    assert torch.equal(quant.unpack_crumbs(quant.pack_crumbs(codes)), codes)
+    w = torch.randn(32, 256, device=DEV)
+    lin = quant.RTNLinear(w, 2, 64)
+    assert lin.packed.shape == (32, 64)
+    assert torch.allclose(lin.weight_dequant(), quant.rtn(w, 2, 64), rtol=1e-3, atol=1e-4)  # fp16 steps
+
+
 def test_rtn_linear_from_codes_matches_constructor():
     torch.manual_seed(10)
     w = torch.randn(32, 256, device=DEV)
