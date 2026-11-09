@@ -45,7 +45,7 @@
 - [x] expert 간 중복 측정 → 활성 부분공간 사영은 모델 전체에서 실패 (KL 1.98~3.40, 거대 활성값이 NMSE를 가림)
 - [ ] 출력 기준 압축 (GPTQ류) 2bit 이하 실험 (배치 GPTQ 구현 완료, NRD 가중 Hessian으로 진행)
 - [x] T1 축소 편향 측정: expert 출력 β 0.90(3bit) / 0.70(2bit), SwiGLU 곱셈 누적 확인 (design.md 4.2)
-- [ ] T1 판별: 편향 제거 RTN(`*_ub`) vs 일반 RTN 모델 전체 KL
+- [x] T1 판별: 편향 제거로 초과 KL −11~12% (2bit 0.328→0.295, 3bit 0.125→0.114), ppl 이상 현상의 원인 확인
 - [ ] T2 NRD 검증: r_t, c_t 수집 → 레이어 10에서 RTN vs 사영 순서가 KL과 맞는지
 - [x] T3 두 자원 배분 계산: 사용 빈도 가중 +0.5bit 상당, 20 tok/s 기준 RAM expert 1.61~1.74bpw
 - [ ] T3 배분기 구현 (water-filling + 하한 + SSD 계층)
