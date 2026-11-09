@@ -102,7 +102,7 @@ def main() -> None:
             opts = [names[i] if i < len(c) else "orig" for i in p]
             report.append({"counts": {o: opts.count(o) for o in names + ["orig"]},
                            "ram_bpw_all": float(c[p[on_ram]].sum() / n_exp),
-                           "ram_bpw_resident": float(c[p[on_ram]].mean()),
+                           "ram_bpw_resident": float(c[p[on_ram]].mean()) if on_ram.any() else 0.0,
                            "ssd_call_share": float(f[layer][~on_ram].sum() / f[layer].sum()),
                            "distortion": float((w[layer][on_ram] * d[p[on_ram]]).sum() / w[layer].sum())})
             plan.append(opts)
