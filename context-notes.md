@@ -29,4 +29,7 @@
 - **다중 토큰 검증과 롤백은 공식 코드에 없다.** 직접 구현한다.
 - **환경 정리**: 사용자 요청으로 Docker Desktop을 종료하고 `HKCU\...\Run`의 "Docker Desktop" 등록을 지웠다(원래 값: `C:\Users\jolib\AppData\Local\Programs\DockerDesktop\Docker Desktop.exe`). Docker 자체 설정의 AutoStart는 원래 false였다. 전원 계획은 고성능으로 바꿨다. RAM 가용량은 54.1GB에서 67.9GB로 늘었다.
 - **WSL 배포판과 Docker 완전 삭제 (사용자 결정, 백업 없음)**: Docker Desktop 4.87.0 제거(데이터 39.6GB 포함), Ubuntu-24.04 등록 해제(가상 디스크 169GB, 안에 `xsec-build` 90GB 등 작업 폴더가 있었으나 사용자가 다른 PC로 옮겼다고 확인), Docker 잔여 설정 폴더 삭제. WSL 기능 자체는 남겼다. 삭제 후 C: 여유 공간은 1362GB(이전 측정 753GB).
+- **주 용도는 범용**(사용자 결정). 보정 데이터는 코딩, 한국어·영어 대화, 수학·추론, 다국어, 도구 호출을 고르게 섞는다. 도메인 특화(Q5)의 이득은 줄어드는 대신, 가지치기(C1)를 보수적으로 잡아야 한다.
+- **레퍼런스 구성**: 공식 `inference/` 파일은 수정 없이 `sclm/reference/`에 두고 `kernel.py`만 순수 PyTorch로 새로 썼다. 원본 갱신 시 덮어쓰기만 하면 되고, 차이가 `kernel.py`에만 모인다.
+- **작은 무작위 모델 검증 수치**: prefill 150토큰과 prefill 128 + decode 22의 마지막 logits cos 0.998. 대조군으로 최근 문맥을 바꾸면 0.3~0.4, 먼 문맥(압축 KV 경로)만 바꾸면 0.92라서 기준 0.995는 경로 차이를 구분할 수 있다.
 - **검증 방법 변경**: WSL이 없으므로 tilelang 공식 커널과 직접 비교하지 않는다. 커널 단위 테스트와 실제 가중치 perplexity로 검증한다. 커널 수식은 단순해서(블록 fake-quant, scale 곱 GEMM, sink 포함 softmax, Sinkhorn) 위험이 낮다고 판단했다.

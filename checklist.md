@@ -21,10 +21,13 @@
 - [x] 샤드 구성 확인 (층당 7.4GB, Engram 203GB)
 - [ ] 다운로드 방식 결정 (CDN이 샌드박스에서 차단됨 → 사용자 실행 또는 승인)
 - [ ] range 요청으로 safetensors 헤더 읽기 (텐서 offset·shape 확인, 사용자 실행 또는 승인)
-- [ ] 순수 PyTorch 레퍼런스 작성 (`kernel.py` 수치 그대로: act_quant, fp4/fp8 GEMM, sparse_attn, hc sinkhorn)
-- [ ] 커널별 단위 테스트 (수학적 정의와 대조) + 작은 무작위 모델 end-to-end 실행 테스트
+- [x] 순수 PyTorch 레퍼런스 작성 (`sclm/reference/kernel.py`, 공식 파일은 수정 없이 반입)
+- [x] 커널별 단위 테스트 (수학적 정의와 대조) + 작은 무작위 모델 end-to-end 실행 테스트 (14개 통과)
+- [x] Engram 해시 검증 (압축 어휘 99,092, 소수 구간 합 = 테이블 행 수)
 - [ ] 실제 가중치로 perplexity·생성 결과 확인 (레퍼런스 정확성의 최종 검증)
-- [ ] Engram 해시 구현 이식과 토크나이저 압축 어휘 크기(99,092) 검증
+- [ ] 실제 가중치 로더 (HF 이름 → 모델 이름, wo_a FP8→bf16 역양자화, expert int8 → fp4 view, MTP embed/head 공유)
+- [ ] 층 단위 스트리밍 실행 (VRAM 16GB 안에서 층 하나씩 올려 전체 forward)
+- [ ] 범용 보정 데이터 구성 (코딩, 한국어·영어 대화, 수학·추론, 다국어, 도구 호출)
 - [ ] 층 단위 레퍼런스 실행 코드 작성 (Pass 1 골격, 층 간 KV/indexer 의존성 포함)
 - [ ] 층 0에서 압축 계산 시간 실측, N과 기법 조정
 - [ ] 평가 세트 고정 (도메인 프롬프트)
