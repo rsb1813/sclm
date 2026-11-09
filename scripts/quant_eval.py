@@ -21,6 +21,7 @@ DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 DEV = "cuda"
 TOPK = 64  # reference distribution kept as its top-64 tokens per position
 CHUNK = 256
+SCALES = (0.9, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3)  # logit multipliers for the oracle-temperature KL diagnostic
 # name -> (bits, group, hadamard) for routed experts; "none" is the uncompressed reference, "dense" runs the
 # uncompressed FP4 weights through the same fp32 path RTNLinear uses (isolates the GEMM path from compression)
 CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had": (2, 64, True),
@@ -301,13 +302,15 @@ def main() -> None:
     # the uncompressed run writes the reference; every other run (incl. "none" with frozen routing) compares to it
     ref = None if cfg is None and not cli.freeze_routing else torch.load(ref_path, weights_only=True)
     out_ids, out_lp = [], []
-    acc = {k: np.zeros(seqs.size(0)) for k in ("nll", "n_tgt", "kl", "agree", "n_pos")}  # per sequence
+    acc = {k: np.zeros(seqs.size(0)) for k in ("nll", "n_tgt", "kl", "agree", "n_pos", "conf", "conf_ref")}  # per seq
+    acc["kl_s"] = np.zeros((seqs.size(0), len(SCALES)))
     for b, h in enumerate(hidden):
         x = norm(h.to(DEV))
         rows = slice(2 * b, 2 * b + x.size(0))
         ids_b = seqs[rows].to(DEV)
         for s0 in range(0, x.size(1), CHUNK):
-            lp = F.log_softmax(F.linear(x[:, s0 : s0 + CHUNK].float(), head), dim=-1)
+            z = F.linear(x[:, s0 : s0 + CHUNK].float(), head)
+            lp = F.log_softmax(z, dim=-1)
             tgt = ids_b[:, s0 + 1 : s0 + 1 + CHUNK]
             acc["nll"][rows] += (-lp[:, : tgt.size(1)].gather(-1, tgt.unsqueeze(-1))).sum((1, 2)).cpu().numpy()
             acc["n_tgt"][rows] += tgt.size(1)
@@ -322,6 +325,12 @@ def main() -> None:
                 acc["kl"][rows] += (r_lp.exp() * (r_lp - lp.gather(-1, r_ids))).sum((1, 2)).cpu().numpy()
                 acc["agree"][rows] += (lp.argmax(-1) == r_ids[..., 0]).sum(1).cpu().numpy()
                 acc["n_pos"][rows] += lp.size(1)
+                # does a global temperature explain part of the KL? (top-1 log-prob = how sharp each model is)
+                acc["conf"][rows] += lp.amax(-1).sum(1).cpu().numpy()
+                acc["conf_ref"][rows] += r_lp[..., 0].sum(1).cpu().numpy()
+                for a_i, a in enumerate(SCALES):
+                    lp_a = F.log_softmax(z * a, dim=-1).gather(-1, r_ids)
+                    acc["kl_s"][rows, a_i] += (r_lp.exp() * (r_lp - lp_a)).sum((1, 2)).cpu().numpy()
     names = np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))["names"]
     cats = np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))["category"][3::6][:8]
     per_seq = [{"category": str(names[c]), "ppl": float(np.exp(acc["nll"][i] / acc["n_tgt"][i]))} for i, c in enumerate(cats)]
@@ -332,7 +341,10 @@ def main() -> None:
     if cli.record_routing:
         torch.save(recorded, routing_path)
     else:
-        result.update({"kl_top64": acc["kl"].sum() / acc["n_pos"].sum(), "top1_agree": acc["agree"].sum() / acc["n_pos"].sum()})
+        n_pos = acc["n_pos"].sum()
+        result.update({"kl_top64": acc["kl"].sum() / n_pos, "top1_agree": acc["agree"].sum() / n_pos,
+                       "top1_logprob": acc["conf"].sum() / n_pos, "top1_logprob_ref": acc["conf_ref"].sum() / n_pos,
+                       "kl_by_logit_scale": {str(a): acc["kl_s"][:, a_i].sum() / n_pos for a_i, a in enumerate(SCALES)}})
         for i, s in enumerate(per_seq):
             s.update({"kl": float(acc["kl"][i] / acc["n_pos"][i]), "top1": float(acc["agree"][i] / acc["n_pos"][i])})
     result["per_seq"] = per_seq
