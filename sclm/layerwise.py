@@ -1,6 +1,7 @@
 # Runs the upstream model one block at a time, so a checkpoint far larger than VRAM can do full-sequence forwards.
 import gc
 import json
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -71,13 +72,19 @@ class LayerwiseRunner:
         return block
 
     @torch.inference_mode()
-    def hidden(self, input_ids: torch.Tensor, n_layers: int | None = None) -> torch.Tensor:
-        """Hidden state [B, S, dim] after `n_layers` blocks (all by default), hc copies collapsed as upstream does."""
+    def hidden(
+        self,
+        input_ids: torch.Tensor,
+        n_layers: int | None = None,
+        before_block: Callable[[int, "m.Block"], None] | None = None,
+    ) -> torch.Tensor:
+        """Hidden state [B, S, dim] after `n_layers` blocks (all by default), hc copies collapsed as upstream does.
+        `before_block(layer_id, block)` runs after each block is loaded and before it executes (e.g. to add hooks)."""
         # upstream creates index tensors without a device and relies on the default device (generate.py sets cuda)
         with torch.device(self.device):
-            return self._hidden(input_ids, n_layers)
+            return self._hidden(input_ids, n_layers, before_block)
 
-    def _hidden(self, input_ids: torch.Tensor, n_layers: int | None) -> torch.Tensor:
+    def _hidden(self, input_ids: torch.Tensor, n_layers: int | None, before_block) -> torch.Tensor:
         args = self.args
         ids = input_ids.to(self.device)
         hashes = self.hash(ids, 0)
@@ -86,6 +93,8 @@ class LayerwiseRunner:
         pre_mix = m.make_identity_pre_mix(h, args.hc_mult)
         for i in range(args.n_layers if n_layers is None else n_layers):
             block = self.build_block(i)
+            if before_block is not None:
+                before_block(i, block)
             if block.engram is not None:
                 h = block.engram(h, hashes[:, :, block.engram.layer_hash_index, :], None)
             h, pre_mix = block(h, 0, pre_mix, None)
