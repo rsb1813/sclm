@@ -77,33 +77,35 @@ def gptq_codes(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPTQ with static groups: quantize columns in order, pushing each column's error onto the not-yet-quantized
     columns through the Cholesky factor of H^-1 (H = X^T X of the layer input), so the error lands where inputs
-    rarely point. Same output format as rtn_codes. `block` must be a multiple of `group`."""
+    rarely point. Same output format as rtn_codes. w [..., N, K] and h [..., K, K] may carry leading batch dims
+    (e.g. a group of experts), processed together. `block` must be a multiple of `group`."""
     assert block % group == 0
-    n, k = w.shape
+    *batch, n, k = w.shape
     W, H = w.float().clone(), h.float().clone()
-    dead = torch.diag(H) == 0
-    H[dead, dead] = 1
-    W[:, dead] = 0
-    H += damp * torch.diag(H).mean() * torch.eye(k, device=H.device, dtype=H.dtype)
+    diag = torch.diagonal(H, dim1=-2, dim2=-1)  # a view: edits below land in H
+    dead = diag == 0
+    diag.masked_fill_(dead, 1)
+    W.masked_fill_(dead.unsqueeze(-2), 0)
+    diag += damp * diag.mean(-1, keepdim=True)
     u = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
     half = 2 ** (bits - 1)
-    codes = torch.empty(n, k, dtype=torch.uint8, device=w.device)
-    steps = torch.empty(n, k // group, device=w.device)
+    codes = torch.empty(*batch, n, k, dtype=torch.uint8, device=w.device)
+    steps = torch.empty(*batch, n, k // group, device=w.device)
     for b0 in range(0, k, block):
         b1 = min(b0 + block, k)
-        w1, err = W[:, b0:b1].clone(), torch.zeros(n, b1 - b0, device=w.device)
-        ub = u[b0:b1, b0:b1]
+        w1, err = W[..., b0:b1].clone(), torch.zeros(*batch, n, b1 - b0, device=w.device)
+        ub = u[..., b0:b1, b0:b1]
         for i in range(b1 - b0):
             col = b0 + i
             if col % group == 0:  # the group's step comes from its columns after earlier error feedback
-                step = _best_step(w1[:, i : i + group], bits)
-                steps[:, col // group] = step.squeeze(-1)
-            idx = torch.floor(w1[:, i : i + 1] / step).clamp(-half, half - 1)
-            codes[:, col] = (idx + half).squeeze(-1).to(torch.uint8)
-            e = (w1[:, i : i + 1] - (idx + 0.5) * step) / ub[i, i]
-            w1[:, i:] -= e * ub[i : i + 1, i:]
-            err[:, i : i + 1] = e
-        W[:, b1:] -= err @ u[b0:b1, b1:]
+                step = _best_step(w1[..., i : i + group], bits)
+                steps[..., col // group] = step.squeeze(-1)
+            idx = torch.floor(w1[..., i : i + 1] / step).clamp(-half, half - 1)
+            codes[..., col] = (idx + half).squeeze(-1).to(torch.uint8)
+            e = (w1[..., i : i + 1] - (idx + 0.5) * step) / ub[..., i : i + 1, i : i + 1]
+            w1[..., i:] -= e * ub[..., i : i + 1, i:]
+            err[..., i : i + 1] = e
+        W[..., b1:] -= err @ u[..., b0:b1, b1:]
     return codes, steps
 
 

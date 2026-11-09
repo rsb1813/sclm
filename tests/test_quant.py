@@ -62,6 +62,18 @@ def test_gptq_beats_rtn_on_correlated_inputs():
     assert e_gptq < 0.5 * e_rtn, (e_gptq, e_rtn)
 
 
+def test_gptq_batched_matches_one_at_a_time():
+    torch.manual_seed(7)
+    w = torch.randn(3, 32, 128, device=DEV)
+    x = torch.randn(3, 512, 128, device=DEV)
+    h = x.transpose(1, 2) @ x
+    h[1, :, 5] = h[1, 5, :] = 0  # a dead input column in one item
+    codes, step = quant.gptq_codes(w, h, 2, 64)
+    for b in range(3):
+        c1, s1 = quant.gptq_codes(w[b], h[b], 2, 64)
+        assert torch.equal(codes[b], c1) and torch.allclose(step[b], s1)
+
+
 def test_rtn_linear_matches_dense_rotated_weight():
     """y = Q(W R) (R^T act_q(x)) must equal the dense dequantized weight R-unrotated, applied to act_q(x)."""
     import sclm.upstream  # noqa: F401
