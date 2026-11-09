@@ -60,7 +60,7 @@ def _best_step(g: torch.Tensor, bits: int, clip_grid: int = 8) -> torch.Tensor:
     amax = g.abs().amax(-1, keepdim=True).clamp_min(1e-12)
     half = 2 ** (bits - 1)  # levels at (i + 0.5) * step for i in [-half, half)
     best_step, best_err = None, None
-    for r in torch.linspace(0.5, 1.0, clip_grid, device=g.device):
+    for r in torch.linspace(0.5, 1.0, clip_grid, device=g.device, dtype=torch.float32):
         step = (amax * r / (half - 0.5)).half().float()  # the step is stored as fp16
         q = (torch.floor(g / step).clamp(-half, half - 1) + 0.5) * step
         err = (q - g).pow(2).sum(-1, keepdim=True)
