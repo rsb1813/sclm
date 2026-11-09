@@ -10,6 +10,8 @@ from .checkpoint import Checkpoint, MappedEngramEmbedding
 from .upstream import CONFIG_PATH, engram, model as m
 
 QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e8m0fnu, torch.float4_e2m1fn_x2)
+# cross-layer attention state upstream hands down the stack through its global `shared_attn`
+SHARED_ATTN_FIELDS = ("compress_kv", "index_k", "topk_idxs", "candidates")
 
 
 class _NoTable(torch.nn.Module):
@@ -80,28 +82,54 @@ class LayerwiseRunner:
     ) -> torch.Tensor:
         """Hidden state [B, S, dim] after `n_layers` blocks (all by default), hc copies collapsed as upstream does.
         `before_block(layer_id, block)` runs after each block is loaded and before it executes (e.g. to add hooks)."""
+        return self.hidden_batches([input_ids], n_layers, before_block)[0].to(self.device)
+
+    @torch.inference_mode()
+    def hidden_batches(
+        self,
+        batches: list[torch.Tensor],
+        n_layers: int | None = None,
+        before_block: Callable[[int, "m.Block"], None] | None = None,
+        before_batch: Callable[[int, int], None] | None = None,
+    ) -> list[torch.Tensor]:
+        """Like hidden() for each batch of input ids, returned on CPU, but every block is loaded once and run over
+        all batches. `before_batch(layer_id, batch_index)` runs before each batch passes through a block."""
         # upstream creates index tensors without a device and relies on the default device (generate.py sets cuda)
         with torch.device(self.device):
-            return self._hidden(input_ids, n_layers, before_block)
+            return self._hidden_batches(batches, n_layers, before_block, before_batch)
 
-    def _hidden(self, input_ids: torch.Tensor, n_layers: int | None, before_block) -> torch.Tensor:
+    def _hidden_batches(self, batches, n_layers, before_block, before_batch) -> list[torch.Tensor]:
         args = self.args
-        ids = input_ids.to(self.device)
-        hashes = self.hash(ids, 0)
-        h = F.embedding(ids, self.ckpt.get("embed.weight").to(self.device))
-        h = h.unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
-        pre_mix = m.make_identity_pre_mix(h, args.hc_mult)
+        embed = self.ckpt.get("embed.weight").to(self.device)
+        hashes, hs, mixes, shared = [], [], [], []
+        for ids in batches:
+            ids = ids.to(self.device)
+            hashes.append(self.hash(ids, 0))
+            h = F.embedding(ids, embed).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
+            mixes.append(m.make_identity_pre_mix(h, args.hc_mult))
+            hs.append(h.cpu())
+            shared.append({})
+        del embed
         for i in range(args.n_layers if n_layers is None else n_layers):
             block = self.build_block(i)
             if before_block is not None:
                 before_block(i, block)
-            if block.engram is not None:
-                h = block.engram(h, hashes[:, :, block.engram.layer_hash_index, :], None)
-            h, pre_mix = block(h, 0, pre_mix, None)
+            for j in range(len(batches)):
+                for name, value in shared[j].items():
+                    setattr(m.shared_attn, name, value)
+                if before_batch is not None:
+                    before_batch(i, j)
+                h = hs[j].to(self.device)
+                if block.engram is not None:
+                    h = block.engram(h, hashes[j][:, :, block.engram.layer_hash_index, :], None)
+                h, mixes[j] = block(h, 0, mixes[j], None)
+                hs[j] = h.cpu()
+                # source layers publish their own persistent caches here, which the next batch overwrites: copy
+                shared[j] = {n: v.clone() for n in SHARED_ATTN_FIELDS if (v := getattr(m.shared_attn, n)) is not None}
             del block
             gc.collect()
             torch.cuda.empty_cache()
-        return m.Block.hc_pre(None, h, pre_mix)
+        return [m.Block.hc_pre(None, h.to(self.device), mix).cpu() for h, mix in zip(hs, mixes)]
 
     @torch.inference_mode()
     def token_nll(self, input_ids: torch.Tensor, chunk: int = 512) -> torch.Tensor:

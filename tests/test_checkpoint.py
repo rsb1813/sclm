@@ -31,6 +31,25 @@ def runner():
     torch.set_default_dtype(torch.float32)
 
 
+needs_layers0_3 = pytest.mark.skipif(
+    not have("model-00004-of-00048.safetensors", "model-00005-of-00048.safetensors",
+             "model-00006-of-00048.safetensors", "model-00047-of-00048.safetensors"),
+    reason="layer 0-3 shards not downloaded",
+)
+
+
+@needs_layer0
+@needs_layers0_3
+def test_layer_major_batches_match_single_runs(runner):
+    # 512 tokens exceed the 128 window, and layer 3 reads the compressed KV and top-k that layer 2 publishes,
+    # so a wrong save/restore of the cross-layer state between batches shows up here
+    g = torch.Generator().manual_seed(0)
+    a, b = (torch.randint(1000, 100000, (1, 512), generator=g) for _ in range(2))
+    both = runner.hidden_batches([a, b], n_layers=4)
+    assert torch.equal(both[0], runner.hidden(a, n_layers=4).cpu())
+    assert torch.equal(both[1], runner.hidden(b, n_layers=4).cpu())
+
+
 @needs_layer0
 def test_layer0_loads_strictly_and_runs(runner):
     ids = torch.tensor([[0] + list(range(1000, 1255))])  # BOS then arbitrary ordinary tokens
