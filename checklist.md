@@ -22,7 +22,8 @@
 - [ ] 다운로드 방식 결정 (CDN이 샌드박스에서 차단됨 → 사용자 실행 또는 승인)
 - [ ] range 요청으로 safetensors 헤더 읽기 (텐서 offset·shape 확인, 사용자 실행 또는 승인)
 - [ ] 순수 PyTorch 레퍼런스 작성 (`kernel.py` 수치 그대로: act_quant, fp4/fp8 GEMM, sparse_attn, hc sinkhorn)
-- [ ] 작은 무작위 모델로 공식 구현과 수치 비교 (WSL2 + tilelang)
+- [ ] 커널별 단위 테스트 (수학적 정의와 대조) + 작은 무작위 모델 end-to-end 실행 테스트
+- [ ] 실제 가중치로 perplexity·생성 결과 확인 (레퍼런스 정확성의 최종 검증)
 - [ ] Engram 해시 구현 이식과 토크나이저 압축 어휘 크기(99,092) 검증
 - [ ] 층 단위 레퍼런스 실행 코드 작성 (Pass 1 골격, 층 간 KV/indexer 의존성 포함)
 - [ ] 층 0에서 압축 계산 시간 실측, N과 기법 조정

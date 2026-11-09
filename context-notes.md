@@ -28,3 +28,5 @@
 - **drafter는 무손실 검증이라 품질 걱정 없이 극단 압축**할 수 있다(C9). confidence head로 검증 길이를 조절한다(S5).
 - **다중 토큰 검증과 롤백은 공식 코드에 없다.** 직접 구현한다.
 - **환경 정리**: 사용자 요청으로 Docker Desktop을 종료하고 `HKCU\...\Run`의 "Docker Desktop" 등록을 지웠다(원래 값: `C:\Users\jolib\AppData\Local\Programs\DockerDesktop\Docker Desktop.exe`). Docker 자체 설정의 AutoStart는 원래 false였다. 전원 계획은 고성능으로 바꿨다. RAM 가용량은 54.1GB에서 67.9GB로 늘었다.
+- **WSL 배포판과 Docker 완전 삭제 (사용자 결정, 백업 없음)**: Docker Desktop 4.87.0 제거(데이터 39.6GB 포함), Ubuntu-24.04 등록 해제(가상 디스크 169GB, 안에 `xsec-build` 90GB 등 작업 폴더가 있었으나 사용자가 다른 PC로 옮겼다고 확인), Docker 잔여 설정 폴더 삭제. WSL 기능 자체는 남겼다. 삭제 후 C: 여유 공간은 1362GB(이전 측정 753GB).
+- **검증 방법 변경**: WSL이 없으므로 tilelang 공식 커널과 직접 비교하지 않는다. 커널 단위 테스트와 실제 가중치 perplexity로 검증한다. 커널 수식은 단순해서(블록 fake-quant, scale 곱 GEMM, sink 포함 softmax, Sinkhorn) 위험이 낮다고 판단했다.

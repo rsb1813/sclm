@@ -111,7 +111,7 @@ L4가 클라우드 증류를 대신하는 품질의 핵심 지렛대다. 비용 
 
 ## 8. Windows 구현 방침
 
-- **레퍼런스 실행**: transformers 5.22.2에는 `deepseek_v41`이 없다(`deepseek_v4`까지만 있음). 그래서 공식 `inference/model.py`와 `kernel.py`를 순수 PyTorch로 옮긴 단일 GPU 레퍼런스를 네이티브 Windows(Python 3.14, torch 2.15.0+cu134, `.venv`)에서 돌린다. WSL2는 tilelang 공식 구현과의 수치 비교에만 쓴다.
+- **레퍼런스 실행**: transformers 5.22.2에는 `deepseek_v41`이 없다(`deepseek_v4`까지만 있음). 그래서 공식 `inference/model.py`와 `kernel.py`를 순수 PyTorch로 옮긴 단일 GPU 레퍼런스를 네이티브 Windows(Python 3.14, torch 2.15.0+cu134, `.venv`)에서 돌린다. WSL 배포판은 모두 제거했다(기능만 남김).
 - **엔진**: 네이티브 C++/CUDA + AVX-512. Triton은 Windows 지원이 불안정하므로 CUDA 커널을 직접 작성한다.
 - **OS 설정**: HAGS 켜기, "메모리에 페이지 잠금" 권한 + `MEM_LARGE_PAGES`, 고성능 전원 계획, 스레드 고정(`SetThreadAffinityMask`), 모델 폴더 Defender 실시간 검사 제외.
 - **I/O**: Engram은 IoRing 또는 unbuffered overlapped I/O.
@@ -170,7 +170,7 @@ C8 PQ 품질이 나쁘면 Engram을 4bit(약 110GB)로 후퇴한다.
 2. 신규 아키텍처(mHC, CSA2, Engram, DSpark)를 직접 구현 → 모듈별로 레퍼런스와 출력 일치 테스트를 먼저 만든다.
 3. 적중률·CPU 커널 효율·채택률 가정이 틀릴 수 있음 → Phase 0 측정으로 확정.
 4. 디스크 → 8.1절 range 스트리밍으로 피크와 최종 모두 약 70~85GB. Engram PQ가 실패하면 약 110GB가 더해진다.
-5. 공식 커널(tilelang)과 분산 코드는 Windows에서 그대로 못 쓴다 → `kernel.py`의 수치를 순수 PyTorch로 그대로 옮긴 단일 GPU 레퍼런스를 만들고, 작은 무작위 모델(공식 `ModelArgs` 기본값)로 공식 구현과 비트 단위 비교를 한다(비교만 WSL2에서).
+5. 공식 커널(tilelang)과 분산 코드는 Windows에서 그대로 못 쓴다 → `kernel.py`의 수치를 순수 PyTorch로 그대로 옮긴 단일 GPU 레퍼런스를 만든다. WSL은 제거했으므로 tilelang과 직접 비교하지 않고, (a) 커널별로 수학적 정의와 대조하는 단위 테스트, (b) 실제 가중치로 알려진 텍스트의 perplexity와 생성 결과 확인으로 검증한다.
 6. 다중 토큰 검증과 롤백을 직접 구현해야 한다(7절).
 
 ## 12. 단계
