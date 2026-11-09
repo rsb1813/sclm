@@ -33,8 +33,13 @@ CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had"
            "proj512_in": ("proj", 512, "in"), "proj512_out": ("proj", 512, "out"),
            # per-expert bits from scripts/allocate_bits.py (data/alloc_<name>.json); 4 keeps the original FP4 expert
            "alloc_2p75": ("alloc", "2p75"),
-           # GPTQ per expert from calibration sequences (GPTQExperts)
-           "gptq2": ("gptq", 2), "gptq3": ("gptq", 3)}
+           # GPTQ per expert from calibration sequences (GPTQExperts); the last field is the H-metric unbiasing
+           "gptq2": ("gptq", 2, True), "gptq3": ("gptq", 3, True),
+           # per-expert GPTQ option or the original FP4 expert (the SSD tier) from scripts/allocate_tiers.py
+           "tier20": ("gptq_alloc", "tier20", False)}
+# GPTQ storage options: name -> (bits, levels, group); "orig" keeps the original FP4 expert
+GPTQ_OPTIONS = {"1b128": (1, 2, 128), "t128": (2, 3, 128), "2b128": (2, 4, 128), "2b64": (2, 4, 64),
+                "3b64": (3, 8, 64), "3b128": (3, 8, 128)}
 
 
 class DenseFP4Linear(torch.nn.Module):
@@ -122,15 +127,18 @@ def rotate_h(h: torch.Tensor, rot: quant.BlockHadamard) -> torch.Tensor:
     return rot_cols(rot, rot_cols(rot, h).transpose(-1, -2))
 
 
-def gptq_unbiased(w: torch.Tensor, hr: torch.Tensor, bits: int, rot: quant.BlockHadamard):
+def gptq_in_basis(w: torch.Tensor, hr: torch.Tensor, bits: int, rot: quant.BlockHadamard, levels: int | None = None,
+                  group: int = 64, unbias: bool = True):
     """GPTQ of w [E, N, K] in the Hadamard basis under Hessians hr [E, K, K] already in that basis (rotate_h), rows
-    rescaled by the output shrinkage <w_hat, w>_H / <w, w>_H. Returns codes and steps (rotated basis) and the
-    dequantized weight (original basis)."""
+    optionally rescaled by the output shrinkage <w_hat, w>_H / <w, w>_H. Returns codes and steps (rotated basis) and
+    the dequantized weight (original basis)."""
     from scripts.gptq_probe import rot_cols
 
     wr = rot_cols(rot, w)
-    codes, steps = quant.gptq_codes(wr, hr, bits, 64)
-    wq = quant.rtn_dequant(codes, steps, bits, 64)
+    codes, steps = quant.gptq_codes(wr, hr, bits, group, levels=levels)
+    wq = quant.rtn_dequant(codes, steps, bits, group, levels)
+    if not unbias:
+        return codes, steps, rot_cols(rot, wq, inverse=True)
     beta = (((wq @ hr) * wr).sum(-1) / ((wr @ hr) * wr).sum(-1)).clamp_min(0.05)
     return codes, steps / beta[..., None], rot_cols(rot, wq / beta[..., None], inverse=True)
 
@@ -138,10 +146,11 @@ def gptq_unbiased(w: torch.Tensor, hr: torch.Tensor, bits: int, rot: quant.Block
 class GPTQExperts:
     """Collects a layer's FFN inputs and routing while the calibration batches pass, then, right before the first eval
     batch, replaces its routed experts by GPTQ codes: Hadamard basis, per-expert gate^2-weighted X^T X mixed with the
-    layer covariance (beta), H-metric unbiasing. The calibration stream stays the uncompressed model's."""
+    layer covariance (beta), optional H-metric unbiasing. The calibration stream stays the uncompressed model's.
+    `plan(layer)` names each expert's GPTQ_OPTIONS entry, or "orig" to keep its FP4 weights."""
 
-    def __init__(self, bits: int, n_cal: int, beta: float = 0.5, batch: int = 8):
-        self.bits, self.n_cal, self.beta, self.batch = bits, n_cal, beta, batch
+    def __init__(self, plan, n_cal: int, unbias: bool, beta: float = 0.5, batch: int = 8):
+        self.plan, self.n_cal, self.unbias, self.beta, self.batch = plan, n_cal, unbias, beta, batch
         self.block, self.store, self.cur, self.t0 = None, [], 0, time.time()
         self.rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (5120, 2304)}  # quant_eval's usual seeds
 
@@ -161,7 +170,6 @@ class GPTQExperts:
 
     def quantize_(self, block) -> None:
         from scripts.gptq_probe import tr_norm
-        from scripts.quant_probe import SWIGLU_LIMIT
 
         t0 = time.time()
         xq = act_q(torch.cat([s[0] for s in self.store]))
@@ -169,12 +177,31 @@ class GPTQExperts:
         idx = torch.cat([s[2] for s in self.store]).long()
         self.store = []
         h_layer = tr_norm(xq.t() @ xq)
-        eye = torch.eye(2304, device=DEV, dtype=torch.float32)
         experts = block.ffn.experts
         experts.to("cpu")  # frees ~7GB of FP4 weights for the Hessians; each batch is copied back for its GPTQ
         torch.cuda.empty_cache()
-        for e0 in range(0, len(experts), self.batch):
-            es = list(range(e0, min(e0 + self.batch, len(experts))))
+        plan = self.plan(self.layer)
+        # kept FP4 experts return to the GPU last, after the Hessians of the quantized ones are freed
+        for opt in sorted(dict.fromkeys(plan), key=lambda o: o == "orig"):
+            es = [e for e, p in enumerate(plan) if p == opt]
+            if opt == "orig":
+                for e in es:
+                    experts[e].to(DEV)
+            else:
+                self.quantize_option_(experts, es, *GPTQ_OPTIONS[opt], xq, gw, idx, h_layer)
+        counts = {o: plan.count(o) for o in dict.fromkeys(plan)}
+        print(f"gptq layer {self.layer:2d}: {xq.size(0)} calib tokens, {counts}, {time.time() - t0:.0f}s, "
+              f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB, total {(time.time() - self.t0) / 60:.0f} min",
+              flush=True)
+
+    def quantize_option_(self, experts, members: list, bits: int, levels: int, group: int, xq, gw, idx,
+                         h_layer) -> None:
+        from scripts.gptq_probe import tr_norm
+        from scripts.quant_probe import SWIGLU_LIMIT
+
+        eye = torch.eye(2304, device=DEV, dtype=torch.float32)
+        for e0 in range(0, len(members), self.batch):
+            es = members[e0 : e0 + self.batch]
             toks = [torch.where(idx == e) for e in es]
             w1, w2, w3 = (torch.stack([fp4_dense(getattr(experts[e], n).to(DEV)) for e in es])
                           for n in ("w1", "w2", "w3"))
@@ -184,8 +211,8 @@ class GPTQExperts:
                 h_e = tr_norm(xr.t() @ (gw[rows, slot].pow(2)[:, None] * xr)) if rows.numel() else h_layer
                 h1.append((1 - self.beta) * h_e + self.beta * h_layer)
             h1 = rotate_h(torch.stack(h1), self.rots[5120])
-            c1, s1, q1 = gptq_unbiased(w1, h1, self.bits, self.rots[5120])
-            c3, s3, q3 = gptq_unbiased(w3, h1, self.bits, self.rots[5120])
+            c1, s1, q1 = gptq_in_basis(w1, h1, bits, self.rots[5120], levels, group, self.unbias)
+            c3, s3, q3 = gptq_in_basis(w3, h1, bits, self.rots[5120], levels, group, self.unbias)
             del h1, w1, w3
             h2 = []
             for k, (rows, slot) in enumerate(toks):
@@ -196,14 +223,13 @@ class GPTQExperts:
                 g, u = xr @ q1[k].t(), (xr @ q3[k].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
                 hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[rows, slot, None])
                 h2.append((1 - self.beta) * tr_norm(hid.t() @ hid) + self.beta * eye)
-            c2, s2, _ = gptq_unbiased(w2, rotate_h(torch.stack(h2), self.rots[2304]), self.bits, self.rots[2304])
+            c2, s2, _ = gptq_in_basis(w2, rotate_h(torch.stack(h2), self.rots[2304]), bits, self.rots[2304], levels,
+                                      group, self.unbias)
             del h2, w2, q1, q3
             for k, e in enumerate(es):
                 for name, c, st, rot in (("w1", c1, s1, 5120), ("w2", c2, s2, 2304), ("w3", c3, s3, 5120)):
-                    setattr(experts[e], name, quant.RTNLinear.from_codes(c[k], st[k], self.bits, 64, self.rots[rot]))
-        print(f"gptq layer {self.layer:2d}: {xq.size(0)} calib tokens, {time.time() - t0:.0f}s, "
-              f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB, total {(time.time() - self.t0) / 60:.0f} min",
-              flush=True)
+                    setattr(experts[e], name,
+                            quant.RTNLinear.from_codes(c[k], st[k], bits, group, self.rots[rot], levels))
 
 
 def freeze_routing_(block, layer: int, ref_idx: list, cur: dict) -> None:
@@ -251,7 +277,7 @@ def main() -> None:
         with open(os.path.join(DATA, f"alloc_{cfg[1]}.json")) as f:
             alloc = json.load(f)["bits"]
         before_block = lambda i, block: quantize_experts_(block, alloc[i], 64, True, True)  # noqa: E731
-    elif isinstance(cfg, tuple) and cfg[0] == "gptq":
+    elif isinstance(cfg, tuple) and cfg[0] in ("gptq", "gptq_alloc"):
         before_block = None  # set below with the calibration batches
     else:
         before_block = (lambda i, block: quantize_experts_(block, *cfg)) if cfg else None
@@ -284,13 +310,18 @@ def main() -> None:
 
     batches = list(seqs.split(2))
     n_cal = 0
-    if isinstance(cfg, tuple) and cfg[0] == "gptq":
+    if isinstance(cfg, tuple) and cfg[0] in ("gptq", "gptq_alloc"):
         assert not (cli.freeze_routing or cli.record_routing)
         from scripts.collect_bases import calib_indices
 
         cal = list(tokens[calib_indices(tokens.size(0), 16)].split(2))  # 15 sequences, none of them eval
         n_cal, batches = len(cal), cal + batches
-        gq = GPTQExperts(cfg[1], n_cal)
+        if cfg[0] == "gptq":
+            plan = lambda i: [f"{cfg[1]}b64"] * runner.args.n_routed_experts  # noqa: E731
+        else:
+            with open(os.path.join(DATA, f"alloc_{cfg[1]}.json")) as f:
+                plan = json.load(f)["options"].__getitem__
+        gq = GPTQExperts(plan, n_cal, cfg[2])
         before_block, before_batch = gq.before_block, gq.before_batch
     hidden = runner.hidden_batches(batches, before_block=before_block, before_batch=before_batch)[n_cal:]
     t_fwd = time.time() - t0
