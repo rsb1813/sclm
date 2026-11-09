@@ -38,6 +38,17 @@ def allocate(w: np.ndarray, f: np.ndarray, d: np.ndarray, c: np.ndarray, ram: fl
     return fit_ram(hi)
 
 
+def layer_sensitivity(n_layers: int, group: int = 8) -> np.ndarray:
+    """Relative KL cost per unit distortion of each layer: excess KL over the noise floor (the dense run) when only its
+    8-layer group is RTN 2-bit (quant_eval --layers), normalized to mean 1. Excess KL adds up across groups."""
+    floor = json.load(open(os.path.join(DATA, "eval_dense.json")))["kl_top64"]
+    s = np.empty(n_layers)
+    for lo in range(0, n_layers, group):
+        with open(os.path.join(DATA, f"eval_rtn2_had_ub_L{lo}-{lo + group}.json")) as fh:
+            s[lo : lo + group] = json.load(fh)["kl_top64"] - floor
+    return s / s.mean()
+
+
 def miss_share(idx_l: np.ndarray, n_exp: int, horizon: float) -> np.ndarray:
     """Per expert, the share of its calls whose previous call lies more than `horizon` tokens back: what an LRU cache
     whose items live `horizon` tokens misses (Che's approximation). idx_l [tokens, topk] in decode order."""
@@ -72,6 +83,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tok-s", type=float, required=True, help="decode speed whose SSD budget the tier may use")
     ap.add_argument("--cache-experts", type=int, default=0, help="VRAM LRU cache for SSD-tier experts (FP4)")
+    ap.add_argument("--global-budget", action="store_true", help="share RAM and SSD across layers, not per layer")
+    ap.add_argument("--layer-weights", action="store_true", help="weight distortion by measured layer sensitivity")
     ap.add_argument("--ram-bpw", type=float, default=1.10, help="RAM for routed experts, as bpw over all of them")
     ap.add_argument("--options", default=",".join(RAM_OPTIONS))
     ap.add_argument("--name", required=True)
@@ -92,12 +105,18 @@ def main() -> None:
     for layer in range(idx.shape[1]):
         np.add.at(w[layer], idx[:, layer].ravel(), (g[:, layer] ** 2).ravel() / n_tok)
         np.add.at(f[layer], idx[:, layer].ravel(), 1.0 / n_tok)
+    sens = layer_sensitivity(idx.shape[1])
+    if cli.layer_weights:
+        w *= sens[:, None]
 
     def tiers(horizon: float) -> tuple[list, list, np.ndarray]:
+        reads = np.stack([f[layer] * miss_share(idx[:, layer], n_exp, horizon) for layer in range(len(f))])
+        if cli.global_budget:
+            picks = allocate(w.ravel(), reads.ravel(), d, c, cli.ram_bpw * w.size, ssd_reads * len(f)).reshape(w.shape)
+        else:
+            picks = [allocate(w[layer], reads[layer], d, c, cli.ram_bpw * n_exp, ssd_reads) for layer in range(len(f))]
         plan, report = [], []
-        for layer in range(idx.shape[1]):
-            reads = f[layer] * miss_share(idx[:, layer], n_exp, horizon)
-            p = allocate(w[layer], reads, d, c, cli.ram_bpw * n_exp, ssd_reads)
+        for layer, p in enumerate(picks):
             on_ram = p < len(c)
             opts = [names[i] if i < len(c) else "orig" for i in p]
             report.append({"counts": {o: opts.count(o) for o in names + ["orig"]},
@@ -130,7 +149,8 @@ def main() -> None:
         calls, misses = replay(idx_all[mask], on_ssd, cli.cache_experts)
         sim[split] = {"calls_per_token": calls / mask.sum(), "reads_per_token": misses / mask.sum(),
                       "ssd_bound_tok_s": SSD_BYTES_S / (misses / mask.sum() * ORIG_BYTES)}
-    out = {"tok_s": cli.tok_s, "ram_bpw": cli.ram_bpw, "cache_experts": cli.cache_experts, "horizon": lo,
+    out = {"tok_s": cli.tok_s, "ram_bpw": cli.ram_bpw, "cache_experts": cli.cache_experts,
+           "global_budget": cli.global_budget, "horizon": lo,
            "options": plan, "d": dict(zip(names, d.tolist())), "ssd_reads_per_layer": ssd_reads,
            "calib_tokens": int(n_tok), "replay": sim, "layers": report}
     with open(os.path.join(DATA, f"alloc_{cli.name}.json"), "w") as fh:
@@ -138,7 +158,8 @@ def main() -> None:
     mean = lambda k: np.mean([x[k] for x in report])  # noqa: E731
     print(f"{cli.name}: SSD budget {ssd_reads:.3f} reads/layer/token, RAM {mean('ram_bpw_all'):.3f} bpw "
           f"(resident {mean('ram_bpw_resident'):.3f}), SSD call share {mean('ssd_call_share'):.3f}, "
-          f"distortion {mean('distortion'):.4f}")
+          f"distortion {mean('distortion'):.4f} (sensitivity-weighted "
+          f"{np.mean(sens * [x['distortion'] for x in report]):.4f})")
     for split, v in sim.items():
         print(f"  {split} replay: {v['calls_per_token']:.2f} SSD calls/token, {v['reads_per_token']:.2f} reads/token, "
               f"SSD-bound {v['ssd_bound_tok_s']:.1f} tok/s")
