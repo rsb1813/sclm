@@ -139,6 +139,34 @@ def rtn(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8, levels: int 
     return rtn_dequant(*rtn_codes(w, bits, group, clip_grid, levels), bits, group, levels)
 
 
+def refit_steps(q: torch.Tensor, w: torch.Tensor, sets: list, group: int, ridge: float = 1e-4,
+                chunk: int = 512) -> torch.Tensor:
+    """Least-squares group steps for fixed levels q [N, K] (the weight in units of its step, e.g. rtn_dequant with unit
+    steps). Per row, minimizes over token sets (x [T, K], wt [T], mix) the sum of
+    mix / tr * sum_t wt_t (x_t.(q*s) - x_t.w)^2, with tr = sum_t wt_t |x_t|^2 / K normalizing each set the way tr_norm
+    does a Hessian. The output is linear in the steps, so this is one G x G system per row (G = K / group). Returns
+    s [N, G] (fp32)."""
+    n, k = q.shape
+    g = k // group
+    qg = q.float().reshape(n, g, group)
+    a = torch.zeros(n, g, g, device=q.device, dtype=torch.float32)
+    b = torch.zeros(n, g, device=q.device, dtype=torch.float32)
+    for x, wt, mix in sets:
+        x, wt = x.float(), wt.float()
+        tr = float((wt[:, None] * x.pow(2)).sum()) / k
+        if tr <= 0:
+            continue
+        for t0 in range(0, x.size(0), chunk):
+            xc, wc = x[t0 : t0 + chunk], wt[t0 : t0 + chunk] * (mix / tr)
+            z = torch.einsum("tgk,ngk->tng", xc.reshape(-1, g, group), qg)  # each group's output per unit step
+            y = xc @ w.float().t()
+            a += torch.einsum("tng,tnh->ngh", z * wc[:, None, None], z)
+            b += torch.einsum("tng,tn->ng", z * wc[:, None, None], y)
+    a += ridge * torch.diagonal(a, dim1=-2, dim2=-1).mean(-1).clamp_min(1e-30)[:, None, None] * torch.eye(
+        g, device=a.device, dtype=torch.float32)
+    return torch.linalg.solve(a, b)
+
+
 def pack_nibbles(codes: torch.Tensor) -> torch.Tensor:
     """uint8 codes < 16, [..., K] -> [..., K/2] (even index in the low nibble)."""
     return codes[..., 0::2] | (codes[..., 1::2] << 4)

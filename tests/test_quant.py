@@ -141,6 +141,24 @@ def test_gptq_ternary_beats_rtn_ternary():
     assert out_err(quant.rtn_dequant(codes, step, 2, 64, levels=3)) < 0.5 * out_err(quant.rtn(w, 2, 64, levels=3))
 
 
+def test_refit_steps_recovers_steps_and_lowers_gptq_output_error():
+    torch.manual_seed(15)
+    q = torch.randint(-2, 2, (16, 256), device=DEV).float() + 0.5
+    s_true = torch.rand(16, 2, device=DEV) + 0.5
+    x = torch.randn(1000, 256, device=DEV)
+    ones = torch.ones(1000, device=DEV)
+    s = quant.refit_steps(q, q * s_true.repeat_interleave(128, -1), [(x, ones, 1.0)], 128)
+    assert torch.allclose(s, s_true, atol=1e-3)
+    # after GPTQ, refitting the steps can only lower the output error both of them minimize
+    x = torch.randn(1000, 32, device=DEV) @ torch.randn(32, 256, device=DEV) + 0.1 * torch.randn(1000, 256, device=DEV)
+    w = torch.randn(64, 256, device=DEV)
+    codes, step = quant.gptq_codes(w, x.t() @ x, 1, 64)
+    q = quant.rtn_dequant(codes, torch.ones_like(step), 1, 64)
+    s = quant.refit_steps(q, w, [(x, ones, 1.0)], 64)
+    err = lambda st: ((q * st.repeat_interleave(64, -1) - w) @ x.t()).pow(2).sum()  # noqa: E731
+    assert err(s) < 0.95 * err(step), (err(s), err(step))
+
+
 def test_two_bit_codes_pack_four_per_byte():
     torch.manual_seed(11)
     codes = torch.randint(0, 4, (6, 256), device=DEV, dtype=torch.uint8)

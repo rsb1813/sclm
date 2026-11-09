@@ -38,6 +38,11 @@ CONFIGS = {
     "gptqt_g128_ubnone": ("gptq", 2, 0.5, "plain", 3, 128, "none"),
     "gptq2_g128_ubnone": ("gptq", 2, 0.5, "plain", 4, 128, "none"),
     "gptq3_g128_ubnone": ("gptq", 3, 0.5, "plain", 8, 128, "none"),
+    # optional refit: least-squares group steps after GPTQ under the same Hessian mix (quant.refit_steps, design.md T8)
+    "gptq1_g128_refit": ("gptq", 1, 0.5, "plain", 2, 128, "none", True),
+    "gptqt_g128_refit": ("gptq", 2, 0.5, "plain", 3, 128, "none", True),
+    "gptq2_g128_refit": ("gptq", 2, 0.5, "plain", 4, 128, "none", True),
+    "gptq3_g128_refit": ("gptq", 3, 0.5, "plain", 8, 128, "none", True),
 }
 
 
@@ -60,15 +65,21 @@ def unbias(wq: torch.Tensor, w: torch.Tensor, h: torch.Tensor | None = None) -> 
 
 
 def quantize(w: torch.Tensor, h: torch.Tensor | None, bits: int, rot: quant.BlockHadamard, levels: int | None = None,
-             group: int = GROUP, h_ub: "torch.Tensor | str" = "fit") -> torch.Tensor:
+             group: int = GROUP, h_ub: "torch.Tensor | str" = "fit", refit: list | None = None) -> torch.Tensor:
     """w [E, N, K] -> unbiased dequantized weight in the original basis; GPTQ when h [E, K, K] is given. h_ub is the
-    unbiasing metric: "fit" (h itself), "none", or a [K, K] matrix."""
+    unbiasing metric: "fit" (h itself), "none", or a [K, K] matrix. refit gives each expert's token sets
+    [(x [T, K], weight [T], mix)] (original basis) to re-solve the GPTQ steps by least squares."""
     wr, hr = rot_cols(rot, w), None
     if h is None:
         wq = quant.rtn(wr.reshape(-1, wr.size(-1)), bits, group, levels=levels).reshape(wr.shape)
     else:
         hr = rot_cols(rot, rot_cols(rot, h).transpose(-1, -2))  # R^T H R
-        wq = quant.rtn_dequant(*quant.gptq_codes(wr, hr, bits, group, levels=levels), bits, group, levels)
+        codes, steps = quant.gptq_codes(wr, hr, bits, group, levels=levels)
+        if refit is not None:
+            q = quant.rtn_dequant(codes, torch.ones_like(steps), bits, group, levels)  # levels in units of the step
+            steps = torch.stack([quant.refit_steps(q[e], wr[e], [(rot.rotate(x), wt, m) for x, wt, m in sets], group)
+                                 for e, sets in enumerate(refit)])
+        wq = quant.rtn_dequant(codes, steps, bits, group, levels)
     if isinstance(h_ub, str) and h_ub == "none":
         return rot_cols(rot, wq, inverse=True)
     hu = hr if isinstance(h_ub, str) else rot_cols(rot, rot_cols(rot, h_ub).transpose(-1, -2))
@@ -80,6 +91,7 @@ def main() -> None:
     ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
     ap.add_argument("--layer", type=int, default=10)
     ap.add_argument("--configs", default=",".join(CONFIGS))
+    ap.add_argument("--fit-every", type=int, default=1, help="keep every m-th Hessian chunk (calibration size study)")
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)
 
@@ -89,8 +101,10 @@ def main() -> None:
     x, idx, gw = data["x"].to(DEV).float(), data["idx"].to(DEV).long(), data["w"].to(DEV).float()
     c, r = nrm["c"].to(DEV).float(), nrm["r"].to(DEV).float()
     n = x.size(0)
-    is_fit = (torch.arange(n, device=DEV) // 256) % 2 == 0  # interleaved chunks: both halves span every category
-    fit, ev = is_fit.nonzero().flatten(), (~is_fit).nonzero().flatten()
+    t = torch.arange(n, device=DEV)
+    is_ev = (t // 256) % 2 == 1  # interleaved chunks: both halves span every category
+    is_fit = ~is_ev & ((t // 512) % cli.fit_every == 0)  # thinning the fit half leaves the held-out half as it is
+    fit, ev = is_fit.nonzero().flatten(), is_ev.nonzero().flatten()
     xq = act_q(x)
     omega = c.pow(2) / r.pow(2).sum(-1)  # per-token NRD weight without the gate (added per expert)
     h_layer = {"plain": tr_norm(xq[fit].t() @ xq[fit]),
@@ -115,10 +129,13 @@ def main() -> None:
         return y
 
     def compressed(method: str, bits: int, beta, weighting, levels: int | None = None, group: int = GROUP,
-                   ub: str = "fit"):
+                   ub: str = "fit", refit: bool = False):
         rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (5120, 2304)}
         eye = torch.eye(2304, device=DEV, dtype=torch.float32)
         ub1, ub2 = (h_layer[weighting], eye) if ub == "prior" else (ub, ub)
+        # the refit's stand-ins for the Hessian priors: 512 layer tokens for w1/w3, unit vectors (identity) for w2
+        x_prior = xq[fit[:: max(1, fit.numel() // 512)][:512]]
+        ones = lambda t: torch.ones(t.size(0), device=DEV, dtype=torch.float32)  # noqa: E731
         for e0 in range(0, N_EXP, BATCH):
             es = list(range(e0, min(e0 + BATCH, N_EXP)))
             ws = [ref(e) for e in es]
@@ -133,23 +150,35 @@ def main() -> None:
                     h_e = tr_norm(xr.t() @ (wt[:, None] * xr)) if rows.numel() else h_layer[weighting]
                     h1.append((1 - beta) * h_e + beta * h_layer[weighting])
                 h1 = torch.stack(h1)
-            w1q, w3q = (quantize(w, h1, bits, rots[5120], levels, group, ub1) for w in (w1, w3))
+            sets1 = None
+            if refit:
+                sets1 = []
+                for e in es:
+                    rows, slot = tok_fit[e]
+                    xr = xq[fit[rows]]
+                    own = [(xr, gw[fit[rows], slot].pow(2), 1 - beta)] if rows.numel() else []
+                    sets1.append(own + [(x_prior, ones(x_prior), beta if own else 1.0)])
+            w1q, w3q = (quantize(w, h1, bits, rots[5120], levels, group, ub1, sets1) for w in (w1, w3))
             del h1
-            h2 = None
+            h2, sets2 = None, [] if refit else None
             if method == "gptq":
                 h2 = []
                 for i, e in enumerate(es):
                     rows, slot = tok_fit[e]
                     if not rows.numel():
                         h2.append(eye)
+                        if refit:
+                            sets2.append([(eye, ones(eye), 1.0)])
                         continue
                     xr = xq[fit[rows]]
                     g, u = xr @ w1q[i].t(), (xr @ w3q[i].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
                     hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[fit[rows], slot, None])
                     wt = omega[fit[rows]] if weighting == "nrd" else torch.ones(rows.numel(), device=DEV, dtype=torch.float32)
                     h2.append((1 - beta) * tr_norm(hid.t() @ (wt[:, None] * hid)) + beta * eye)
+                    if refit:
+                        sets2.append([(hid, wt, 1 - beta), (eye, ones(eye), beta)])
                 h2 = torch.stack(h2)
-            w2q = quantize(w2, h2, bits, rots[2304], levels, group, ub2)
+            w2q = quantize(w2, h2, bits, rots[2304], levels, group, ub2, sets2)
             for i, e in enumerate(es):
                 yield e, w1q[i], w2q[i], w3q[i]
 
@@ -162,10 +191,11 @@ def main() -> None:
         t0 = time.time()
         y_q = routed(compressed(*CONFIGS[name]))
         d = y_q - y_ref
-        results[name] = {"nrd_rel": float((seen(d).mean() / sig).sqrt()),
-                         "routed_nmse": float(d.pow(2).sum() / y_ref.pow(2).sum()),
-                         "out_gain": float((y_q * y_ref).sum() / y_ref.pow(2).sum()), "sec": time.time() - t0}
-        print(name, json.dumps(results[name]), flush=True)
+        key = name if cli.fit_every == 1 else f"{name}_fit1of{cli.fit_every}"
+        results[key] = {"nrd_rel": float((seen(d).mean() / sig).sqrt()),
+                        "routed_nmse": float(d.pow(2).sum() / y_ref.pow(2).sum()),
+                        "out_gain": float((y_q * y_ref).sum() / y_ref.pow(2).sum()), "sec": time.time() - t0}
+        print(key, json.dumps(results[key]), flush=True)
         with open(out_path, "w") as f:
             json.dump(results, f, indent=1)
 
