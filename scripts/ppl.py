@@ -41,18 +41,42 @@ TEXTS = {
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    parser.add_argument("--file", help="score this text file instead of the built-in samples")
+    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--no-compressed",
+        action="store_true",
+        help="ablation: drop every compressed-KV position so attention sees only the sliding window",
+    )
     args_cli = parser.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
     tok = AutoTokenizer.from_pretrained(args_cli.ckpt)
-    runner = LayerwiseRunner(Checkpoint(args_cli.ckpt), load_args(max_batch_size=1, max_seq_len=1024), tok)
-    for name, text in TEXTS.items():
-        ids = torch.tensor([[tok.bos_token_id] + tok.encode(text, add_special_tokens=False)])
+    texts = TEXTS
+    if args_cli.file:
+        with open(args_cli.file, encoding="utf-8") as f:
+            texts = {"file": f.read()}
+    encoded = {k: [tok.bos_token_id] + tok.encode(v, add_special_tokens=False)[: args_cli.max_tokens - 1] for k, v in texts.items()}
+    max_len = max(1024, max(len(v) for v in encoded.values()))
+    runner = LayerwiseRunner(Checkpoint(args_cli.ckpt), load_args(max_batch_size=1, max_seq_len=max_len), tok)
+    if args_cli.no_compressed:
+        from sclm.upstream import model as m
+
+        compress_kv = m.Attention._compress_kv
+
+        def window_only(self, *a):
+            kv, idxs = compress_kv(self, *a)
+            return kv, torch.full_like(idxs, -1)
+
+        m.Attention._compress_kv = window_only
+    for name, ids in encoded.items():
+        ids = torch.tensor([ids])
         t0 = time.time()
         nll = runner.token_nll(ids)[0].float()
-        print(f"{name:5s} tokens={ids.size(1):4d} ppl={math.exp(nll.mean().item()):8.3f} "
-              f"first-half={math.exp(nll[: len(nll) // 2].mean().item()):8.3f} "
-              f"second-half={math.exp(nll[len(nll) // 2 :].mean().item()):8.3f} ({time.time() - t0:.0f}s)")
+        ppl = lambda x: math.exp(x.mean().item()) if len(x) else float("nan")
+        print(f"{name:5s} tokens={ids.size(1):4d} ppl={ppl(nll):8.3f} "
+              f"first-half={ppl(nll[: len(nll) // 2]):8.3f} second-half={ppl(nll[len(nll) // 2 :]):8.3f} "
+              f"pos<128={ppl(nll[:127]):8.3f} pos>=256={ppl(nll[255:]):8.3f} ({time.time() - t0:.0f}s)")
 
 
 if __name__ == "__main__":
