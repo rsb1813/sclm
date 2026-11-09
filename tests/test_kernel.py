@@ -91,6 +91,24 @@ def test_fp4_gemm_matches_dense():
     assert torch.allclose(got.double(), want, rtol=2e-2, atol=1e-3)
 
 
+def test_bf16_operand_path_matches_fp32_path():
+    """Power-of-2 scales take the bf16 tensor-core path; the same scales as fp32 take the fp32 path. They must agree
+    to fp32 accumulation error, since every dequantized operand is exact in bf16."""
+    torch.manual_seed(4)
+    N, K, M = 256, 512, 16
+    w_codes = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=DEV).view(torch.float4_e2m1fn_x2)
+    w_s = torch.pow(2.0, torch.randint(-9, -5, (N, K // 32), device=DEV).float()).to(torch.float8_e8m0fnu)
+    a_q, a_s = kernel.act_quant(torch.randn(M, K, device=DEV, dtype=torch.bfloat16), 32, "ue8m0", torch.float8_e8m0fnu)
+    fast = kernel.fp4_gemm(a_q, a_s, w_codes, w_s, torch.float8_e8m0fnu, 32)
+    slow = kernel.fp4_gemm(a_q, a_s.float(), w_codes, w_s.float(), torch.float32, 32)
+    assert torch.allclose(fast, slow, rtol=1e-5, atol=1e-6)
+    w8 = torch.randn(N, K, device=DEV).to(torch.float8_e4m3fn)
+    w8_s = torch.pow(2.0, torch.randint(-7, -3, (N // 32, K // 32), device=DEV).float()).to(torch.float8_e8m0fnu)
+    fast = kernel.fp8_gemm(a_q, a_s, w8, w8_s, torch.float8_e8m0fnu, 32)
+    slow = kernel.fp8_gemm(a_q, a_s.float(), w8, w8_s.float(), torch.float32, 32)
+    assert torch.allclose(fast, slow, rtol=1e-5, atol=1e-6)
+
+
 def test_fp8_gemm_matches_dense():
     torch.manual_seed(1)
     N, K, M = 96, 256, 8

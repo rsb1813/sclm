@@ -3,6 +3,9 @@ from typing import Optional
 
 import torch
 
+# The GEMMs below feed bf16 operands to cuBLAS; keep its reductions in fp32 like the upstream kernels.
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
 FP8_MAX = 448.0
 FP4_MAX = 6.0
 # e2m1 magnitudes indexed by the low 3 bits of a code; bit 3 is the sign
@@ -42,9 +45,9 @@ def pack_fp4(code: torch.Tensor) -> torch.Tensor:
     return (c[..., 0::2] | (c[..., 1::2] << 4)).view(torch.float4_e2m1fn_x2)
 
 
-def unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
-    """float4_e2m1fn_x2 [..., K//2] -> fp32 [..., K]."""
-    table = torch.tensor(FP4_GRID + tuple(-g for g in FP4_GRID), device=packed.device)
+def unpack_fp4(packed: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """float4_e2m1fn_x2 [..., K//2] -> `dtype` [..., K] (every e2m1 value is exact in bf16 and fp32)."""
+    table = torch.tensor(FP4_GRID + tuple(-g for g in FP4_GRID), device=packed.device, dtype=dtype)
     b = packed.view(torch.uint8)
     codes = torch.stack([b & 0x0F, b >> 4], dim=-1).flatten(-2)
     return table[codes.long()]
@@ -96,8 +99,21 @@ def fp4_act_quant(
     return pack_fp4(code.flatten(-2)), s.to(scale_dtype)
 
 
-def _dequant_act(a: torch.Tensor, a_s: torch.Tensor, block_size: int) -> torch.Tensor:
-    return (a.float().unflatten(-1, (-1, block_size)) * a_s.float().unsqueeze(-1)).flatten(-2)
+def _operand_dtype(a_s: torch.Tensor, b_s: torch.Tensor) -> torch.dtype:
+    """With power-of-2 (E8M0) scales on both sides, every dequantized fp8/fp4 value is exactly representable in
+    bf16, so bf16 operands with fp32 accumulation give the fp32 result on tensor cores. Otherwise stay in fp32."""
+    return torch.bfloat16 if a_s.dtype == b_s.dtype == torch.float8_e8m0fnu else torch.float32
+
+
+def _dequant_act(a: torch.Tensor, a_s: torch.Tensor, block_size: int, dtype: torch.dtype) -> torch.Tensor:
+    return (a.to(dtype).unflatten(-1, (-1, block_size)) * a_s.float().to(dtype).unsqueeze(-1)).flatten(-2)
+
+
+def _mm_fp32_out(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """a @ w.T with an fp32 result, so bf16 operands are not rounded back to bf16 before the caller's cast."""
+    a2 = a.reshape(-1, a.size(-1))
+    out = torch.mm(a2, w.t(), out_dtype=torch.float32) if a.dtype == torch.bfloat16 else a2 @ w.t()
+    return out.view(*a.shape[:-1], w.size(0))
 
 
 def fp8_gemm(
@@ -113,9 +129,10 @@ def fp8_gemm(
     K, N = a.size(-1), b.size(0)
     assert K % block_size == 0
     assert b_s.shape == ((N + block_size - 1) // block_size, K // block_size)
-    sb = b_s.float().repeat_interleave(block_size, 0)[:N].repeat_interleave(block_size, 1)
-    w = b.float() * sb
-    return (_dequant_act(a, a_s, block_size) @ w.t()).to(torch.get_default_dtype())
+    dt = _operand_dtype(a_s, b_s)
+    sb = b_s.float().to(dt).repeat_interleave(block_size, 0)[:N].repeat_interleave(block_size, 1)
+    w = b.to(dt) * sb
+    return _mm_fp32_out(_dequant_act(a, a_s, block_size, dt), w).to(torch.get_default_dtype())
 
 
 def fp4_gemm(
@@ -132,8 +149,9 @@ def fp4_gemm(
     K, N = a.size(-1), b.size(0)
     assert K % act_block_size == 0
     assert b_s.shape == (N, K // 32)
-    w = (unpack_fp4(b).unflatten(-1, (-1, 32)) * b_s.float().unsqueeze(-1)).flatten(-2)
-    return (_dequant_act(a, a_s, act_block_size) @ w.t()).to(torch.get_default_dtype())
+    dt = _operand_dtype(a_s, b_s)
+    w = (unpack_fp4(b, dt).unflatten(-1, (-1, 32)) * b_s.float().to(dt).unsqueeze(-1)).flatten(-2)
+    return _mm_fp32_out(_dequant_act(a, a_s, act_block_size, dt), w).to(torch.get_default_dtype())
 
 
 def sparse_attn(
