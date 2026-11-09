@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from sclm.checkpoint import Checkpoint
-from scripts.quant_probe import DATA, DEV, expert_out, fp4_weight, fp8_weight
+from scripts.quant_probe import DATA, DEV, expert_out, fp4_weight, fp8_weight, outlier_free_nmse
 
 RANKS = (256, 512, 1024, 1536, 2048, 3072)
 
@@ -74,6 +74,7 @@ def main() -> None:
         return y
 
     y_ref = routed(ref)
+    nmse_ex1 = outlier_free_nmse(y_ref)
     shared = [fp8_weight(state, f"shared_experts.w{j}") for j in (1, 2, 3)]
     y_full_norm = (y_ref + expert_out(xe, *shared, torch.ones(1, device=DEV))).pow(2).sum()
     # output covariance of the routed part, from the fit half
@@ -97,8 +98,10 @@ def main() -> None:
             ("w1w3_input_proj", lambda e: (lambda w: [w[0] @ p_in, w[1], w[2] @ p_in])(ref(e))),
             ("w2_output_proj", lambda e: (lambda w: [w[0], p_out @ w[1], w[2]])(ref(e))),
         ):
-            d = (routed(fn) - y_ref).pow(2).sum()
-            res[name] = {"routed_nmse": float(d / y_ref.pow(2).sum()), "moe_nmse": float(d / y_full_norm)}
+            y_q = routed(fn)
+            d = (y_q - y_ref).pow(2).sum()
+            res[name] = {"routed_nmse": float(d / y_ref.pow(2).sum()), "routed_nmse_ex1": nmse_ex1(y_q),
+                         "moe_nmse": float(d / y_full_norm)}
         report["functional"][r] = res
         print(r, json.dumps(res), flush=True)
 

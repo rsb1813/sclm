@@ -31,6 +31,16 @@ CONFIGS = {
 }
 
 
+def outlier_free_nmse(y_ref: torch.Tensor):
+    """NMSE with the dominant direction of the reference output removed. In many layers one massive-activation
+    direction carries ~98-100% of the routed output energy, so a plain NMSE hides damage to everything else."""
+    _, vecs = torch.linalg.eigh(y_ref.t() @ y_ref)
+    u1 = vecs[:, -1:]
+    perp = lambda z: z - (z @ u1) @ u1.t()  # noqa: E731
+    denom = perp(y_ref).pow(2).sum()
+    return lambda y_q: float(perp(y_q - y_ref).pow(2).sum() / denom)
+
+
 def bpw(kind: str, p: dict) -> float:
     return p["bits"] + 16 / p["group"] if kind == "rtn" else p["code_bits"] / p["dim"]
 
@@ -141,6 +151,7 @@ def main() -> None:
     y_ref = routed(ref_weights)
     shared = [fp8_weight(state, f"shared_experts.w{j}") for j in (1, 2, 3)]
     y_full = y_ref + expert_out(x, *shared, torch.ones(1, device=DEV))
+    nmse_ex1 = outlier_free_nmse(y_ref)
     in_dims = [w.size(1) for w in ref_weights(0)]
     results = {}
     for name in cli.configs.split(","):
@@ -163,13 +174,19 @@ def main() -> None:
                 "bpw": bpw(kind, p),
                 "weight_nmse": wnmse,
                 "routed_nmse": (d / y_ref.pow(2).sum()).item(),
+                "routed_nmse_ex1": nmse_ex1(y_q),
                 "moe_nmse": (d / y_full.pow(2).sum()).item(),
                 "cos_moe": F.cosine_similarity(y_full, y_full - y_ref + y_q, dim=-1).mean().item(),
             }
             print(f"{key:16s} bpw={results[key]['bpw']:.2f} weight_nmse={wnmse:.4f} "
-                  f"routed_nmse={results[key]['routed_nmse']:.4f} moe_nmse={results[key]['moe_nmse']:.4f} "
+                  f"routed_nmse={results[key]['routed_nmse']:.4f} ex1={results[key]['routed_nmse_ex1']:.4f} "
+                  f"moe_nmse={results[key]['moe_nmse']:.4f} "
                   f"cos={results[key]['cos_moe']:.4f} ({time.time() - t0:.0f}s)", flush=True)
-    with open(os.path.join(DATA, f"probe_L{cli.layer}_results.json"), "w") as f:
+    out_path = os.path.join(DATA, f"probe_L{cli.layer}_results.json")
+    if os.path.exists(out_path):  # a run over a subset of configs updates, not replaces, earlier results
+        with open(out_path) as f:
+            results = {**json.load(f)["results"], **results}
+    with open(out_path, "w") as f:
         json.dump({"layer": cli.layer, "tokens": int(x.size(0)), "results": results}, f, indent=1)
 
 
