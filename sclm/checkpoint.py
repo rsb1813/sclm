@@ -2,6 +2,7 @@
 import json
 import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -95,8 +96,24 @@ class MappedEngramEmbedding(torch.nn.Module):
         self.weight, self.scale, self.block_size = weight, scale, block_size
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        idx = indices.reshape(-1).cpu().numpy()
-        w = torch.from_numpy(self.weight[idx]).to(indices.device).view(torch.float8_e4m3fn)
-        s = torch.from_numpy(self.scale[idx]).to(indices.device).view(torch.float8_e8m0fnu)
+        # Rows are scattered over a ~100GB file, so reading them one page fault at a time runs at SSD queue depth 1
+        # (~5K rows/s here). Deduplicate, sort, and fault pages in from several threads (~65K rows/s).
+        rows, inverse = np.unique(indices.reshape(-1).cpu().numpy(), return_inverse=True)
+        parts = list(_row_reader().map(lambda c: (self.weight[c], self.scale[c]), np.array_split(rows, ROW_CHUNKS)))
+        w = torch.from_numpy(np.concatenate([p[0] for p in parts])).to(indices.device).view(torch.float8_e4m3fn)
+        s = torch.from_numpy(np.concatenate([p[1] for p in parts])).to(indices.device).view(torch.float8_e8m0fnu)
         values = (w.float().unflatten(-1, (-1, self.block_size)) * s.float().unsqueeze(-1)).flatten(-2)
-        return values.to(torch.bfloat16).view(*indices.shape, -1)
+        values = values.to(torch.bfloat16)[torch.from_numpy(inverse).to(indices.device)]
+        return values.view(*indices.shape, -1)
+
+
+READ_THREADS = 16
+ROW_CHUNKS = READ_THREADS * 4
+_reader: ThreadPoolExecutor | None = None
+
+
+def _row_reader() -> ThreadPoolExecutor:
+    global _reader
+    if _reader is None:
+        _reader = ThreadPoolExecutor(READ_THREADS)
+    return _reader
