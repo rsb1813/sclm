@@ -32,8 +32,8 @@
 - [x] `python -m scripts.ppl`로 영어·한국어·코드 perplexity 확인: 2.87 / 2.54 / 1.37 (모두 128토큰 미만이라 window 경로만 검증됨)
 - [x] 긴 문맥(2,048토큰) 정상 vs 압축 경로 차단 비교: 256토큰 이후 ppl 3.07 vs 12.07 → 압축 KV·indexer·candidate 경로 정상
 - [x] 범용 보정 데이터 구성 (`data/calib_v1`, 104K 토큰, 9개 분류)
-- [ ] **(오늘 밤 재개)** VRAM 상한 코드(`set_per_process_memory_fraction`) 검증 → 테스트 → 커밋 (미커밋 상태)
-- [ ] **(오늘 밤 재개)** `python -m scripts.routing_trace --batch 2` 실행 → `python -m scripts.analyze_routing`
+- [x] VRAM 상한 코드 검증·커밋, 수집기 블록 참조 누수 수정, Engram 병렬 읽기
+- [x] 라우팅 기록 (18.4분, 104K 토큰 × 40층) → 분석 (design.md 9.1)
 - [ ] bf16 커널 변경 후 perplexity가 그대로인지 재확인 (영어 2.874)
 - [ ] 층 단위 레퍼런스 실행 코드 작성 (Pass 1 골격, 층 간 KV/indexer 의존성 포함)
 - [ ] 층 0에서 압축 계산 시간 실측, N과 기법 조정
