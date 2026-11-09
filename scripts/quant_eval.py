@@ -23,7 +23,10 @@ CHUNK = 256
 # name -> (bits, group, hadamard) for routed experts; "none" is the uncompressed reference, "dense" runs the
 # uncompressed FP4 weights through the same fp32 path RTNLinear uses (isolates the GEMM path from compression)
 CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had": (2, 64, True),
-           "rtn3": (3, 64, False), "rtn2": (2, 64, False)}
+           "rtn3": (3, 64, False), "rtn2": (2, 64, False),
+           # routed experts restricted to the per-layer top-r activation subspaces (scripts/collect_bases.py)
+           "proj256": ("proj", 256), "proj512": ("proj", 512),
+           "proj512_in": ("proj", 512, "in"), "proj512_out": ("proj", 512, "out")}
 
 
 class DenseFP4Linear(torch.nn.Module):
@@ -43,6 +46,48 @@ def dense_experts_(block) -> None:
     for expert in block.ffn.experts:
         for name in ("w1", "w2", "w3"):
             setattr(expert, name, DenseFP4Linear(getattr(expert, name)))
+
+
+def act_q(x: torch.Tensor) -> torch.Tensor:
+    return kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True).float()
+
+
+def fp4_dense(lin) -> torch.Tensor:
+    return (kernel.unpack_fp4(lin.weight).unflatten(-1, (-1, 32)) * lin.scale.float().unsqueeze(-1)).flatten(-2)
+
+
+class ProjIn(torch.nn.Module):
+    """w1/w3 restricted to the layer's top-r FFN-input directions: W x ~= (W U)(U^T x), U shared by all experts."""
+
+    def __init__(self, w: torch.Tensor, u: torch.Tensor):
+        super().__init__()
+        self.u, self.wu = u, w @ u
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return ((act_q(x) @ self.u) @ self.wu.t()).to(torch.get_default_dtype())
+
+
+class ProjOut(torch.nn.Module):
+    """w2 restricted to the layer's top-r routed-output directions: W h ~= V (V^T W h)."""
+
+    def __init__(self, w: torch.Tensor, v: torch.Tensor):
+        super().__init__()
+        self.v, self.vw = v, v.t() @ w
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return ((act_q(h) @ self.vw.t()) @ self.v.t()).to(torch.get_default_dtype())
+
+
+def project_experts_(layer: int, block, r: int, sides: str = "inout") -> None:
+    bases = torch.load(os.path.join(DATA, "bases_v1", f"layer{layer}.pt"), weights_only=True)
+    u = bases["in_basis"][:, :r].to(DEV)
+    v = bases["out_basis"][:, :r].to(DEV)
+    for expert in block.ffn.experts:
+        if "in" in sides:
+            expert.w1 = ProjIn(fp4_dense(expert.w1), u)
+            expert.w3 = ProjIn(fp4_dense(expert.w3), u)
+        if "out" in sides:
+            expert.w2 = ProjOut(fp4_dense(expert.w2), v)
 
 
 def quantize_experts_(block, bits: int, group: int, use_rot: bool) -> None:
@@ -73,6 +118,8 @@ def main() -> None:
     cfg = CONFIGS[cli.config]
     if cfg == "dense":
         before_block = lambda i, block: dense_experts_(block)  # noqa: E731
+    elif isinstance(cfg, tuple) and cfg[0] == "proj":
+        before_block = lambda i, block: project_experts_(i, block, *cfg[1:])  # noqa: E731
     else:
         before_block = (lambda i, block: quantize_experts_(block, *cfg)) if cfg else None
     t0 = time.time()
