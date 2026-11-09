@@ -261,6 +261,7 @@ def main() -> None:
     ap.add_argument("--config", choices=list(CONFIGS), required=True)
     ap.add_argument("--freeze-routing", action="store_true", help="force the reference model's expert choices")
     ap.add_argument("--record-routing", action="store_true", help="with --config none: save the expert choices")
+    ap.add_argument("--layers", help="lo:hi, compress only layers lo..hi-1 (per-block configs; layer sensitivity)")
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)
 
@@ -281,11 +282,18 @@ def main() -> None:
         before_block = None  # set below with the calibration batches
     else:
         before_block = (lambda i, block: quantize_experts_(block, *cfg)) if cfg else None
+    if cli.layers:
+        assert before_block is not None, "GPTQ configs quantize in before_batch"
+        lo, hi = map(int, cli.layers.split(":"))
+        only = before_block
+        before_block = lambda i, block: only(i, block) if lo <= i < hi else None  # noqa: E731
     t0 = time.time()
     # expert choices of the uncompressed model on the eval batches: [batch][layer] -> [B*S, topk]. routing_v1.npz
     # cannot serve: it was traced before the bf16-operand GEMM change and differs from today's reference path
     routing_path = os.path.join(DATA, "eval_routing_ref.pt")
     before_batch, tag, cur = None, cli.config, {"batch": 0}
+    if cli.layers:
+        tag += "_L" + cli.layers.replace(":", "-")
     if cli.freeze_routing or cli.record_routing:
         assert not (cli.record_routing and (cfg is not None or cli.freeze_routing))
         inner = before_block
