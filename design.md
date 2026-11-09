@@ -117,7 +117,7 @@ L4가 클라우드 증류를 대신하는 품질의 핵심 지렛대다. 비용 
 - **I/O**: Engram은 IoRing 또는 unbuffered overlapped I/O.
 - **동기화**: T2 메가커널로 WDDM 지연을 상쇄한다.
 - **저장 위치**: 모델 관련 파일은 C:(NVMe)에 둔다. H:도 같은 NVMe 위의 VHDX라 공간을 공유한다. 원본 510GB를 통째로 받지 않는다(8.1절).
-- **다운로드**: HF 파일은 CDN(`us.aws.cdn.hf.co`, 이 PC에서는 AWS 싱가포르로 조회)에서 받는다. 사용자 방화벽 규칙 `stormy/dropship`이 이 대역을 막으므로 다운로드하는 동안 규칙을 꺼야 한다. 원본은 `C:\models\DeepSeek-V4.1-Flash`에 리비전 `314113f8`로 고정해 보관한다(사용자 승인, 실험 반복용).
+- **다운로드**: HF 파일은 CDN(`us.aws.cdn.hf.co`, 이 PC에서는 AWS 싱가포르로 조회)에서 받는다. 사용자의 지역 차단 규칙은 bf6.exe 전용(`BF6 region block`)으로 바꿨으므로 다운로드에 영향이 없다. 원본은 `C:\models\DeepSeek-V4.1-Flash`에 리비전 `314113f8`로 고정해 보관한다(사용자 승인, 실험 반복용).
 
 ## 8.1 디스크 최소화 파이프라인
 

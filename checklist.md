@@ -27,7 +27,8 @@
 - [ ] 실제 가중치로 perplexity·생성 결과 확인 (레퍼런스 정확성의 최종 검증)
 - [x] 실제 가중치 로더 (`sclm/checkpoint.py`: wo_a FP8→bf16 역양자화, expert int8 → fp4 view, Engram 테이블은 memmap 행 조회)
 - [x] 층 단위 실행기 (`sclm/layerwise.py`: Block 하나씩 생성·로드·해제) — 레이어 0 실제 가중치 엄격 로드·실행 통과
-- [ ] 원본 전체 다운로드 (진행 중, 약 110MB/s) → 끝나면 방화벽 규칙 `stormy/dropship` 다시 켜기
+- [x] 방화벽 정리: dropship 제거, bf6.exe 전용 `BF6 region block` 규칙 생성 (다운로드와 무관해짐)
+- [ ] 원본 전체 다운로드 (46/48 완료, Engram 샤드 2개 진행 중)
 - [ ] `python -m scripts.ppl`로 영어·한국어·코드 perplexity 확인 (MTP 로드는 아직 없음)
 - [ ] 범용 보정 데이터 구성 (코딩, 한국어·영어 대화, 수학·추론, 다국어, 도구 호출)
 - [ ] 층 단위 레퍼런스 실행 코드 작성 (Pass 1 골격, 층 간 KV/indexer 의존성 포함)
