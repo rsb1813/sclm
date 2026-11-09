@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+import weakref
 
 import numpy as np
 import torch
@@ -40,7 +41,8 @@ class Collector:
         self.pred = {}
 
     def before_block(self, i: int, block) -> None:
-        self.layer, self.block = i, block
+        # weak: a strong reference would keep this ~7.4GB block alive while the runner builds the next one
+        self.layer, self.block = i, weakref.ref(block)
 
         def on_attn_norm(_mod, inp, _out):
             self.pred["B"] = predict(block, inp[0])
@@ -66,7 +68,7 @@ class Collector:
     def before_batch(self, i: int, j: int) -> None:
         self.batch = j
         raw = self.prev_raw[j]
-        self.pred = {"A": predict(self.block, raw.to(DEVICE)) if raw is not None else None}
+        self.pred = {"A": predict(self.block(), raw.to(DEVICE)) if raw is not None else None}
 
 
 def main() -> None:
