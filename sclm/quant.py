@@ -90,10 +90,10 @@ def gptq_codes(
     u = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
     half = 2 ** (bits - 1)
     codes = torch.empty(*batch, n, k, dtype=torch.uint8, device=w.device)
-    steps = torch.empty(*batch, n, k // group, device=w.device)
+    steps = torch.empty(*batch, n, k // group, device=w.device, dtype=torch.float32)  # callers may default to bf16
     for b0 in range(0, k, block):
         b1 = min(b0 + block, k)
-        w1, err = W[..., b0:b1].clone(), torch.zeros(*batch, n, b1 - b0, device=w.device)
+        w1, err = W[..., b0:b1].clone(), torch.zeros(*batch, n, b1 - b0, device=w.device, dtype=torch.float32)
         ub = u[..., b0:b1, b0:b1]
         for i in range(b1 - b0):
             col = b0 + i

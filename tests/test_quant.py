@@ -74,6 +74,21 @@ def test_gptq_batched_matches_one_at_a_time():
         assert torch.equal(codes[b], c1) and torch.allclose(step[b], s1)
 
 
+def test_gptq_ignores_bf16_default_dtype():
+    # probe and eval scripts set the default dtype to bf16; GPTQ's internal buffers must stay fp32
+    torch.manual_seed(8)
+    w = torch.randn(32, 128, device=DEV)
+    x = torch.randn(512, 128, device=DEV)
+    ref = quant.gptq_codes(w, x.t() @ x, 2, 64)
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        got = quant.gptq_codes(w, x.t() @ x, 2, 64)
+    finally:
+        torch.set_default_dtype(prev)
+    assert torch.equal(got[0], ref[0]) and got[1].dtype == torch.float32 and torch.equal(got[1], ref[1])
+
+
 def test_rtn_linear_matches_dense_rotated_weight():
     """y = Q(W R) (R^T act_q(x)) must equal the dense dequantized weight R-unrotated, applied to act_q(x)."""
     import sclm.upstream  # noqa: F401
