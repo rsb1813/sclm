@@ -5,7 +5,18 @@ import struct
 
 import numpy as np
 import torch
-from safetensors import safe_open
+
+ST_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "I32": torch.int32,
+    "I64": torch.int64,
+}
 
 
 def read_header(path: str) -> tuple[dict, int]:
@@ -22,17 +33,33 @@ class Checkpoint:
         self.root = root
         with open(os.path.join(root, "model.safetensors.index.json")) as f:
             self.weight_map: dict[str, str] = json.load(f)["weight_map"]
-        self._handles = {}
+        self._headers: dict[str, tuple[dict, int]] = {}
 
     def path(self, name: str) -> str:
         return os.path.join(self.root, self.weight_map[name])
 
+    def _header(self, path: str) -> tuple[dict, int]:
+        if path not in self._headers:
+            self._headers[path] = read_header(path)
+        return self._headers[path]
+
     def get(self, name: str) -> torch.Tensor:
+        """One tensor read into fresh CPU memory with plain file reads. Memory-mapping whole shards (safe_open)
+        keeps every touched page resident; over 40 shards that exhausted RAM and crashed with an access violation."""
         path = self.path(name)
-        handle = self._handles.get(path)
-        if handle is None:
-            handle = self._handles[path] = safe_open(path, framework="pt", device="cpu")
-        return handle.get_tensor(name)
+        header, data_start = self._header(path)
+        info = header[name]
+        start, end = info["data_offsets"]
+        buf = torch.empty(end - start, dtype=torch.uint8, device="cpu")
+        view = memoryview(buf.numpy())
+        with open(path, "rb", buffering=0) as f:
+            f.seek(data_start + start)
+            done = 0
+            while done < len(view):  # raw reads may return short on large requests
+                n = f.readinto(view[done:])
+                assert n, f"unexpected EOF reading {name}"
+                done += n
+        return buf.view(ST_DTYPES[info["dtype"]]).reshape(info["shape"])
 
     def module_state(self, prefix: str, skip: tuple[str, ...] = ()) -> dict[str, torch.Tensor]:
         """Tensors under `prefix`, keyed relative to it, converted as upstream convert.py does for one rank:
@@ -52,7 +79,7 @@ class Checkpoint:
     def memmap(self, name: str) -> np.memmap:
         """Read-only uint8 view of a tensor's raw bytes, shaped like the tensor (1-byte dtypes only)."""
         path = self.path(name)
-        header, data_start = read_header(path)
+        header, data_start = self._header(path)
         info = header[name]
         assert info["dtype"] in ("F8_E4M3", "F8_E8M0", "U8", "I8"), info["dtype"]
         start, _ = info["data_offsets"]
