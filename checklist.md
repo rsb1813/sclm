@@ -39,7 +39,9 @@
 ## Phase 1 — 압축 (진행 중)
 - [x] 압축 함수 모듈 (`sclm/quant.py`: RTN, Hadamard, k-means++ VQ) + 테스트
 - [x] 레이어 10 압축 방법 비교 (`scripts.quant_probe`): RTN 3bit+Had 2.8%, 2bit+Had 12.5%, VQ 1bpw 51% (design.md 4.1)
-- [ ] MoE 출력 오차 ↔ 모델 전체 KL 관계 측정 (허용 가능한 오차 수준 확정)
+- [x] MoE 출력 오차 ↔ 모델 전체 KL 관계 측정: 잡음 바닥 KL 0.033, 3bit+Had 0.125, 2bit+Had 0.331 (design.md 4.1)
+- [ ] 평가 세트를 분류별로 고르게 다시 구성 (지금 8개에는 다국어·도구 호출 없음)
+- [ ] 레이어별 민감도 측정 (한 레이어씩 2bit로 낮춰 KL 변화) → 혼합 정밀도 근거
 - [ ] expert 간 중복 측정 (공유 기저로 설명되는 에너지 비율)
 - [ ] 출력 기준 압축 (GPTQ류) 2bit 이하 실험
 - [ ] RAM 용량(평균 약 1.1bpw 상한) vs 품질(2~3bpw 필요) 충돌 해소안 결정: 출력 기준 압축 / 공유 기저 / SSD 계층 / 가지치기

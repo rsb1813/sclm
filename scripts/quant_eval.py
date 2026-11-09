@@ -20,8 +20,29 @@ DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 DEV = "cuda"
 TOPK = 64  # reference distribution kept as its top-64 tokens per position
 CHUNK = 256
-# name -> (bits, group, hadamard) for routed experts; "none" is the uncompressed reference
-CONFIGS = {"none": None, "rtn3_had": (3, 64, True), "rtn2_had": (2, 64, True), "rtn3": (3, 64, False), "rtn2": (2, 64, False)}
+# name -> (bits, group, hadamard) for routed experts; "none" is the uncompressed reference, "dense" runs the
+# uncompressed FP4 weights through the same fp32 path RTNLinear uses (isolates the GEMM path from compression)
+CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had": (2, 64, True),
+           "rtn3": (3, 64, False), "rtn2": (2, 64, False)}
+
+
+class DenseFP4Linear(torch.nn.Module):
+    """Uncompressed expert Linear computed like RTNLinear: fp8 activation fake-quant, fp32 dequantized weight, fp32 GEMM."""
+
+    def __init__(self, lin):
+        super().__init__()
+        self.weight, self.scale = lin.weight, lin.scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+        w = (kernel.unpack_fp4(self.weight).unflatten(-1, (-1, 32)) * self.scale.float().unsqueeze(-1)).flatten(-2)
+        return F.linear(xq.float(), w).to(torch.get_default_dtype())
+
+
+def dense_experts_(block) -> None:
+    for expert in block.ffn.experts:
+        for name in ("w1", "w2", "w3"):
+            setattr(expert, name, DenseFP4Linear(getattr(expert, name)))
 
 
 def quantize_experts_(block, bits: int, group: int, use_rot: bool) -> None:
@@ -37,6 +58,7 @@ def quantize_experts_(block, bits: int, group: int, use_rot: bool) -> None:
             del lin, w
 
 
+@torch.inference_mode()
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
@@ -49,7 +71,10 @@ def main() -> None:
     runner = LayerwiseRunner(Checkpoint(cli.ckpt), load_args(max_batch_size=2, max_seq_len=tokens.size(1)),
                              AutoTokenizer.from_pretrained(cli.ckpt))
     cfg = CONFIGS[cli.config]
-    before_block = (lambda i, block: quantize_experts_(block, *cfg)) if cfg else None
+    if cfg == "dense":
+        before_block = lambda i, block: dense_experts_(block)  # noqa: E731
+    else:
+        before_block = (lambda i, block: quantize_experts_(block, *cfg)) if cfg else None
     t0 = time.time()
     hidden = runner.hidden_batches(list(seqs.split(2)), before_block=before_block)
     t_fwd = time.time() - t0
@@ -60,15 +85,16 @@ def main() -> None:
     ref_path = os.path.join(DATA, "eval_ref.pt")
     ref = None if cfg is None else torch.load(ref_path, weights_only=True)
     out_ids, out_lp = [], []
-    nll_sum = kl_sum = agree = n_pos = n_tgt = 0.0
+    acc = {k: np.zeros(seqs.size(0)) for k in ("nll", "n_tgt", "kl", "agree", "n_pos")}  # per sequence
     for b, h in enumerate(hidden):
         x = norm(h.to(DEV))
-        ids_b = seqs[2 * b : 2 * b + 2].to(DEV)
+        rows = slice(2 * b, 2 * b + x.size(0))
+        ids_b = seqs[rows].to(DEV)
         for s0 in range(0, x.size(1), CHUNK):
             lp = F.log_softmax(F.linear(x[:, s0 : s0 + CHUNK].float(), head), dim=-1)
             tgt = ids_b[:, s0 + 1 : s0 + 1 + CHUNK]
-            nll_sum += -lp[:, : tgt.size(1)].gather(-1, tgt.unsqueeze(-1)).sum().item()
-            n_tgt += tgt.numel()
+            acc["nll"][rows] += (-lp[:, : tgt.size(1)].gather(-1, tgt.unsqueeze(-1))).sum((1, 2)).cpu().numpy()
+            acc["n_tgt"][rows] += tgt.size(1)
             if ref is None:
                 top = lp.topk(TOPK, dim=-1)
                 out_ids.append(top.indices.to(torch.int32).cpu())
@@ -77,15 +103,21 @@ def main() -> None:
                 r_ids = ref["ids"][len(out_ids)].to(DEV).long()
                 r_lp = ref["lp"][len(out_ids)].to(DEV).float()
                 out_ids.append(None)
-                kl_sum += (r_lp.exp() * (r_lp - lp.gather(-1, r_ids))).sum().item()
-                agree += (lp.argmax(-1) == r_ids[..., 0]).sum().item()
-                n_pos += r_ids[..., 0].numel()
-    result = {"config": cli.config, "tokens": int(seqs.numel()), "ppl": float(np.exp(nll_sum / n_tgt)),
-              "forward_min": t_fwd / 60}
+                acc["kl"][rows] += (r_lp.exp() * (r_lp - lp.gather(-1, r_ids))).sum((1, 2)).cpu().numpy()
+                acc["agree"][rows] += (lp.argmax(-1) == r_ids[..., 0]).sum(1).cpu().numpy()
+                acc["n_pos"][rows] += lp.size(1)
+    names = np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))["names"]
+    cats = np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))["category"][3::6][:8]
+    per_seq = [{"category": str(names[c]), "ppl": float(np.exp(acc["nll"][i] / acc["n_tgt"][i]))} for i, c in enumerate(cats)]
+    result = {"config": cli.config, "tokens": int(seqs.numel()),
+              "ppl": float(np.exp(acc["nll"].sum() / acc["n_tgt"].sum())), "forward_min": t_fwd / 60}
     if ref is None:
         torch.save({"ids": out_ids, "lp": out_lp}, ref_path)
     else:
-        result.update({"kl_top64": kl_sum / n_pos, "top1_agree": agree / n_pos})
+        result.update({"kl_top64": acc["kl"].sum() / acc["n_pos"].sum(), "top1_agree": acc["agree"].sum() / acc["n_pos"].sum()})
+        for i, s in enumerate(per_seq):
+            s.update({"kl": float(acc["kl"][i] / acc["n_pos"][i]), "top1": float(acc["agree"][i] / acc["n_pos"][i])})
+    result["per_seq"] = per_seq
     with open(os.path.join(DATA, f"eval_{cli.config}.json"), "w") as f:
         json.dump(result, f, indent=1)
     print(json.dumps(result), flush=True)
