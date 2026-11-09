@@ -43,26 +43,43 @@ class BlockHadamard:
         return self._h(w.float()) * self.signs
 
 
-def rtn_codes(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric mid-rise uniform quantization to 2**bits levels per `group` weights along K, with the clip ratio
-    searched per group for minimum MSE. Returns codes (uint8 [N, K], in [0, 2**bits)) and the fp16-representable
-    step per group (fp32 [N, K/group]). Storage: bits + 16/group bpw."""
+def _grid(levels: int) -> tuple[int, int, float]:
+    """(lo, hi, offset): index i in [lo, hi] reconstructs to (i + offset) * step. An even level count is mid-rise
+    (offset 0.5, no zero level, e.g. 2**bits); an odd one is mid-tread (zero included; 3 levels = ternary)."""
+    if levels % 2 == 0:
+        return -levels // 2, levels // 2 - 1, 0.5
+    return -(levels // 2), levels // 2, 0.0
+
+
+def _index(x: torch.Tensor, step: torch.Tensor, levels: int) -> torch.Tensor:
+    lo, hi, off = _grid(levels)
+    return (torch.floor(x / step) if off else torch.round(x / step)).clamp(lo, hi)
+
+
+def rtn_codes(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8,
+              levels: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric uniform quantization to `levels` (default 2**bits) levels per `group` weights along K, with the clip
+    ratio searched per group for minimum MSE. Returns codes (uint8 [N, K], in [0, levels)) and the fp16-representable
+    step per group (fp32 [N, K/group]). Storage: log2(levels) + 16/group bpw."""
+    levels = levels or 2**bits
     n, k = w.shape
     g = w.float().reshape(n, k // group, group)
-    half = 2 ** (bits - 1)
-    best_step = _best_step(g, bits, clip_grid)
-    codes = (torch.floor(g / best_step).clamp(-half, half - 1) + half).to(torch.uint8)
+    best_step = _best_step(g, bits, clip_grid, levels)
+    codes = (_index(g, best_step, levels) - _grid(levels)[0]).to(torch.uint8)
     return codes.reshape(n, k), best_step.squeeze(-1)
 
 
-def _best_step(g: torch.Tensor, bits: int, clip_grid: int = 8) -> torch.Tensor:
-    """Per-group step [..., 1] (fp16-representable) minimizing the group's RTN MSE over a grid of clip ratios."""
+def _best_step(g: torch.Tensor, bits: int, clip_grid: int = 8, levels: int | None = None) -> torch.Tensor:
+    """Per-group step [..., 1] (fp16-representable) minimizing the group's RTN MSE over a grid of clip ratios. With
+    2 or 3 levels the best outer level sits far inside the group max (~0.33x for 1 bit), so the grid starts lower."""
+    levels = levels or 2**bits
     amax = g.abs().amax(-1, keepdim=True).clamp_min(1e-12)
-    half = 2 ** (bits - 1)  # levels at (i + 0.5) * step for i in [-half, half)
+    _, hi, off = _grid(levels)
+    lo_r, n_r = (0.5, clip_grid) if levels > 3 else (0.2, 2 * clip_grid)
     best_step, best_err = None, None
-    for r in torch.linspace(0.5, 1.0, clip_grid, device=g.device, dtype=torch.float32):
-        step = (amax * r / (half - 0.5)).half().float()  # the step is stored as fp16
-        q = (torch.floor(g / step).clamp(-half, half - 1) + 0.5) * step
+    for r in torch.linspace(lo_r, 1.0, n_r, device=g.device, dtype=torch.float32):
+        step = (amax * r / (hi + off)).half().float()  # the outer level is (hi + off) * step; stored as fp16
+        q = (_index(g, step, levels) + off) * step
         err = (q - g).pow(2).sum(-1, keepdim=True)
         if best_step is None:
             best_step, best_err = step, err
@@ -73,7 +90,8 @@ def _best_step(g: torch.Tensor, bits: int, clip_grid: int = 8) -> torch.Tensor:
 
 
 def gptq_codes(
-    w: torch.Tensor, h: torch.Tensor, bits: int, group: int, damp: float = 0.01, block: int = 128
+    w: torch.Tensor, h: torch.Tensor, bits: int, group: int, damp: float = 0.01, block: int = 128,
+    levels: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPTQ with static groups: quantize columns in order, pushing each column's error onto the not-yet-quantized
     columns through the Cholesky factor of H^-1 (H = X^T X of the layer input), so the error lands where inputs
@@ -88,7 +106,8 @@ def gptq_codes(
     W.masked_fill_(dead.unsqueeze(-2), 0)
     diag += damp * diag.mean(-1, keepdim=True)
     u = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
-    half = 2 ** (bits - 1)
+    levels = levels or 2**bits
+    lo, _, off = _grid(levels)
     codes = torch.empty(*batch, n, k, dtype=torch.uint8, device=w.device)
     steps = torch.empty(*batch, n, k // group, device=w.device, dtype=torch.float32)  # callers may default to bf16
     for b0 in range(0, k, block):
@@ -98,25 +117,26 @@ def gptq_codes(
         for i in range(b1 - b0):
             col = b0 + i
             if col % group == 0:  # the group's step comes from its columns after earlier error feedback
-                step = _best_step(w1[..., i : i + group], bits)
+                step = _best_step(w1[..., i : i + group], bits, levels=levels)
                 steps[..., col // group] = step.squeeze(-1)
-            idx = torch.floor(w1[..., i : i + 1] / step).clamp(-half, half - 1)
-            codes[..., col] = (idx + half).squeeze(-1).to(torch.uint8)
-            e = (w1[..., i : i + 1] - (idx + 0.5) * step) / ub[..., i : i + 1, i : i + 1]
+            idx = _index(w1[..., i : i + 1], step, levels)
+            codes[..., col] = (idx - lo).squeeze(-1).to(torch.uint8)
+            e = (w1[..., i : i + 1] - (idx + off) * step) / ub[..., i : i + 1, i : i + 1]
             w1[..., i:] -= e * ub[..., i : i + 1, i:]
             err[..., i : i + 1] = e
         W[..., b1:] -= err @ u[..., b0:b1, b1:]
     return codes, steps
 
 
-def rtn_dequant(codes: torch.Tensor, step: torch.Tensor, bits: int, group: int) -> torch.Tensor:
-    half = 2 ** (bits - 1)
-    return (codes.float() - half + 0.5) * step.float().repeat_interleave(group, -1)
+def rtn_dequant(codes: torch.Tensor, step: torch.Tensor, bits: int, group: int,
+                levels: int | None = None) -> torch.Tensor:
+    lo, _, off = _grid(levels or 2**bits)
+    return (codes.float() + lo + off) * step.float().repeat_interleave(group, -1)
 
 
-def rtn(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8) -> torch.Tensor:
+def rtn(w: torch.Tensor, bits: int, group: int, clip_grid: int = 8, levels: int | None = None) -> torch.Tensor:
     """Dequantized result of rtn_codes (fp32)."""
-    return rtn_dequant(*rtn_codes(w, bits, group, clip_grid), bits, group)
+    return rtn_dequant(*rtn_codes(w, bits, group, clip_grid, levels), bits, group, levels)
 
 
 def pack_nibbles(codes: torch.Tensor) -> torch.Tensor:
@@ -148,34 +168,34 @@ class RTNLinear(torch.nn.Module):
     w1, w3 and w2 into the expert output (~0.70 at 2 bits). Costs nothing: 1/beta is folded into the row's steps."""
 
     def __init__(self, w: torch.Tensor, bits: int, group: int, rot: "BlockHadamard | None" = None,
-                 unbiased: bool = False):
+                 unbiased: bool = False, levels: int | None = None):
         super().__init__()
-        assert bits <= 4
-        self.bits, self.group, self.rot = bits, group, rot
+        self.bits, self.group, self.rot, self.levels = bits, group, rot, levels or 2**bits
+        assert self.levels <= 16
         wr = rot.rotate(w) if rot else w.float()
-        codes, step = rtn_codes(wr, bits, group)
+        codes, step = rtn_codes(wr, bits, group, levels=self.levels)
         if unbiased:
-            wq = rtn_dequant(codes, step, bits, group)
+            wq = rtn_dequant(codes, step, bits, group, self.levels)
             beta = (wq * wr).sum(1) / (wr * wr).sum(1).clamp_min(1e-30)
             step = step / beta.clamp_min(0.05)[:, None]
-        self.register_buffer("packed", pack_crumbs(codes) if bits <= 2 else pack_nibbles(codes))
+        self.register_buffer("packed", pack_crumbs(codes) if self.levels <= 4 else pack_nibbles(codes))
         self.register_buffer("step", step.half())
 
     @classmethod
     def from_codes(cls, codes: torch.Tensor, step: torch.Tensor, bits: int, group: int,
-                   rot: "BlockHadamard | None" = None) -> "RTNLinear":
+                   rot: "BlockHadamard | None" = None, levels: int | None = None) -> "RTNLinear":
         """Wrap codes and steps made elsewhere (e.g. gptq_codes; in the rotated basis when rot is given)."""
         self = cls.__new__(cls)
         torch.nn.Module.__init__(self)
-        self.bits, self.group, self.rot = bits, group, rot
-        self.register_buffer("packed", pack_crumbs(codes) if bits <= 2 else pack_nibbles(codes))
+        self.bits, self.group, self.rot, self.levels = bits, group, rot, levels or 2**bits
+        self.register_buffer("packed", pack_crumbs(codes) if self.levels <= 4 else pack_nibbles(codes))
         self.register_buffer("step", step.half())
         return self
 
     def weight_dequant(self) -> torch.Tensor:
         """The effective weight in the rotated basis (fp32)."""
-        codes = unpack_crumbs(self.packed) if self.bits <= 2 else unpack_nibbles(self.packed)
-        return rtn_dequant(codes, self.step, self.bits, self.group)
+        codes = unpack_crumbs(self.packed) if self.levels <= 4 else unpack_nibbles(self.packed)
+        return rtn_dequant(codes, self.step, self.bits, self.group, self.levels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from . import upstream  # noqa: F401  (puts kernel on sys.path)

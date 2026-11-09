@@ -103,6 +103,44 @@ def test_rtn_linear_unbiased_restores_row_gain():
             assert beta.mean() < 0.95  # 2-bit rounding shrinks rows
 
 
+def test_level_counts_one_bit_and_ternary():
+    torch.manual_seed(12)
+    w = torch.randn(256, 1024, device=DEV)
+    nmse = lambda q: ((q - w).pow(2).sum() / w.pow(2).sum()).item()  # noqa: E731
+    assert nmse(quant.rtn(w, 1, 64)) < 0.40  # scalar 1-bit optimum on a Gaussian is 0.363
+    codes, step = quant.rtn_codes(w, 2, 64, levels=3)
+    assert set(codes.unique().tolist()) == {0, 1, 2}
+    assert nmse(quant.rtn_dequant(codes, step, 2, 64, levels=3)) < 0.22
+    lin = quant.RTNLinear(w, 2, 64, levels=3)
+    assert lin.packed.shape == (256, 256) and torch.allclose(lin.weight_dequant(), quant.rtn(w, 2, 64, levels=3),
+                                                             rtol=1e-3, atol=1e-4)
+
+
+def test_rtn_unchanged_for_power_of_two_levels():
+    # the level-count generalization must keep the 2**bits mid-rise path bit-identical to the original formula
+    torch.manual_seed(13)
+    w = torch.randn(64, 512, device=DEV)
+    for bits in (2, 3, 4):
+        g, half = w.reshape(64, -1, 64), 2 ** (bits - 1)
+        amax, best, err = g.abs().amax(-1, keepdim=True), None, None
+        for r in torch.linspace(0.5, 1.0, 8, device=DEV, dtype=torch.float32):
+            step = (amax * r / (half - 0.5)).half().float()
+            e = ((torch.floor(g / step).clamp(-half, half - 1) + 0.5) * step - g).pow(2).sum(-1, keepdim=True)
+            best, err = (step, e) if best is None else (torch.where(e < err, step, best), torch.minimum(e, err))
+        want = ((torch.floor(g / best).clamp(-half, half - 1) + 0.5) * best).reshape(w.shape)
+        assert torch.equal(quant.rtn(w, bits, 64), want)
+
+
+def test_gptq_ternary_beats_rtn_ternary():
+    torch.manual_seed(14)
+    x = torch.randn(4096, 32, device=DEV) @ torch.randn(32, 256, device=DEV) + 0.1 * torch.randn(4096, 256, device=DEV)
+    w = torch.randn(64, 256, device=DEV)
+    out_err = lambda wq: ((wq - w) @ x.t()).pow(2).sum() / (w @ x.t()).pow(2).sum()  # noqa: E731
+    codes, step = quant.gptq_codes(w, x.t() @ x, 2, 64, levels=3)
+    assert int(codes.max()) <= 2
+    assert out_err(quant.rtn_dequant(codes, step, 2, 64, levels=3)) < 0.5 * out_err(quant.rtn(w, 2, 64, levels=3))
+
+
 def test_two_bit_codes_pack_four_per_byte():
     torch.manual_seed(11)
     codes = torch.randint(0, 4, (6, 256), device=DEV, dtype=torch.uint8)
