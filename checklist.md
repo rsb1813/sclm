@@ -25,8 +25,10 @@
 - [x] 커널별 단위 테스트 (수학적 정의와 대조) + 작은 무작위 모델 end-to-end 실행 테스트 (14개 통과)
 - [x] Engram 해시 검증 (압축 어휘 99,092, 소수 구간 합 = 테이블 행 수)
 - [ ] 실제 가중치로 perplexity·생성 결과 확인 (레퍼런스 정확성의 최종 검증)
-- [ ] 실제 가중치 로더 (HF 이름 → 모델 이름, wo_a FP8→bf16 역양자화, expert int8 → fp4 view, MTP embed/head 공유)
-- [ ] 층 단위 스트리밍 실행 (VRAM 16GB 안에서 층 하나씩 올려 전체 forward)
+- [x] 실제 가중치 로더 (`sclm/checkpoint.py`: wo_a FP8→bf16 역양자화, expert int8 → fp4 view, Engram 테이블은 memmap 행 조회)
+- [x] 층 단위 실행기 (`sclm/layerwise.py`: Block 하나씩 생성·로드·해제) — 레이어 0 실제 가중치 엄격 로드·실행 통과
+- [ ] 원본 전체 다운로드 (진행 중, 약 110MB/s) → 끝나면 방화벽 규칙 `stormy/dropship` 다시 켜기
+- [ ] `python -m scripts.ppl`로 영어·한국어·코드 perplexity 확인 (MTP 로드는 아직 없음)
 - [ ] 범용 보정 데이터 구성 (코딩, 한국어·영어 대화, 수학·추론, 다국어, 도구 호출)
 - [ ] 층 단위 레퍼런스 실행 코드 작성 (Pass 1 골격, 층 간 KV/indexer 의존성 포함)
 - [ ] 층 0에서 압축 계산 시간 실측, N과 기법 조정
