@@ -1,3 +1,5 @@
 bench/build/
 .venv/
 ref/
+__pycache__/
+.pytest_cache/
