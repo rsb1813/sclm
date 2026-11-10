@@ -33,7 +33,7 @@ class TieredMoE(nn.Module):
         total = sum(gates)
         if cache.topk:  # lossy: the weakest picks are dropped (the gate lists them best first)
             ids, gates = ids[:cache.topk], gates[:cache.topk]
-        ram = [k for k, e in enumerate(ids) if e in self.ram.experts]
+        ram = [k for k, e in enumerate(ids) if e in self.ram.experts and gates[k] >= cache.ram_share * total]
         ssd = [k for k, e in enumerate(ids) if e not in self.ram.experts]
         wait = [gates[k] >= cache.wait_share * total for k in ssd] if cache.wait_share else None
         slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token, wait)

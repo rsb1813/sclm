@@ -79,10 +79,11 @@ class HostAttention(m.Attention):
         token = x.contiguous()
         qr, q = gpu.attn_q(self.wq_a, self.q_norm.weight, self.wq_b, token, freqs, heads, self.head_dim, rd, self.eps)
         gpu.attn_kv(self.wkv, self.kv_norm.weight, token, freqs, self.window_kv_cache[0, start_pos % win], rd, self.eps)
-        idxs, compressed = m.get_window_topk_idxs(win, 1, 1, start_pos).view(-1), self.window_kv_cache
-        if self.compress_ratio:
-            compressed, compress_idxs = self._compress_kv(x, qr.view(1, 1, -1), start_pos, win)
-            idxs = torch.cat([idxs, compress_idxs.view(-1)])
+        with torch.device(x.device):  # upstream creates index tensors on the default device
+            idxs, compressed = m.get_window_topk_idxs(win, 1, 1, start_pos).view(-1), self.window_kv_cache
+            if self.compress_ratio:
+                compressed, compress_idxs = self._compress_kv(x, qr.view(1, 1, -1), start_pos, win)
+                idxs = torch.cat([idxs, compress_idxs.view(-1)])
         o = gpu.sparse_attn(q, self.window_kv_cache, compressed, idxs, self.attn_sink, heads, win, self.softmax_scale)
         out = gpu.attn_out(o, freqs, self.wo_a.fp8, self.wo_a.scale, self.wo_b, heads, rd, self.n_local_groups)
         return out.view(1, 1, -1)
@@ -206,6 +207,10 @@ class Host:
         self.end = self.cache.token + input_ids.size(-1)
         gpu.active, m.linear = self.kernels, kernel_linear if self.kernels else _upstream_linear
         try:
+            if self.kernels and start_pos and input_ids.numel() == 1:
+                # the default-device context costs every small tensor call 0.6 us, ten thousand times a token;
+                # the kernel path enters it only around upstream's index code (HostAttention)
+                return self.net(input_ids.to(self.device), start_pos)[1]
             with torch.device(self.device):  # upstream creates index tensors on the default device
                 return self.net(input_ids.to(self.device), start_pos)[1]
         finally:

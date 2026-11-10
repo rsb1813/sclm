@@ -73,6 +73,7 @@ class ExpertCache:
         # > 0: an expert that has to be read is waited for only if it carries at least this share of the token's
         # routing weight; otherwise the token goes on without it and it is read in the background
         self.wait_share = 0.0
+        self.ram_share = 0.0  # > 0: a CPU-tier expert with less than this share of the routing weight is left out
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
