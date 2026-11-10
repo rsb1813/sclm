@@ -2,7 +2,7 @@
 
 ## 지금
 - 하는 일: 런타임 4단계, 상시 경로와 SSD 계층 expert 계산을 코어의 CUDA 커널로 이전 (지금 1.3 tok/s의 대부분)
-- 최근 완료: 런타임 3단계, 실제 가중치로 첫 생성. 문장 정상, 1.32 tok/s (PyTorch 상시 경로 448ms, SSD expert 계산 196ms, RAM 계층 58ms, 읽기 54ms)
+- 최근 완료: GPU 커널 첫 묶음(FP8 GEMV, FP4 expert, mHC)으로 1.32 → 2.65 tok/s. 슬롯 복사 경합 버그 수정. 저장한 부호 재평가 KL 0.0956 재현
 - 확인 대기: VRAM 여유 확보 방법 (3절). 런타임 구조는 3안으로 확정
 - 다음 GPU 작업: int8 표의 KL 영향 평가 (저장한 부호로, `quant_eval --config codes`)
 - 최근 결과: tier20v100 (RAM 1.00bpw) KL 0.0956, top-1 91.4%, 부호 63.3GiB 저장 완료
@@ -120,7 +120,10 @@
   - [x] 실제 체크포인트를 CPU로 적재: 40층 이름·모양 일치, 처음 3층이 실제 파일로 실행됨. 상주 7.96GiB (`wo_a`를 FP8로 둬서 레퍼런스 적재보다 1.25GiB 작음)
   - [x] 3단계: 실제 체크포인트로 GPU에서 생성. 문장 정상, 1.32 tok/s, VRAM 최대 12.56GiB(캐시 200칸), RAM 91.6GiB. 캐시 300칸 이상은 PyTorch 임시 텐서 때문에 VRAM 부족
   - [x] 전체 테스트 56개 통과 (GPU 포함)
-  - [ ] 4단계: 상시 경로를 코어의 CUDA 커널로 이전
+  - [x] 저장한 부호만으로 재평가(`quant_eval --config codes`): KL 0.09565, top-1 91.44% 재현
+  - [x] 4단계 첫 묶음: FP8 GEMV·FP4 expert·mHC 커널(`engine/gpu.cu`), 작은 모델에서 레퍼런스와 1e-14. 2.65 tok/s
+  - [x] 슬롯 복사와 다음 읽기의 경합 수정 (프리필에서 슬롯 바이트가 섞일 수 있었음)
+  - [ ] 4단계 나머지: attention 안쪽(RoPE, sparse attention, KV 캐시), gate, Engram, head를 커널로
 - [ ] Phase 3 캐시·예측·스케줄러
 - [ ] Phase 4 speculative
 - [ ] Phase 5 손실 기법 토글 실험

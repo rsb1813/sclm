@@ -306,7 +306,7 @@ class RTNLinear(torch.nn.Module):
         return F.linear(xq, self.weight_dequant()).to(torch.get_default_dtype())
 
 
-TABLE_GATHER = 1 << 30  # table entries gathered at once by VQLinear's table path (one byte each)
+TABLE_GATHER = 1 << 26  # table entries gathered at once by VQLinear's table path (a byte each, 4 while summed)
 
 
 class VQLinear(RTNLinear):

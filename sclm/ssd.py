@@ -91,6 +91,6 @@ class ExpertCache:
             return
         self.reader.wait()
         n_scale, n_weight = self.reader.sizes
-        for slot, buf, (at_s, at_w) in pending:
-            self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale], non_blocking=True)
-            self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
+        for slot, buf, (at_s, at_w) in pending:  # blocking copies: the next request reads into the same buffers
+            self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale])
+            self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight])

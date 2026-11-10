@@ -5,6 +5,7 @@ from time import perf_counter
 import torch
 from torch import nn
 
+from sclm import gpu
 from sclm.upstream import model as m
 
 
@@ -15,7 +16,7 @@ class TieredMoE(nn.Module):
 
     def __init__(self, layer_id: int, args: "m.ModelArgs"):
         super().__init__()
-        self.layer_id, self.dim = layer_id, args.dim
+        self.layer_id, self.dim, self.inter, self.limit = layer_id, args.dim, args.moe_inter_dim, args.swiglu_limit
         self.gate = m.Gate(layer_id, args)
         self.shared_experts = m.Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
         self.ram = self.cache = None
@@ -40,8 +41,13 @@ class TieredMoE(nn.Module):
             t2 = perf_counter()
             self.cache.finish(pending)
             t3 = perf_counter()
-            for k, slot in zip(ssd, slots):
-                y[r] += m.Expert.forward(self.cache.experts[slot], x[r:r + 1], weights[r, k].view(1, 1))[0]
+            if ssd and gpu.active:  # straight from the slots' FP4 bytes
+                xq = gpu.act_quant(x[r])
+                for k, slot in zip(ssd, slots):
+                    gpu.fp4_expert(self.cache.store[slot], self.dim, self.inter, self.limit, xq, gates[r][k], y[r])
+            else:
+                for k, slot in zip(ssd, slots):
+                    y[r] += m.Expert.forward(self.cache.experts[slot], x[r:r + 1], weights[r, k].view(1, 1))[0]
             t4 = perf_counter()
             stats["ram_s"] += t2 - t1  # includes starting the reads
             stats["read_s"] += t3 - t2  # what is left of the reads after the CPU tier, and the copies into the slots

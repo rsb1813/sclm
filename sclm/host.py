@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sclm import core, ssd
+from sclm import core, gpu, ssd
 from sclm.checkpoint import Checkpoint, MappedEngramEmbedding, widen_fp8
 from sclm.layerwise import load_params_
 from sclm.tiered import TieredMoE
@@ -56,6 +56,65 @@ class Fp8Weight(nn.Module):
         return widen_fp8(self.fp8, self.scale)
 
 
+_upstream_linear = m.linear
+
+
+def kernel_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    """upstream linear(), with an fp8 weight applied to a single token by the engine's kernel."""
+    if weight.dtype == torch.float8_e4m3fn and x.numel() == weight.size(1) and x.dtype == torch.bfloat16:
+        return gpu.fp8_linear(x.contiguous(), weight, weight.scale).view(*x.shape[:-1], -1)
+    return _upstream_linear(x, weight, bias)
+
+
+class HostAttention(m.Attention):
+    """upstream Attention; decoding one token with the kernels on, the output projection reads wo_a as stored
+    (Fp8Weight) through the engine's grouped kernel instead of widening it."""
+
+    def forward(self, x: torch.Tensor, start_pos: int):
+        if not (gpu.active and x.size(0) * x.size(1) == 1):
+            return super().forward(x, start_pos)
+        bsz, seqlen, _ = x.size()  # upstream's forward up to the output projection
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        rd = self.rope_head_dim
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        m.apply_rotary_emb(q[..., -rd:], freqs_cis)
+        kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+        if self.compress_ratio:
+            compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
+            kv = torch.cat([kv, compress_kv], dim=1)
+            topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
+        o = m.sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        m.apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        o = gpu.fp8_linear(o.contiguous(), self.wo_a.fp8, self.wo_a.scale, self.n_local_groups)
+        return self.wo_b(o.view(bsz, seqlen, -1))
+
+
+class HostBlock(m.Block):
+    """upstream Block; decoding one token with the kernels on, the hyper-connection steps and the norm in front of
+    each sublayer run as fused kernels (upstream spends about a hundred small operations on them per sublayer)."""
+
+    attention_cls = HostAttention
+
+    def forward(self, x, start_pos, pre_mix, image_mask, *attn_args):
+        if not (gpu.active and x.size(0) * x.size(1) == 1):
+            return super().forward(x, start_pos, pre_mix, image_mask, *attn_args)
+        hc, shape = self.hc_mult, x.shape
+        mixes = lambda h, part: gpu.hc_mixes(  # noqa: E731  -> pre[hc], post[hc], comb[hc][hc]
+            h, getattr(self, f"hc_{part}_fn"), getattr(self, f"hc_{part}_scale"), getattr(self, f"hc_{part}_base"), hc,
+            self.norm_eps, self.hc_eps, self.hc_sinkhorn_iters)
+        h = x.contiguous()
+        attn_mix = mixes(h, "attn")
+        a = gpu.hc_pre_norm(h, pre_mix.contiguous(), self.attn_norm.weight, self.attn_norm.eps)
+        a = self.attn(a.view(1, 1, -1), start_pos, *attn_args)
+        h = gpu.hc_post(a.contiguous(), h, attn_mix[hc:2 * hc], attn_mix[2 * hc:])
+        ffn_mix = mixes(h, "ffn")
+        f = gpu.hc_pre_norm(h, attn_mix[:hc], self.ffn_norm.weight, self.ffn_norm.eps)  # the mix attention computed
+        f = self.ffn(f.view(1, 1, -1), image_mask)
+        h = gpu.hc_post(f.contiguous(), h, ffn_mix[hc:2 * hc], ffn_mix[2 * hc:])
+        return h.view(shape), ffn_mix[:hc].view(1, 1, hc)
+
+
 class _Absent(nn.Module):
     """Stands in, while the model is built, for a module whose weights are placed afterwards."""
 
@@ -68,9 +127,9 @@ def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.T
     device: the routed experts (each block's ffn is a TieredMoE), the engram tables, the embedding and the head.
     Parameters are uninitialized."""
     assert not args.dspark_block_size and not args.vision_enabled
-    names = ("MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
+    names = ("Block", "MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
     upstream = [getattr(m, n) for n in names]
-    m.MoE, m.ParallelEngramEmbedding, m.ParallelEmbedding, m.ParallelHead = TieredMoE, _Absent, _Absent, _Absent
+    m.Block, m.MoE, m.ParallelEngramEmbedding, m.ParallelEmbedding, m.ParallelHead = HostBlock, TieredMoE, _Absent, _Absent, _Absent
     try:
         with torch.device(device):
             return m.Transformer(args, tokenizer)
@@ -111,14 +170,21 @@ def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, c
 
 
 class Host:
-    """The tiered model as a decoder: prefill with start_pos 0, then one token per call."""
+    """The tiered model as a decoder: prefill with start_pos 0, then one token per call. kernels: single-token
+    steps use the engine's GPU kernels (by default when the model is on a GPU and they are built)."""
 
-    def __init__(self, net: "m.Transformer", cache: ssd.ExpertCache, device: str = "cuda"):
+    def __init__(self, net: "m.Transformer", cache: ssd.ExpertCache, device: str = "cuda", kernels: bool | None = None):
         self.net, self.cache, self.device = net, cache, device
+        on_gpu = torch.device(device).type == "cuda"
+        self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
 
     @torch.inference_mode()
     def logits(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         """Next-token logits [batch, vocab] (fp32) after input_ids, which continue the sequence at start_pos."""
         self.cache.token = start_pos
-        with torch.device(self.device):  # upstream creates index tensors on the default device
-            return self.net(input_ids.to(self.device), start_pos)[1]
+        gpu.active, m.linear = self.kernels, kernel_linear if self.kernels else _upstream_linear
+        try:
+            with torch.device(self.device):  # upstream creates index tensors on the default device
+                return self.net(input_ids.to(self.device), start_pos)[1]
+        finally:
+            gpu.active, m.linear = False, _upstream_linear
