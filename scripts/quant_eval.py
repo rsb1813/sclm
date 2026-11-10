@@ -264,6 +264,7 @@ class GPTQExperts:
                                           gw[rows[c : c + TOKEN_CHUNK], slot[c : c + TOKEN_CHUNK], None], rc[c : c + TOKEN_CHUNK])
             else:
                 self.quantize_option_(experts, es, opt, xq, gw, idx, h_layer)
+        experts.to(DEV)
         counts = {o: plan.count(o) for o in dict.fromkeys(plan)}
         print(f"gptq layer {self.layer:2d}: {xq.size(0)} calib tokens, {counts}, {time.time() - t0:.0f}s, "
               f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB, RAM free {ram_avail_gb():.1f}GiB, "
@@ -345,6 +346,7 @@ class GPTQExperts:
             del h2, w2, q1, q3
             for k, e in enumerate(es):
                 experts[e].w1, experts[e].w2, experts[e].w3 = l1[k], l2[k], l3[k]
+                experts[e].to("cpu")  # up to 4GiB of codes in a layer: off the GPU while the others are quantized
 
 
 def freeze_routing_(block, layer: int, ref_idx: list, cur: dict) -> None:
