@@ -184,9 +184,11 @@ def gptq_vq(
             err[..., i : i + d] = e
         W[..., b1:] -= err @ u[..., b0:b1, b1:]
     if refit:
+        del W, u, inv_all, ct_all  # the refit's [..., N, K] temporaries were the VRAM peak
         q = cb[codes].flatten(-2)
         qh = q @ H
-        scales = ((qh * w0).sum(-1, keepdim=True) / (qh * q).sum(-1, keepdim=True).clamp_min(1e-12)).half().float()
+        num = w0.mul_(qh).sum(-1, keepdim=True)
+        scales = (num / qh.mul_(q).sum(-1, keepdim=True).clamp_min(1e-12)).half().float()
     return codes, scales
 
 

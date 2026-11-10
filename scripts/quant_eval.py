@@ -324,9 +324,11 @@ class GPTQExperts:
                 h1.append((1 - self.beta) * h_e + self.beta * h_layer)
             h1 = rotate_h(torch.stack(h1), self.rots[5120])
             # w1 and w3 see the same inputs: one GPTQ pass over both (rows are independent given the Hessian)
-            (l1, l3), q13 = gptq(torch.cat([w1, w3], dim=1), h1, self.rots[5120], parts=2)
+            w13 = torch.cat([w1, w3], dim=1)
+            del w1, w3
+            (l1, l3), q13 = gptq(w13, h1, self.rots[5120], parts=2)
             q1, q3 = q13.chunk(2, 1)
-            del h1, w1, w3, q13
+            del h1, w13, q13
             h2 = []
             for k, (rows, slot) in enumerate(toks):
                 if not rows.numel():
