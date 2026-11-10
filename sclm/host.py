@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sclm import core, ssd
-from sclm.checkpoint import Checkpoint, MappedEngramEmbedding
-from sclm.layerwise import _NoTable, load_params_
+from sclm.checkpoint import Checkpoint, MappedEngramEmbedding, widen_fp8
+from sclm.layerwise import load_params_
 from sclm.tiered import TieredMoE
 from sclm.upstream import model as m
 
@@ -43,27 +43,52 @@ class Bf16Head(nn.Module):
         return kernel._mm_fp32_out(x.to(torch.bfloat16), self.weight)
 
 
+class Fp8Weight(nn.Module):
+    """attn.wo_a as the checkpoint stores it, fp8 with block scales. upstream widens it to bf16 once at load (twice
+    the memory); here `weight` widens it at each use."""
+
+    def __init__(self, weight: torch.Tensor, scale: torch.Tensor):
+        super().__init__()
+        self.fp8, self.scale = weight, scale
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return widen_fp8(self.fp8, self.scale)
+
+
+class _Absent(nn.Module):
+    """Stands in, while the model is built, for a module whose weights are placed afterwards."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+
 def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.Transformer":
-    """upstream's Transformer for `args` (with TEXT_ONLY applied) without what stays off the device: the routed
-    experts (each block's ffn is a TieredMoE) and the engram tables. Parameters are uninitialized."""
+    """upstream's Transformer for `args` (with TEXT_ONLY applied) without what is placed afterwards or stays off the
+    device: the routed experts (each block's ffn is a TieredMoE), the engram tables, the embedding and the head.
+    Parameters are uninitialized."""
     assert not args.dspark_block_size and not args.vision_enabled
-    upstream = m.MoE, m.ParallelEngramEmbedding
-    m.MoE, m.ParallelEngramEmbedding = TieredMoE, _NoTable
+    names = ("MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
+    upstream = [getattr(m, n) for n in names]
+    m.MoE, m.ParallelEngramEmbedding, m.ParallelEmbedding, m.ParallelHead = TieredMoE, _Absent, _Absent, _Absent
     try:
         with torch.device(device):
             return m.Transformer(args, tokenizer)
     finally:
-        m.MoE, m.ParallelEngramEmbedding = upstream
+        for n, cls in zip(names, upstream):
+            setattr(m, n, cls)
 
 
 def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda") -> None:
     """Fills build_net's model from the released checkpoint. The engram tables stay in the checkpoint files, the
-    embedding table in RAM, the head in bf16."""
+    embedding table in RAM, the head in bf16 and attn.wo_a in fp8."""
     net.embed = HostEmbedding(ckpt.get("embed.weight"))
     for i, block in enumerate(net.layers):
         prefix = f"layers.{i}."
+        block.attn.wo_a = Fp8Weight(*(ckpt.get(f"{prefix}attn.wo_a.{part}").to(device) for part in ("weight", "scale")))
         # bias_vl routes image tokens only
-        load_params_(block, ckpt.module_state(prefix, skip=(".engram.embed.", ".ffn.experts.", ".ffn.gate.bias_vl")), prefix)
+        skip = (".engram.embed.", ".ffn.experts.", ".ffn.gate.bias_vl", ".attn.wo_a.")
+        load_params_(block, ckpt.module_state(prefix, skip=skip), prefix)
         if block.engram is not None:
             block.engram.embed = MappedEngramEmbedding(
                 ckpt.memmap(prefix + "engram.embed.weight"), ckpt.memmap(prefix + "engram.embed.scale")

@@ -20,6 +20,13 @@ ST_DTYPES = {
 }
 
 
+def widen_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """An fp8 weight with one scale per block of rows and columns, as bf16 (upstream convert.py stores wo_a so)."""
+    bo, bi = weight.size(0) // scale.size(0), weight.size(1) // scale.size(1)
+    wide = weight.unflatten(0, (-1, bo)).unflatten(-1, (-1, bi)).float() * scale[:, None, :, None].float()
+    return wide.flatten(2, 3).flatten(0, 1).bfloat16()
+
+
 def read_header(path: str) -> tuple[dict, int]:
     """safetensors header of `path` and the byte offset where tensor data starts."""
     with open(path, "rb") as f:
@@ -76,10 +83,7 @@ class Checkpoint:
         names = [k for k in self.weight_map if k.startswith(prefix) and not any(s in k for s in skip)]
         state = {k[len(prefix) :]: self.get(k) for k in names}
         for key in [k for k in state if k.endswith("wo_a.weight")]:
-            weight, scale = state[key], state.pop(key[: -len("weight")] + "scale")
-            bo, bi = weight.size(0) // scale.size(0), weight.size(1) // scale.size(1)
-            weight = weight.unflatten(0, (-1, bo)).unflatten(-1, (-1, bi)).float() * scale[:, None, :, None].float()
-            state[key] = weight.flatten(2, 3).flatten(0, 1).bfloat16()
+            state[key] = widen_fp8(state[key], state.pop(key[: -len("weight")] + "scale"))
         for key, value in state.items():
             if ".experts." in key and "shared_experts" not in key and value.dtype == torch.int8:
                 state[key] = value.view(torch.float4_e2m1fn_x2)

@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from sclm import core, host
-from sclm.checkpoint import Checkpoint
+from sclm.checkpoint import Checkpoint, widen_fp8
 from sclm.layerwise import load_params_
 from sclm.upstream import model as m
 
@@ -46,9 +46,17 @@ def test_host_decodes_as_upstream_with_the_same_experts(tmp_path, monkeypatch):
                            swiglu_limit=tc.LIMIT, vocab_size=1000, max_batch_size=1, max_seq_len=64, temperature=0)
         ref = m.Transformer(args)
         init_random_(ref, dev="cpu")
+        g = torch.Generator().manual_seed(4)
+        wo_a = []  # per layer, fp8 with a scale per 32 x 32 block, as the released checkpoint stores it
         with torch.no_grad():
             ref.head.weight.copy_(ref.head.weight.to(torch.bfloat16))  # the released head is bf16
-        state = {name: p for name, p in ref.named_parameters() if ".ffn.experts." not in name}
+            for layer in ref.layers:
+                out, k = layer.attn.wo_a.weight.shape
+                wo_a.append((torch.randn(out, k, generator=g, dtype=torch.float32).to(torch.float8_e4m3fn),
+                             torch.full((out // 32, k // 32), 2.0**-5, dtype=torch.float32).to(torch.float8_e8m0fnu)))
+                layer.attn.wo_a.weight.copy_(widen_fp8(*wo_a[-1]))  # upstream holds it widened
+        placed = (".ffn.experts.", ".attn.wo_a.", "embed.", "head.")
+        state = {name: p for name, p in ref.named_parameters() if not any(s in name for s in placed)}
         write_checkpoint(tmp_path, {name: p.detach().view(torch.uint8).numpy() for name, p in ref.named_parameters()
                                     if ".ffn.experts." in name})
         for i, layer in enumerate(ref.layers):
@@ -58,8 +66,10 @@ def test_host_decodes_as_upstream_with_the_same_experts(tmp_path, monkeypatch):
                     layer.ffn.experts[e] = Tabled(c)
 
         net = host.build_net(args, device="cpu")
+        for layer, (weight, scale) in zip(net.layers, wo_a):
+            layer.attn.wo_a = host.Fp8Weight(weight, scale)
         load_params_(net, state, "")
-        net.embed, net.head = host.HostEmbedding(net.embed.weight.detach()), host.Bf16Head(net.head.weight.detach().to(torch.bfloat16))
+        net.embed, net.head = host.HostEmbedding(ref.embed.weight.detach()), host.Bf16Head(ref.head.weight.detach().to(torch.bfloat16))
         cache = host.attach_tiers_(net, args, Checkpoint(str(tmp_path)), str(tmp_path), slots=5, lam=0.1, device="cpu")
         reads, submit = [], cache.reader.submit
         cache.reader.submit = lambda layer, e, buf: reads.append((layer, e)) or submit(layer, e, buf)
