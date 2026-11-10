@@ -16,7 +16,7 @@ OPTIONS = {"v8c8": (8, 8, False), "v2c6": (2, 6, False)}
 PLAN = ["v8c8", "orig", "v2c6", "v8c8", "v2c6"]
 
 
-def make_layer(path):
+def make_layer(path, plan=PLAN):
     g = torch.Generator().manual_seed(0)
     rots = {k: quant.BlockHadamard(k, seed=17 + k, device="cpu") for k in (DIM, INTER)}
     cbs = {o: torch.randn(1 << bits, d, generator=g) for o, (d, bits, _) in OPTIONS.items()}
@@ -27,8 +27,8 @@ def make_layer(path):
         return quant.VQLinear(torch.randint(0, 1 << bits, (n, k // d), generator=g), scales, cbs[opt], rots[k])
 
     experts = [None if o == "orig" else SimpleNamespace(w1=lin(o, INTER, DIM), w2=lin(o, DIM, INTER), w3=lin(o, INTER, DIM),
-                                                        swiglu_limit=LIMIT) for o in PLAN]
-    codes.save_layer(path, PLAN, experts, OPTIONS, rots)
+                                                        swiglu_limit=LIMIT) for o in plan]
+    codes.save_layer(path, plan, experts, OPTIONS, rots)
     return experts
 
 
