@@ -3,9 +3,9 @@
 import ctypes as C
 import json
 import os
+import struct
 
 import numpy as np
-from safetensors import safe_open
 
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclm_core.dll")
 
@@ -48,10 +48,8 @@ class Layer:
 
     def __init__(self, path: str, dim: int, inter: int, swiglu_limit: float):
         self.lib, self.dim = _dll(), dim
-        with safe_open(path, "np") as f:
-            meta = f.metadata()
-            assert meta["format"] == "sclm-vq-1" and int(meta["tile"]) == 256
-            self.arrays = {k: np.ascontiguousarray(f.get_tensor(k)) for k in f.keys()}  # the engine keeps pointers into these
+        meta, self.arrays = read_file(path)  # the engine keeps pointers into these
+        assert meta["format"] == "sclm-vq-1" and int(meta["tile"]) == 256
         options = json.loads(meta["options"])
         formats = (Format * len(options))()
         self.experts = {}  # expert index -> Expert
@@ -87,7 +85,7 @@ def pages(nbytes: int) -> np.ndarray:
 
 
 class Reader:
-    """Unbuffered overlapped reads from the checkpoint shards: nothing passes through the OS file cache."""
+    """Unbuffered overlapped reads from files (the checkpoint shards): nothing passes through the OS file cache."""
 
     def __init__(self, paths: list, chunk: int = 4 << 20):
         self.lib = _dll()
@@ -127,3 +125,24 @@ class Cache:
         if getattr(self, "handle", None):
             self.lib.sclm_cache_free(self.handle)
 
+
+ST_DTYPES = {"F32": np.float32, "F16": np.float16, "I32": np.int32, "I8": np.int8, "U8": np.uint8}
+
+
+def read_file(path: str) -> tuple[dict, dict]:
+    """(metadata, arrays by name) of a safetensors file, its data read in one piece into this process's memory.
+    A buffered or memory-mapped read would leave a second copy in the OS file cache, and the RAM tier is most of
+    the machine's memory."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+    meta, size = header.pop("__metadata__"), os.path.getsize(path) - 8 - n
+    buf = pages(size + 2 * PAGE)
+    reader = Reader([path])
+    head = reader.submit(0, 8 + n, size, buf)
+    reader.wait()
+    arrays = {}
+    for name, info in header.items():
+        start, end = info["data_offsets"]
+        arrays[name] = buf[head + start:head + end].view(ST_DTYPES[info["dtype"]]).reshape(info["shape"])
+    return meta, arrays
