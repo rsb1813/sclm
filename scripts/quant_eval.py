@@ -23,6 +23,7 @@ TOPK = 64  # reference distribution kept as its top-64 tokens per position
 CHUNK = 256
 SCALES = (0.9, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3)  # logit multipliers for the oracle-temperature KL diagnostic
 MARGIN_EDGES = torch.logspace(-5, 0, 26)  # bins of the 6th-7th selection-score margin (--flip-stats)
+TOKEN_CHUNK = 16384  # calibration tokens per Hessian accumulation step of one expert
 # name -> (bits, group, hadamard) for routed experts; "none" is the uncompressed reference, "dense" runs the
 # uncompressed FP4 weights through the same fp32 path RTNLinear uses (isolates the GEMM path from compression)
 CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had": (2, 64, True),
@@ -37,10 +38,13 @@ CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had"
            # GPTQ per expert from calibration sequences (GPTQExperts); the last field is the H-metric unbiasing
            "gptq2": ("gptq", 2, True), "gptq3": ("gptq", 3, True),
            # per-expert GPTQ option or the original FP4 expert (the SSD tier) from scripts/allocate_tiers.py
-           "tier20": ("gptq_alloc", "tier20", False), "tier20g": ("gptq_alloc", "tier20g", False)}
+           "tier20": ("gptq_alloc", "tier20", False), "tier20g": ("gptq_alloc", "tier20g", False),
+           "tier20v": ("gptq_alloc", "tier20v", False), "tier20v110": ("gptq_alloc", "tier20v110", False)}
 # GPTQ storage options: name -> (bits, levels, group); "orig" keeps the original FP4 expert
 GPTQ_OPTIONS = {"1b128": (1, 2, 128), "t128": (2, 3, 128), "2b128": (2, 4, 128), "2b64": (2, 4, 64),
                 "3b64": (3, 8, 64), "3b128": (3, 8, 128)}
+# vector-code options (quant.gptq_vq, one fp16 scale per row): name -> (columns per code, code bits, least-squares scale)
+VQ_OPTIONS = {"v16c8": (16, 8, True), "v8c8": (8, 8, True), "v4c8": (4, 8, False), "v2c6": (2, 6, False)}
 
 
 class DenseFP4Linear(torch.nn.Module):
@@ -68,6 +72,19 @@ def act_q(x: torch.Tensor) -> torch.Tensor:
 
 def fp4_dense(lin) -> torch.Tensor:
     return (kernel.unpack_fp4(lin.weight).unflatten(-1, (-1, 32)) * lin.scale.float().unsqueeze(-1)).flatten(-2)
+
+
+def ram_avail_gb() -> float:
+    """Physical RAM Windows reports as available, in GiB."""
+    import ctypes
+
+    class Status(ctypes.Structure):  # MEMORYSTATUSEX
+        _fields_ = [("length", ctypes.c_uint32), ("load", ctypes.c_uint32),
+                    *((n, ctypes.c_uint64) for n in ("total", "avail", "page", "page_avail", "virt", "virt_avail", "ext"))]
+
+    st = Status(length=ctypes.sizeof(Status))
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+    return st.avail / 2**30
 
 
 class ProjIn(torch.nn.Module):
@@ -148,40 +165,42 @@ class GPTQExperts:
     """Collects a layer's FFN inputs and routing while the calibration batches pass, then, right before the first eval
     batch, replaces its routed experts by GPTQ codes: Hadamard basis, per-expert gate^2-weighted X^T X mixed with the
     layer covariance (beta), optional H-metric unbiasing. The calibration stream stays the uncompressed model's.
-    `plan(layer)` names each expert's GPTQ_OPTIONS entry, or "orig" to keep its FP4 weights."""
+    `plan(layer)` names each expert's GPTQ_OPTIONS or VQ_OPTIONS entry, or "orig" to keep its FP4 weights.
+    `n_tok`: calibration tokens in all (their FFN inputs of the current layer wait in one CPU buffer)."""
 
-    def __init__(self, plan, n_cal: int, unbias: bool, beta: float = 0.5, batch: int = 8):
+    def __init__(self, plan, n_cal: int, n_tok: int, unbias: bool, beta: float = 0.5, batch: int = 8):
         self.plan, self.n_cal, self.unbias, self.beta, self.batch = plan, n_cal, unbias, beta, batch
-        self.block, self.store, self.cur, self.t0 = None, [], 0, time.time()
+        self.block, self.cur, self.t0 = None, 0, time.time()
+        self.xq = torch.empty(n_tok, 5120, dtype=torch.bfloat16, device="cpu")
         self.rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (5120, 2304)}  # quant_eval's usual seeds
 
     def before_block(self, i: int, block) -> None:
-        self.layer, self.block, self.store = i, weakref.ref(block), []  # weak: the runner frees each block itself
+        self.layer, self.block = i, weakref.ref(block)  # weak: the runner frees each block itself
+        self.gates, self.n, self.h_layer = [], 0, 0
         block.ffn.gate.register_forward_hook(self.on_gate)
 
     def on_gate(self, _mod, inp, out) -> None:
-        if self.cur < self.n_cal:  # inputs wait on the CPU: 100K+ calibration tokens would crowd the Hessians out
-            self.store.append((inp[0].detach().to("cpu", torch.bfloat16), out[0].float(), out[1]))
+        if self.cur < self.n_cal:
+            x = act_q(inp[0].detach().reshape(-1, 5120))
+            self.h_layer = self.h_layer + x.t() @ x
+            # fp8 values with power-of-two scales: exact in bf16. They wait on the CPU: 100K+ calibration tokens
+            # would crowd the Hessians out of VRAM
+            self.xq[self.n : self.n + x.size(0)] = x.bfloat16()
+            self.n += x.size(0)
+            self.gates.append((out[0].float(), out[1]))
 
     def before_batch(self, i: int, j: int) -> None:
         self.cur = j
         if j == self.n_cal:
             self.quantize_(self.block())
-            self.store = []
 
     def quantize_(self, block) -> None:
         from scripts.gptq_probe import tr_norm
 
         t0 = time.time()
-        gw = torch.cat([s[1] for s in self.store])
-        idx = torch.cat([s[2] for s in self.store]).long()
-        xq, h_layer = [], 0
-        for s in self.store:  # fp8 values with power-of-two scales: exact in bf16; fp32 accumulation per batch
-            chunk = act_q(s[0].to(DEV))
-            h_layer = h_layer + chunk.t() @ chunk
-            xq.append(chunk.bfloat16().cpu())
-        xq, self.store = torch.cat(xq), []
-        h_layer = tr_norm(h_layer)
+        gw = torch.cat([g for g, _ in self.gates])
+        idx = torch.cat([i for _, i in self.gates]).long()
+        xq, h_layer, self.gates, self.h_layer = self.xq[: self.n], tr_norm(self.h_layer), [], 0
         experts = block.ffn.experts
         experts.to("cpu")  # frees ~7GB of FP4 weights for the Hessians; each batch is copied back for its GPTQ
         torch.cuda.empty_cache()
@@ -193,16 +212,44 @@ class GPTQExperts:
                 for e in es:
                     experts[e].to(DEV)
             else:
-                self.quantize_option_(experts, es, *GPTQ_OPTIONS[opt], xq, gw, idx, h_layer)
+                self.quantize_option_(experts, es, opt, xq, gw, idx, h_layer)
         counts = {o: plan.count(o) for o in dict.fromkeys(plan)}
         print(f"gptq layer {self.layer:2d}: {xq.size(0)} calib tokens, {counts}, {time.time() - t0:.0f}s, "
-              f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB, total {(time.time() - self.t0) / 60:.0f} min",
-              flush=True)
+              f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB, RAM free {ram_avail_gb():.1f}GiB, "
+              f"total {(time.time() - self.t0) / 60:.0f} min", flush=True)
 
-    def quantize_option_(self, experts, members: list, bits: int, levels: int, group: int, xq, gw, idx,
-                         h_layer) -> None:
-        from scripts.gptq_probe import tr_norm
+    def codebook(self, experts, members: list, d: int, bits: int) -> torch.Tensor:
+        """k-means codes for d consecutive weights (rotated basis, rows at unit rms) of 8 of the option's experts,
+        trained as scripts/gptq_probe.py does."""
+        torch.manual_seed(0)  # k-means draws from the global generators: a resumed run trains the same codebook
+        sample = []
+        for e in members[:: max(1, len(members) // 8)][:8]:
+            for name in ("w1", "w2", "w3"):
+                w = fp4_dense(getattr(experts[e], name).to(DEV)).float()
+                wr = self.rots[w.size(-1)].rotate(w)
+                v = (wr / wr.pow(2).mean(-1, keepdim=True).sqrt()).reshape(-1, d)
+                sample.append(v[torch.randperm(v.size(0), device="cpu")[: 1 << 17].to(DEV)])
+        return quant.kmeans(torch.cat(sample), 1 << bits)
+
+    def quantize_option_(self, experts, members: list, opt: str, xq, gw, idx, h_layer) -> None:
+        from scripts.gptq_probe import rot_cols, tr_norm
         from scripts.quant_probe import SWIGLU_LIMIT
+
+        # gptq(w [E, N, K], Hessians in the rotated basis, rot) -> the experts' modules and dequantized weights
+        if opt in VQ_OPTIONS:
+            d, bits, refit = VQ_OPTIONS[opt]
+            cb = self.codebook(experts, members, d, bits)
+
+            def gptq(w, hr, rot):
+                codes, scales = quant.gptq_vq(rot_cols(rot, w), hr, cb, w.size(-1), refit=refit)
+                return ([quant.VQLinear(c, s, cb, rot) for c, s in zip(codes, scales)],
+                        rot_cols(rot, quant.vq_codes_dequant(codes, scales, cb), inverse=True))
+        else:
+            bits, levels, group = GPTQ_OPTIONS[opt]
+
+            def gptq(w, hr, rot):
+                codes, steps, wq = gptq_in_basis(w, hr, bits, rot, levels, group, self.unbias)
+                return [quant.RTNLinear.from_codes(c, s, bits, group, rot, levels) for c, s in zip(codes, steps)], wq
 
         eye = torch.eye(2304, device=DEV, dtype=torch.float32)
         for e0 in range(0, len(members), self.batch):
@@ -213,29 +260,32 @@ class GPTQExperts:
                           for n in ("w1", "w2", "w3"))
             h1 = []
             for (rows, slot), rc in zip(toks, rows_cpu):
-                xr = xq[rc].to(DEV).float()
-                h_e = tr_norm(xr.t() @ (gw[rows, slot].pow(2)[:, None] * xr)) if rows.numel() else h_layer
+                h_e = 0
+                for c in range(0, rows.numel(), TOKEN_CHUNK):  # a busy expert sees 100K+ calibration tokens
+                    xr = xq[rc[c : c + TOKEN_CHUNK]].to(DEV).float()
+                    h_e = h_e + xr.t() @ (gw[rows[c : c + TOKEN_CHUNK], slot[c : c + TOKEN_CHUNK]].pow(2)[:, None] * xr)
+                h_e = tr_norm(h_e) if rows.numel() else h_layer
                 h1.append((1 - self.beta) * h_e + self.beta * h_layer)
             h1 = rotate_h(torch.stack(h1), self.rots[5120])
-            c1, s1, q1 = gptq_in_basis(w1, h1, bits, self.rots[5120], levels, group, self.unbias)
-            c3, s3, q3 = gptq_in_basis(w3, h1, bits, self.rots[5120], levels, group, self.unbias)
+            l1, q1 = gptq(w1, h1, self.rots[5120])
+            l3, q3 = gptq(w3, h1, self.rots[5120])
             del h1, w1, w3
             h2 = []
             for k, (rows, slot) in enumerate(toks):
                 if not rows.numel():
                     h2.append(eye)
                     continue
-                xr = xq[rows_cpu[k]].to(DEV).float()
-                g, u = xr @ q1[k].t(), (xr @ q3[k].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-                hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[rows, slot, None])
-                h2.append((1 - self.beta) * tr_norm(hid.t() @ hid) + self.beta * eye)
-            c2, s2, _ = gptq_in_basis(w2, rotate_h(torch.stack(h2), self.rots[2304]), bits, self.rots[2304], levels,
-                                      group, self.unbias)
+                h_e = 0
+                for c in range(0, rows.numel(), TOKEN_CHUNK):
+                    xr = xq[rows_cpu[k][c : c + TOKEN_CHUNK]].to(DEV).float()
+                    g, u = xr @ q1[k].t(), (xr @ q3[k].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+                    hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[rows[c : c + TOKEN_CHUNK], slot[c : c + TOKEN_CHUNK], None])
+                    h_e = h_e + hid.t() @ hid
+                h2.append((1 - self.beta) * tr_norm(h_e) + self.beta * eye)
+            l2, _ = gptq(w2, rotate_h(torch.stack(h2), self.rots[2304]), self.rots[2304])
             del h2, w2, q1, q3
             for k, e in enumerate(es):
-                for name, c, st, rot in (("w1", c1, s1, 5120), ("w2", c2, s2, 2304), ("w3", c3, s3, 5120)):
-                    setattr(experts[e], name,
-                            quant.RTNLinear.from_codes(c[k], st[k], bits, group, self.rots[rot], levels))
+                experts[e].w1, experts[e].w2, experts[e].w3 = l1[k], l2[k], l3[k]
 
 
 def freeze_routing_(block, layer: int, ref_idx: list, cur: dict) -> None:
@@ -330,6 +380,8 @@ def main() -> None:
     ap.add_argument("--calib-seqs", type=int, help="GPTQ calibration sequences, spread over the non-eval ones "
                     "(default: the 15 of collect_bases.calib_indices)")
     ap.add_argument("--calib-extra", help="token set (e.g. calib_v2, disjoint from calib_v1) added to that pool")
+    ap.add_argument("--checkpoint-every", type=int, help="GPTQ configs: save the state between layers to "
+                    "data/ckpt_<tag>.pt every this many layers, and resume from that file when it exists")
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)
 
@@ -436,9 +488,16 @@ def main() -> None:
         else:
             with open(os.path.join(DATA, f"alloc_{cfg[1]}.json")) as f:
                 plan = json.load(f)["options"].__getitem__
-        gq = GPTQExperts(plan, n_cal, cfg[2])
+        gq = GPTQExperts(plan, n_cal, sum(b.numel() for b in cal), cfg[2])
         before_block, before_batch = gq.before_block, gq.before_batch
-    hidden = runner.hidden_batches(batches, before_block=before_block, before_batch=before_batch)[n_cal:]
+    ckpt = None
+    if cli.checkpoint_every:
+        assert n_cal, "the hooks of the other configs keep state across layers"
+        ckpt = os.path.join(DATA, f"ckpt_{tag}.pt")
+    hidden = runner.hidden_batches(batches, before_block=before_block, before_batch=before_batch, checkpoint=ckpt,
+                                   every=cli.checkpoint_every or 4)[n_cal:]
+    if ckpt and os.path.exists(ckpt):
+        os.remove(ckpt)
     t_fwd = time.time() - t0
 
     norm = m.RMSNorm(runner.args.dim, runner.args.norm_eps).to(DEV)

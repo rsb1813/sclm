@@ -247,3 +247,20 @@ def test_gptq_vq_beats_plain_vq_on_correlated_inputs():
     c1, s1 = quant.gptq_vq(w, h, cb, k, refit=True)
     assert torch.equal(c0, c1) and s1.shape == (3, n, 1)
     assert out_err(quant.vq_codes_dequant(c1, s1, cb)) < out_err(quant.vq_codes_dequant(c0, s0, cb))
+
+
+def test_vq_linear_applies_the_gptq_vq_weight():
+    import sclm.upstream  # noqa: F401
+    import kernel
+
+    torch.manual_seed(12)
+    w, x = torch.randn(48, 256, device=DEV) * 0.02, torch.randn(10, 256, device=DEV)
+    rot = quant.BlockHadamard(256, seed=4)
+    cb = quant.kmeans(torch.randn(4096, 4, device=DEV), 64)
+    codes, scales = quant.gptq_vq(rot.rotate(w), torch.eye(256, device=DEV), cb, 256)
+    lin = quant.VQLinear(codes, scales, cb, rot)
+    assert lin.codes.dtype == torch.uint8 and lin.scales.shape == (48, 1)
+    w_eff = rot.unrotate(quant.vq_codes_dequant(codes, scales, cb))
+    xq = kernel.act_quant(x.to(torch.bfloat16).clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True).float()
+    assert torch.allclose(lin(x).float(), xq @ w_eff.t(), rtol=1e-4, atol=1e-5)
+    assert ((w_eff - w).pow(2).mean() / w.pow(2).mean()) < 0.25  # 64 codes for 4 Gaussian weights (1.5 bits each)

@@ -296,6 +296,22 @@ class RTNLinear(torch.nn.Module):
         return F.linear(xq, self.weight_dequant()).to(torch.get_default_dtype())
 
 
+class VQLinear(RTNLinear):
+    """RTNLinear's drop-in role for gptq_vq's output: one code byte per codebook vector, one fp16 scale per row (or
+    per group) and the codebook [C <= 256, d] the layer's experts share, in the block-Hadamard-rotated basis."""
+
+    def __init__(self, codes: torch.Tensor, scales: torch.Tensor, codebook: torch.Tensor,
+                 rot: "BlockHadamard | None" = None):
+        torch.nn.Module.__init__(self)
+        assert codebook.size(0) <= 256
+        self.rot, self.codebook = rot, codebook
+        self.register_buffer("codes", codes.to(torch.uint8))
+        self.register_buffer("scales", scales.half())
+
+    def weight_dequant(self) -> torch.Tensor:
+        return vq_codes_dequant(self.codes.long(), self.scales.float(), self.codebook)
+
+
 def kmeanspp_init(x: torch.Tensor, n_codes: int, seed: int = 0, max_points: int = 64) -> torch.Tensor:
     """k-means++ seeding on a random subsample of at most max_points * n_codes rows."""
     g = torch.Generator(device="cpu").manual_seed(seed)
