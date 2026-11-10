@@ -1,4 +1,5 @@
 bench/build/
+engine/build/
 .venv/
 ref/
 __pycache__/
