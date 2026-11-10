@@ -23,14 +23,11 @@ class TieredMoE(nn.Module):
         self.ram = self.cache = None
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        """forward for one token (bf16 [dim]) on the engine's GPU kernels. The device computes the routing and the
-        shared expert on its own; the host waits for it once, to learn the routing and take x for the CPU tier."""
+        """forward for one token (bf16 [dim]) on the engine's GPU kernels. The host waits for the device once, to
+        learn the routing and take x for the CPU tier; while the CPU computes its tier, the device computes the shared
+        expert and the routed experts it already holds."""
         cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
-        pack = gpu.gate(self.gate, x)
-        xq = gpu.act_quant(x)
-        shared = torch.empty(self.dim, dtype=torch.float32, device=x.device)
-        gpu.fp8_expert(self.shared_experts, self.limit, xq, shared, store=True)
-        host = pack.cpu().numpy()
+        host = gpu.gate(self.gate, x).cpu().numpy()
         t1 = perf_counter()
         ids, gates = host[:topk].astype(np.int64).tolist(), host[topk:2 * topk].tolist()
         total = sum(gates)
@@ -45,13 +42,24 @@ class TieredMoE(nn.Module):
         kept = sum(gates[k] for k in ram + ssd)
         if kept < total and kept > 0:  # what is computed keeps the routing weight of all six
             gates = [g * (total / kept) for g in gates]
+        xq = gpu.act_quant(x)
+        shared = torch.empty(self.dim, dtype=torch.float32, device=x.device)
+        gpu.fp8_expert(self.shared_experts, self.limit, xq, shared, store=True)
+        y = torch.zeros(self.dim, dtype=torch.float32, device=x.device)
+        reading = {slot for slot, _, _ in pending}
+        for k, slot in zip(ssd, slots):
+            if slot not in reading:
+                gpu.fp4_expert(cache.store[slot], self.dim, self.inter, self.limit, xq, gates[k], y)
         self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:], cache.ram_out.numpy())
         t2 = perf_counter()
         cache.finish(pending)
         t3 = perf_counter()
-        y = cache.ram_out.to(x.device)  # a blocking copy: the buffer is written again in the next layer
         for k, slot in zip(ssd, slots):
-            gpu.fp4_expert(cache.store[slot], self.dim, self.inter, self.limit, xq, gates[k], y)
+            if slot in reading:
+                gpu.fp4_expert(cache.store[slot], self.dim, self.inter, self.limit, xq, gates[k], y)
+        # not waited for: the device takes the buffer before the next layer's routing comes back, and the CPU tier
+        # writes it again only after that
+        y += cache.ram_out.to(x.device, non_blocking=True)
         out = gpu.moe_finish(y, shared)
         t4 = perf_counter()
         for key, value in (("device_s", t1 - t0), ("ram_s", t2 - t1), ("read_s", t3 - t2), ("launch_s", t4 - t3),
