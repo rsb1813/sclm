@@ -99,7 +99,12 @@ class MappedEngramEmbedding(torch.nn.Module):
         # Rows are scattered over a ~100GB file, so reading them one page fault at a time runs at SSD queue depth 1
         # (~5K rows/s here). Deduplicate, sort, and fault pages in from several threads (~65K rows/s).
         rows, inverse = np.unique(indices.reshape(-1).cpu().numpy(), return_inverse=True)
-        parts = list(_row_reader().map(lambda c: (self.weight[c], self.scale[c]), np.array_split(rows, ROW_CHUNKS)))
+        # A view of its own for this lookup: the pages a view faults in stay in the working set until it is unmapped
+        # (0.2GiB per 2048-token sequence, which ran 247 calibration sequences out of RAM)
+        weight, scale = (np.memmap(a.filename, dtype=a.dtype, mode="r", offset=a.offset, shape=a.shape)
+                         for a in (self.weight, self.scale))
+        parts = list(_row_reader().map(lambda c: (weight[c], scale[c]), np.array_split(rows, ROW_CHUNKS)))
+        del weight, scale
         w = torch.from_numpy(np.concatenate([p[0] for p in parts])).to(indices.device).view(torch.float8_e4m3fn)
         s = torch.from_numpy(np.concatenate([p[1] for p in parts])).to(indices.device).view(torch.float8_e8m0fnu)
         values = (w.float().unflatten(-1, (-1, self.block_size)) * s.float().unsqueeze(-1)).flatten(-2)
