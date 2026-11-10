@@ -1,4 +1,5 @@
 # Builds the general-purpose calibration set: fixed-length token sequences from licensed public sources, plus a manifest.
+import argparse
 import glob
 import json
 import os
@@ -9,7 +10,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 CKPT = r"C:\models\DeepSeek-V4.1-Flash"
-OUT = os.path.join(os.path.dirname(__file__), "..", "data", "calib_v1")
+DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 SEQ_LEN = 2048
 DOC_MAX = 1024  # cap tokens per document so one long document cannot fill a category
 
@@ -82,13 +83,27 @@ def docs(category: str, tok):
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", default="calib_v1")
+    ap.add_argument("--scale", type=int, default=1, help="multiply every category's sequence count")
+    ap.add_argument("--skip", help="earlier set (e.g. calib_v1) whose documents to skip, so the two are disjoint")
+    cli = ap.parse_args()
+    out = os.path.join(DATA, cli.name)
+    skip = {}
+    if cli.skip:
+        with open(os.path.join(DATA, cli.skip + ".json"), encoding="utf-8") as f:
+            skip = {c: v.get("skipped", 0) + v["documents"] for c, v in json.load(f)["categories"].items()}
     tok = AutoTokenizer.from_pretrained(CKPT)
-    os.makedirs(OUT, exist_ok=True)
-    seqs, cats, manifest = [], [], {"seq_len": SEQ_LEN, "doc_max": DOC_MAX, "categories": {}}
+    os.makedirs(out, exist_ok=True)
+    seqs, cats, manifest = [], [], {"seq_len": SEQ_LEN, "doc_max": DOC_MAX, "skip": cli.skip, "categories": {}}
     for ci, (category, (n_seq, source, license_)) in enumerate(PLAN.items()):
-        need, buf, n_docs = n_seq * SEQ_LEN, [], 0
+        n_seq *= cli.scale
+        need, buf, n_docs, n_skip = n_seq * SEQ_LEN, [], 0, 0
         for ids in docs(category, tok):
             if len(ids) < 32:
+                continue
+            if n_skip < skip.get(category, 0):
+                n_skip += 1
                 continue
             buf.extend(ids[:DOC_MAX])
             n_docs += 1
@@ -97,12 +112,13 @@ def main() -> None:
         arr = np.array(buf[:need], dtype=np.int32).reshape(n_seq, SEQ_LEN)
         seqs.append(arr)
         cats += [ci] * n_seq
-        manifest["categories"][category] = {"source": source, "license": license_, "sequences": n_seq, "documents": n_docs}
+        manifest["categories"][category] = {"source": source, "license": license_, "sequences": n_seq, "documents": n_docs,
+                                            "skipped": n_skip}
         print(f"{category:10s} {n_seq} seqs from {n_docs} docs", flush=True)
     tokens = np.concatenate(seqs)
-    np.savez(os.path.join(OUT, "tokens.npz"), tokens=tokens, category=np.array(cats, dtype=np.int8), names=np.array(list(PLAN)))
+    np.savez(os.path.join(out, "tokens.npz"), tokens=tokens, category=np.array(cats, dtype=np.int8), names=np.array(list(PLAN)))
     manifest["total_tokens"] = int(tokens.size)
-    with open(OUT + ".json", "w", encoding="utf-8") as f:
+    with open(out + ".json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print("total tokens", tokens.size)
 
