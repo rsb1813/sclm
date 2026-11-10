@@ -142,3 +142,19 @@ def test_fp8_expert_matches_upstream_expert():
     y = torch.zeros(dim, dtype=torch.float32, device=DEV)
     gpu.fp8_expert(expert, limit, gpu.act_quant(x), y)
     close(y, expert(x))
+
+
+def test_gate_matches_upstream_gate():
+    g = torch.Generator(device=DEV).manual_seed(6)
+    args = m.ModelArgs(dim=512, n_routed_experts=48, n_activated_experts=6, route_scale=2.5)
+    gate = m.Gate(0, args).to(DEV)
+    with torch.no_grad():
+        gate.weight.copy_((0.1 * torch.randn(gate.weight.shape, generator=g, device=DEV, dtype=torch.float32)).to(torch.bfloat16))
+        gate.bias.copy_(0.05 * torch.randn(gate.bias.shape, generator=g, device=DEV, dtype=torch.float32))
+    for _ in range(4):
+        x = (3 * torch.randn(1, 512, generator=g, device=DEV, dtype=torch.float32)).to(torch.bfloat16)
+        weights, indices = gate(x)
+        pack = gpu.gate(gate, x.flatten())
+        assert pack[:6].int().tolist() == indices.flatten().tolist()
+        assert torch.allclose(pack[6:12], weights.flatten(), rtol=1e-5)
+        assert torch.equal(pack[12:], x.flatten().float())

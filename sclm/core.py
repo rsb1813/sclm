@@ -70,10 +70,12 @@ class Layer:
         self.handle = self.lib.sclm_layer_new(dim, inter, swiglu_limit, formats, len(options), signs[0].ctypes.data,
                                               int(meta[f"rot{dim}.block"]), signs[1].ctypes.data, int(meta[f"rot{inter}.block"]))
 
-    def forward(self, experts: list, gates: list, x: np.ndarray) -> np.ndarray:
-        """sum of gates[i] * expert experts[i] of x (fp32 [dim]), as MoE.forward sums one token's routed experts."""
+    def forward(self, experts: list, gates: list, x: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
+        """sum of gates[i] * expert experts[i] of x (fp32 [dim]), as MoE.forward sums one token's routed experts.
+        Written into `out` (fp32 [dim]) when given."""
         ex = (Expert * len(experts))(*[self.experts[e] for e in experts])
-        x, g, y = np.ascontiguousarray(x, np.float32), np.asarray(gates, np.float32), np.empty(self.dim, np.float32)
+        x, g = np.ascontiguousarray(x, np.float32), np.asarray(gates, np.float32)
+        y = np.empty(self.dim, np.float32) if out is None else out
         self.lib.sclm_layer_forward(self.handle, ex, g.ctypes.data, len(experts), x.ctypes.data, y.ctypes.data)
         return y
 

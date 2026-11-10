@@ -1,4 +1,5 @@
 # Pure-PyTorch drop-in for the upstream tilelang kernel.py, mirroring its quantization, GEMM and attention numerics.
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -25,10 +26,16 @@ def pow2(e: torch.Tensor) -> torch.Tensor:
     return ((e.to(torch.int32) + 127) << 23).view(torch.float32)
 
 
+@lru_cache(8)
+def _fp4_grid(device: torch.device) -> torch.Tensor:
+    """The e2m1 magnitudes on `device`, made once: creating a device tensor from host data waits for the device."""
+    return torch.tensor(FP4_GRID, device=device, dtype=torch.float32)
+
+
 def round_fp4(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Round values already clamped to [-6, 6] onto the e2m1 grid, ties to even code.
     Returns the rounded fp32 values and their 4-bit codes."""
-    grid = torch.tensor(FP4_GRID, device=v.device)
+    grid = _fp4_grid(v.device)
     a = v.abs()
     hi_idx = torch.bucketize(a, grid).clamp(1, len(FP4_GRID) - 1)
     lo, hi = grid[hi_idx - 1], grid[hi_idx]

@@ -64,7 +64,8 @@ def main() -> None:
                                                               add_generation_prompt=True, tokenize=False)
     ids = tok.encode(text)
     t0 = time.perf_counter()
-    logits = decoder.logits(torch.tensor([ids]), 0)
+    for pos, token in enumerate(ids):  # a token at a time: a batched prefill runs upstream's kernels, which widen
+        logits = decoder.logits(torch.tensor([[token]]), pos)  # every weight and need about 1 GiB more VRAM
     torch.cuda.synchronize()
     out.update(prompt_tokens=len(ids), prefill_s=time.perf_counter() - t0, prefill_stats=dict(cache.stats))
     print(f"prefill: {len(ids)} tokens in {out['prefill_s']:.1f}s", flush=True)

@@ -72,7 +72,7 @@ class HostAttention(m.Attention):
     KV and its index stay upstream's code."""
 
     def forward(self, x: torch.Tensor, start_pos: int):
-        if not (gpu.active and x.size(0) * x.size(1) == 1):
+        if not (gpu.active and x.size(0) * x.size(1) == 1 and start_pos):  # position 0 is upstream's prefill case
             return super().forward(x, start_pos)
         rd, win, heads = self.rope_head_dim, self.window_size, self.n_local_heads
         freqs = self.freqs_cis.data_ptr() + start_pos * rd * 4  # the position's row: rd / 2 complex64
@@ -86,6 +86,26 @@ class HostAttention(m.Attention):
         o = gpu.sparse_attn(q, self.window_kv_cache, compressed, idxs, self.attn_sink, heads, win, self.softmax_scale)
         out = gpu.attn_out(o, freqs, self.wo_a.fp8, self.wo_a.scale, self.wo_b, heads, rd, self.n_local_groups)
         return out.view(1, 1, -1)
+
+
+class HostIndexer(m.Indexer):
+    """upstream Indexer; decoding with the kernels on while every compressed position still fits in index_topk,
+    nothing is scored: the top-k of fewer than k positions is all of them, in order. The index keys are still made
+    and kept, for when the context outgrows that."""
+
+    def forward(self, x, qr, latent, start_pos, offset):
+        count = (start_pos + x.size(1)) // self.compress_ratio
+        if not (gpu.active and start_pos and count <= self.index_topk):
+            return super().forward(x, qr, latent, start_pos, offset)
+        if self.owns_k:
+            if latent is not None:  # upstream's key update, one completed group
+                ratio = self.compress_ratio
+                k = self.k_norm(self.wk(latent))
+                m.apply_rotary_emb(k[..., -self.rope_head_dim:], self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0))
+                m.fp4_act_quant(k, m.fp4_block_size, True)
+                self.k_cache[:x.size(0), start_pos // ratio : start_pos // ratio + k.size(1)] = k
+            m.shared_attn.index_k = self.k_cache
+        return (torch.arange(count, device=x.device, dtype=torch.int32) + offset).view(1, 1, count)
 
 
 class HostBlock(m.Block):
@@ -125,9 +145,10 @@ def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.T
     device: the routed experts (each block's ffn is a TieredMoE), the engram tables, the embedding and the head.
     Parameters are uninitialized."""
     assert not args.dspark_block_size and not args.vision_enabled
-    names = ("Block", "MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
+    names = ("Block", "Indexer", "MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
     upstream = [getattr(m, n) for n in names]
-    m.Block, m.MoE, m.ParallelEngramEmbedding, m.ParallelEmbedding, m.ParallelHead = HostBlock, TieredMoE, _Absent, _Absent, _Absent
+    m.Block, m.Indexer, m.MoE = HostBlock, HostIndexer, TieredMoE
+    m.ParallelEngramEmbedding = m.ParallelEmbedding = m.ParallelHead = _Absent
     try:
         with torch.device(device):
             return m.Transformer(args, tokenizer)

@@ -2,6 +2,7 @@
 # original FP4 ones computed by the upstream kernels from the device-memory cache.
 from time import perf_counter
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -21,8 +22,38 @@ class TieredMoE(nn.Module):
         self.shared_experts = m.Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
         self.ram = self.cache = None
 
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        """forward for one token (bf16 [dim]) on the engine's GPU kernels. The device computes the routing and the
+        shared expert on its own; the host waits for it once, to learn the routing and take x for the CPU tier."""
+        cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
+        pack = gpu.gate(self.gate, x)
+        xq = gpu.act_quant(x)
+        shared = torch.empty(self.dim, dtype=torch.float32, device=x.device)
+        gpu.fp8_expert(self.shared_experts, self.limit, xq, shared, store=True)
+        host = pack.cpu().numpy()
+        t1 = perf_counter()
+        ids, gates = host[:topk].astype(np.int64).tolist(), host[topk:2 * topk].tolist()
+        ram = [k for k, e in enumerate(ids) if e in self.ram.experts]
+        ssd = [k for k, e in enumerate(ids) if e not in self.ram.experts]
+        slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token)
+        self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:], cache.ram_out.numpy())
+        t2 = perf_counter()
+        cache.finish(pending)
+        t3 = perf_counter()
+        y = cache.ram_out.to(x.device)  # a blocking copy: the buffer is written again in the next layer
+        for k, slot in zip(ssd, slots):
+            gpu.fp4_expert(cache.store[slot], self.dim, self.inter, self.limit, xq, gates[k], y)
+        out = gpu.moe_finish(y, shared)
+        t4 = perf_counter()
+        for key, value in (("device_s", t1 - t0), ("ram_s", t2 - t1), ("read_s", t3 - t2), ("launch_s", t4 - t3),
+                           ("ram_calls", len(ram)), ("ssd_calls", len(ssd)), ("reads", len(pending))):
+            stats[key] += value
+        return out
+
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.size()
+        if gpu.active and x.numel() == self.dim and self.gate.score_func == "sqrtsoftplus" and image_mask is None:
+            return self.decode(x.reshape(-1)).view(shape)
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)

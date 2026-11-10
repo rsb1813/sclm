@@ -20,7 +20,9 @@ def lib():
         _lib.sclm_gpu_hc_mixes.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int, C.c_float, C.c_float, C.c_int]
         _lib.sclm_gpu_hc_pre_norm.argtypes = [C.c_void_p] * 4 + [C.c_int, C.c_int, C.c_float]
         _lib.sclm_gpu_hc_post.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int]
-        _lib.sclm_gpu_fp8_expert.argtypes = [C.c_void_p] * 6 + [C.c_int, C.c_int, C.c_float, C.c_void_p, C.c_void_p]
+        _lib.sclm_gpu_fp8_expert.argtypes = [C.c_void_p] * 6 + [C.c_int, C.c_int, C.c_float, C.c_void_p, C.c_void_p, C.c_int]
+        _lib.sclm_gpu_gate.argtypes = [C.c_void_p] * 4 + [C.c_int] * 3 + [C.c_float, C.c_float, C.c_int]
+        _lib.sclm_gpu_moe_finish.argtypes = [C.c_void_p] * 3 + [C.c_int]
         _lib.sclm_gpu_attn_q.argtypes = [C.c_void_p] * 9 + [C.c_int] * 5 + [C.c_float]
         _lib.sclm_gpu_attn_kv.argtypes = [C.c_void_p] * 6 + [C.c_int] * 3 + [C.c_float]
         _lib.sclm_gpu_sparse_attn.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float]
@@ -87,12 +89,13 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
     return out
 
 
-def fp8_expert(expert, limit: float, xq: torch.Tensor, y: torch.Tensor) -> None:
-    """y (fp32 [dim]) += an upstream Expert with fp8 weights (the shared expert) on the layer input quantized as xq."""
+def fp8_expert(expert, limit: float, xq: torch.Tensor, y: torch.Tensor, store: bool = False) -> None:
+    """y (fp32 [dim]) += an upstream Expert with fp8 weights (the shared expert) on the layer input quantized as xq;
+    store: y is overwritten instead."""
     w1, w2, w3 = expert.w1.weight, expert.w2.weight, expert.w3.weight
     assert xq.dtype == y.dtype == torch.float32 and xq.numel() == y.numel() == w1.size(1)
     _check(lib().sclm_gpu_fp8_expert(w1.data_ptr(), w1.scale.data_ptr(), w2.data_ptr(), w2.scale.data_ptr(), w3.data_ptr(),
-                                     w3.scale.data_ptr(), w1.size(1), w1.size(0), limit, xq.data_ptr(), y.data_ptr()))
+                                     w3.scale.data_ptr(), w1.size(1), w1.size(0), limit, xq.data_ptr(), y.data_ptr(), store))
 
 
 def attn_q(wq_a, norm_weight: torch.Tensor, wq_b, x: torch.Tensor, freqs: int, heads: int, head_dim: int, rd: int,
@@ -140,4 +143,23 @@ def attn_out(o: torch.Tensor, freqs: int, wo_a_weight: torch.Tensor, wo_a_scale:
     _check(lib().sclm_gpu_attn_out(o.data_ptr(), freqs, wo_a_weight.data_ptr(), wo_a_scale.data_ptr(), wo_b.weight.data_ptr(),
                                    wo_b.scale.data_ptr(), out.data_ptr(), heads, o.numel() // heads, rd, groups,
                                    wo_a_weight.size(0), dim))
+    return out
+
+
+def gate(module, x: torch.Tensor) -> torch.Tensor:
+    """upstream Gate.forward ("sqrtsoftplus" scores) for one token x (bf16 [dim]) -> fp32 [2 * topk + dim]: the picked
+    experts' indices, their weights, then x as fp32, so that one transfer gives the host all it needs."""
+    assert module.score_func == "sqrtsoftplus" and x.dtype == module.weight.dtype == torch.bfloat16 and x.is_contiguous()
+    n, dim = module.weight.shape
+    pack = torch.empty(2 * module.topk + dim, dtype=torch.float32, device=x.device)
+    _check(lib().sclm_gpu_gate(module.weight.data_ptr(), module.bias.data_ptr(), x.data_ptr(), pack.data_ptr(), n, module.topk,
+                               dim, module.gate_temp, module.route_scale, module.norm_topk_prob))
+    return pack
+
+
+def moe_finish(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
+    """bf16 of routed + shared (fp32 [dim] each)."""
+    assert routed.dtype == shared.dtype == torch.float32 and routed.numel() == shared.numel()
+    out = torch.empty(routed.numel(), dtype=torch.bfloat16, device=routed.device)
+    _check(lib().sclm_gpu_moe_finish(routed.data_ptr(), shared.data_ptr(), out.data_ptr(), routed.numel()))
     return out

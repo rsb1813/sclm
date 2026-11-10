@@ -22,6 +22,7 @@ class ExpertReader:
         self.reader = core.Reader(paths, chunk)
         self.sizes = [n for _, _, n in self.extents(0, 0)]  # the same for every expert
         self.nbytes = sum(self.sizes) + 4 * core.PAGE
+        self.where = {}  # (layer, expert) -> [(file index, offset)] of its two runs, looked up once
 
     def extents(self, layer: int, expert: int) -> list:
         """[(shard path, file offset, byte count)] of the expert's scales and of its weights."""
@@ -34,11 +35,15 @@ class ExpertReader:
     def submit(self, layer: int, expert: int, buf: np.ndarray) -> tuple[int, int]:
         """Starts reading the expert into buf (from staging()). Returns where its scales and its weights begin in buf,
         valid once wait() returns."""
+        runs = self.where.get((layer, expert))
+        if runs is None:
+            found = self.extents(layer, expert)
+            assert [n for _, _, n in found] == self.sizes
+            runs = self.where[layer, expert] = [(self.file[path], offset) for path, offset, _ in found]
         at, starts = 0, []
-        for (path, offset, nbytes), size in zip(self.extents(layer, expert), self.sizes):
-            assert nbytes == size
+        for (file, offset), size in zip(runs, self.sizes):
             room = size + 2 * core.PAGE
-            starts.append(at + self.reader.submit(self.file[path], offset, size, buf[at:at + room]))
+            starts.append(at + self.reader.submit(file, offset, size, buf[at:at + room]))
             at += room
         return starts[0], starts[1]
 
@@ -56,10 +61,12 @@ class ExpertCache:
         self.reader, self.n_experts = reader, n_experts
         self.token = 0  # position of the first token of the forward in progress, set by the host
         self.stats = defaultdict(float)  # seconds and counts the tiered MoE adds up, for whoever measures
+        self.uploading = False  # slot uploads may still be reading the staging buffers
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
         pin = torch.device(device).type == "cuda"
+        self.ram_out = torch.empty(dim, dtype=torch.float32, pin_memory=pin)  # where the CPU tier writes a token's sum
         self.staging = []  # page-aligned host buffers the reader fills, one per expert a call can miss
         for _ in range(scratch):
             buf = torch.empty(reader.nbytes + core.PAGE, dtype=torch.uint8, pin_memory=pin)
@@ -79,6 +86,9 @@ class ExpertCache:
     def request(self, layer: int, experts: list, token: int) -> tuple[list, list]:
         """Slots of a layer's SSD-tier experts at a token, with the reads of the missing ones started.
         Returns (slots, pending); finish(pending) has to run before the slots are used."""
+        if self.uploading:  # the reads below go into the buffers those uploads copy from
+            torch.cuda.synchronize()
+            self.uploading = False
         slots, miss = self.policy.use([layer * self.n_experts + e for e in experts], token)
         pending = []
         for e, slot, buf in zip(np.asarray(experts)[miss].tolist(), slots[miss].tolist(), self.staging):
@@ -91,6 +101,7 @@ class ExpertCache:
             return
         self.reader.wait()
         n_scale, n_weight = self.reader.sizes
-        for slot, buf, (at_s, at_w) in pending:  # blocking copies: the next request reads into the same buffers
-            self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale])
-            self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight])
+        for slot, buf, (at_s, at_w) in pending:
+            self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale], non_blocking=True)
+            self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
+        self.uploading = self.store.is_cuda

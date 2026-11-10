@@ -49,7 +49,7 @@ def test_host_decodes_as_upstream_with_the_same_experts(tmp_path, monkeypatch, d
     try:
         args = m.ModelArgs(dim=tc.DIM, moe_inter_dim=tc.INTER, n_routed_experts=len(PLANS[0]), n_activated_experts=4,
                            swiglu_limit=tc.LIMIT, vocab_size=1000, max_batch_size=1, max_seq_len=256, temperature=0,
-                           window_size=16)  # a short window: its ring wraps within the test
+                           window_size=16, index_topk=32)  # a short window and index: the ring wraps and the index starts choosing within the test
         with torch.device(dev):
             ref = m.Transformer(args)
         init_random_(ref, dev=dev)

@@ -143,8 +143,19 @@ __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const u
 // y[row] = sum over k of w[row][k] * scale[row / 32][k / 32] * xq[k], w in E4M3 and scale in E8M0. One block per row.
 // Rows come in groups of rows_per_group, group g reading xq[g * k ..] (attention's block-diagonal wo_a; one group
 // otherwise).
-// The sum is rounded to bf16 as the reference's GEMM output is; add: it is added to the fp32 y, else stored as bf16.
-__global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, int rows_per_group, bool add) {
+// The sum is rounded to bf16 as the reference's GEMM output is, then stored as bf16 (STORE), added to the fp32 y
+// (ADD) or stored there (STORE_F32).
+enum Mode { STORE, ADD, STORE_F32 };
+
+__device__ __forceinline__ void put(void* y, int row, float acc, Mode mode) {
+    const uint16_t r = to_bf16(acc);
+    if (mode == STORE)
+        ((uint16_t*)y)[row] = r;
+    else
+        ((float*)y)[row] = (mode == ADD ? ((float*)y)[row] : 0.0f) + from_bf16(r);
+}
+
+__global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, int rows_per_group, Mode mode) {
     const int row = blockIdx.x;
     const uint8_t* wr = w + size_t(row) * k;
     const uint8_t* sr = scale + size_t(row >> 5) * (k >> 5);
@@ -156,16 +167,11 @@ __global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* 
                                    e4m3(b >> 24) * x[c + 3]);
     }
     acc = block_sum(acc);
-    if (threadIdx.x) return;
-    const uint16_t r = to_bf16(acc);
-    if (add)
-        ((float*)y)[row] += from_bf16(r);
-    else
-        ((uint16_t*)y)[row] = r;
+    if (threadIdx.x == 0) put(y, row, acc, mode);
 }
 
 // The same for packed FP4: w[row] is k / 2 bytes (the even column in the low nibble), scale[row][k / 32] in E8M0.
-__global__ void fp4_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, bool add) {
+__global__ void fp4_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, Mode mode) {
     const int row = blockIdx.x;
     const uint8_t* wr = w + size_t(row) * (k >> 1);
     const uint8_t* sr = scale + size_t(row) * (k >> 5);
@@ -177,12 +183,53 @@ __global__ void fp4_gemv_k(const uint8_t* w, const uint8_t* scale, const float* 
         acc += 0.5f * e8m0(sr[c >> 5]) * s;
     }
     acc = block_sum(acc);
-    if (threadIdx.x) return;
-    const uint16_t r = to_bf16(acc);
-    if (add)
-        ((float*)y)[row] += from_bf16(r);
-    else
-        ((uint16_t*)y)[row] = r;
+    if (threadIdx.x == 0) put(y, row, acc, mode);
+}
+
+// upstream Gate.forward for one token, first half: block e computes <weight[e], x> (bf16 rows of dim values).
+__global__ void gate_scores_k(const uint16_t* w, const uint16_t* x, float* scores, int dim) {
+    const uint16_t* wr = w + size_t(blockIdx.x) * dim;
+    float acc = 0;
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) acc += from_bf16(wr[c]) * from_bf16(x[c]);
+    acc = block_sum(acc);
+    if (threadIdx.x == 0) scores[blockIdx.x] = acc;
+}
+
+// Second half, one block of 1024 threads (n <= 1024, a thread per expert): a score becomes
+// sqrt(softplus(score / temp)); the topk largest of score + bias are picked (best first) and weighted by their
+// unbiased scores, normalized over the picks when norm is set, times route_scale.
+// pack = the topk indices (as fp32), their weights, then x as fp32: all the host needs of this layer in one transfer.
+__global__ void gate_pick_k(const float* scores, const float* bias, const uint16_t* x, float* pack, int n, int topk, int dim,
+                            float temp, float route_scale, bool norm) {
+    __shared__ float key[1024];
+    const int e = threadIdx.x;
+    for (int c = e; c < dim; c += blockDim.x) pack[2 * topk + c] = from_bf16(x[c]);
+    float score = 0;
+    if (e < n) {
+        const float v = scores[e] / temp;
+        score = sqrtf(v > 20.0f ? v : log1pf(expf(v)));  // F.softplus and its threshold
+        key[e] = score + bias[e];
+    }
+    __syncthreads();
+    if (e < n) {
+        int rank = 0;  // how many experts come before this one
+        for (int j = 0; j < n; ++j) rank += key[j] > key[e] || (key[j] == key[e] && j < e);
+        if (rank < topk) pack[rank] = float(e), pack[topk + rank] = score;
+    }
+    __syncthreads();
+    if (e) return;
+    float sum = 0;
+    for (int k = 0; k < topk; ++k) sum += pack[topk + k];
+    for (int k = 0; k < topk; ++k) {
+        if (norm && topk > 1) pack[topk + k] /= sum + 1e-20f;
+        pack[topk + k] *= route_scale;
+    }
+}
+
+// The two-tier MoE's last step: out = bf16(routed + shared), both fp32 sums of bf16 expert outputs.
+__global__ void moe_finish_k(const float* routed, const float* shared, uint16_t* out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = to_bf16(routed[i] + shared[i]);
 }
 
 // The reference Expert's middle: h = weight * silu(min(gate, limit)) * clamp(up, -limit, limit), rounded to bf16.
@@ -275,7 +322,7 @@ struct Scratch {
 void ensure_scratch() {
     if (scratch.xq) return;
     cudaMalloc(&scratch.xq, SCRATCH * sizeof(float));
-    cudaMalloc(&scratch.dots, 256 * sizeof(float));
+    cudaMalloc(&scratch.dots, 4096 * sizeof(float));
     cudaMalloc(&scratch.gate, SCRATCH * sizeof(uint16_t));
     cudaMalloc(&scratch.up, SCRATCH * sizeof(uint16_t));
     cudaMalloc(&scratch.h, SCRATCH * sizeof(uint16_t));
@@ -297,7 +344,7 @@ API int sclm_gpu_fp8_linear(const uint8_t* w, const uint8_t* scale, int n, int k
     if (groups * k > SCRATCH) return -1;
     ensure_scratch();
     act_quant_k<float><<<groups * k / 32, 32>>>(x, scratch.xq);
-    fp8_gemv_k<<<n, threads_for(k, 4)>>>(w, scale, scratch.xq, y, k, n / groups, false);
+    fp8_gemv_k<<<n, threads_for(k, 4)>>>(w, scale, scratch.xq, y, k, n / groups, STORE);
     return cudaGetLastError();
 }
 
@@ -308,25 +355,25 @@ API int sclm_gpu_fp4_expert(const uint8_t* slot, int dim, int inter, float limit
     ensure_scratch();
     const uint8_t *s1 = slot, *s2 = s1 + size_t(inter) * (dim / 32), *s3 = s2 + size_t(dim) * (inter / 32);
     const uint8_t *w1 = s3 + size_t(inter) * (dim / 32), *w2 = w1 + size_t(inter) * (dim / 2), *w3 = w2 + size_t(dim) * (inter / 2);
-    fp4_gemv_k<<<inter, threads_for(dim, 8)>>>(w1, s1, xq, scratch.gate, dim, false);
-    fp4_gemv_k<<<inter, threads_for(dim, 8)>>>(w3, s3, xq, scratch.up, dim, false);
+    fp4_gemv_k<<<inter, threads_for(dim, 8)>>>(w1, s1, xq, scratch.gate, dim, STORE);
+    fp4_gemv_k<<<inter, threads_for(dim, 8)>>>(w3, s3, xq, scratch.up, dim, STORE);
     swiglu_k<<<(inter + 255) / 256, 256>>>(scratch.gate, scratch.up, scratch.h, inter, limit, weight);
     act_quant_k<float><<<inter / 32, 32>>>(scratch.h, scratch.xq);
-    fp4_gemv_k<<<dim, threads_for(inter, 8)>>>(w2, s2, scratch.xq, y, inter, true);
+    fp4_gemv_k<<<dim, threads_for(inter, 8)>>>(w2, s2, scratch.xq, y, inter, ADD);
     return cudaGetLastError();
 }
 
 // y[dim] (fp32) += the upstream Expert with fp8 weights and block scales (the shared expert) on the layer input
-// quantized as xq[dim]. w1 and w3 are [inter, dim], w2 is [dim, inter].
+// quantized as xq[dim]; store: y is overwritten instead. w1 and w3 are [inter, dim], w2 is [dim, inter].
 API int sclm_gpu_fp8_expert(const uint8_t* w1, const uint8_t* s1, const uint8_t* w2, const uint8_t* s2, const uint8_t* w3,
-                            const uint8_t* s3, int dim, int inter, float limit, const float* xq, float* y) {
+                            const uint8_t* s3, int dim, int inter, float limit, const float* xq, float* y, int store) {
     if (dim > SCRATCH || inter > SCRATCH) return -1;
     ensure_scratch();
-    fp8_gemv_k<<<inter, threads_for(dim, 4)>>>(w1, s1, xq, scratch.gate, dim, inter, false);
-    fp8_gemv_k<<<inter, threads_for(dim, 4)>>>(w3, s3, xq, scratch.up, dim, inter, false);
+    fp8_gemv_k<<<inter, threads_for(dim, 4)>>>(w1, s1, xq, scratch.gate, dim, inter, STORE);
+    fp8_gemv_k<<<inter, threads_for(dim, 4)>>>(w3, s3, xq, scratch.up, dim, inter, STORE);
     swiglu_k<<<(inter + 255) / 256, 256>>>(scratch.gate, scratch.up, scratch.h, inter, limit, 1.0f);
     act_quant_k<float><<<inter / 32, 32>>>(scratch.h, scratch.xq);
-    fp8_gemv_k<<<dim, threads_for(inter, 4)>>>(w2, s2, scratch.xq, y, inter, dim, true);
+    fp8_gemv_k<<<dim, threads_for(inter, 4)>>>(w2, s2, scratch.xq, y, inter, dim, store ? STORE_F32 : ADD);
     return cudaGetLastError();
 }
 
@@ -338,10 +385,10 @@ API int sclm_gpu_attn_q(const uint8_t* wa, const uint8_t* sa, const uint16_t* no
                         int head_dim, int rd, float eps) {
     ensure_scratch();
     act_quant_k<float><<<dim / 32, 32>>>(x, scratch.xq);
-    fp8_gemv_k<<<rank, threads_for(dim, 4)>>>(wa, sa, scratch.xq, qr, dim, rank, false);
+    fp8_gemv_k<<<rank, threads_for(dim, 4)>>>(wa, sa, scratch.xq, qr, dim, rank, STORE);
     rmsnorm_k<<<1, 1024>>>(qr, norm_w, qr, rank, eps);
     act_quant_k<float><<<rank / 32, 32>>>(qr, scratch.xq);
-    fp8_gemv_k<<<heads * head_dim, threads_for(rank, 4)>>>(wb, sb, scratch.xq, q, rank, heads * head_dim, false);
+    fp8_gemv_k<<<heads * head_dim, threads_for(rank, 4)>>>(wb, sb, scratch.xq, q, rank, heads * head_dim, STORE);
     rope_k<<<(heads * rd / 2 + 255) / 256, 256>>>(q, freqs, heads, head_dim, rd, false);
     return cudaGetLastError();
 }
@@ -352,7 +399,7 @@ API int sclm_gpu_attn_kv(const uint8_t* w, const uint8_t* s, const uint16_t* nor
                          uint16_t* kv, int dim, int head_dim, int rd, float eps) {
     ensure_scratch();
     act_quant_k<float><<<dim / 32, 32>>>(x, scratch.xq);
-    fp8_gemv_k<<<head_dim, threads_for(dim, 4)>>>(w, s, scratch.xq, kv, dim, head_dim, false);
+    fp8_gemv_k<<<head_dim, threads_for(dim, 4)>>>(w, s, scratch.xq, kv, dim, head_dim, STORE);
     rmsnorm_k<<<1, 1024>>>(kv, norm_w, kv, head_dim, eps);
     rope_k<<<(rd / 2 + 255) / 256, 256>>>(kv, freqs, 1, head_dim, rd, false);
     act_quant_k<uint16_t><<<head_dim / 32, 32>>>(kv, kv);
@@ -377,9 +424,9 @@ API int sclm_gpu_attn_out(uint16_t* o, const float* freqs, const uint8_t* wa, co
     ensure_scratch();
     rope_k<<<(heads * rd / 2 + 255) / 256, 256>>>(o, freqs, heads, head_dim, rd, true);
     act_quant_k<float><<<width / 32, 32>>>(o, scratch.xq);
-    fp8_gemv_k<<<n_a, threads_for(width / groups, 4)>>>(wa, sa, scratch.xq, scratch.h, width / groups, n_a / groups, false);
+    fp8_gemv_k<<<n_a, threads_for(width / groups, 4)>>>(wa, sa, scratch.xq, scratch.h, width / groups, n_a / groups, STORE);
     act_quant_k<float><<<n_a / 32, 32>>>(scratch.h, scratch.xq);
-    fp8_gemv_k<<<dim, threads_for(n_a, 4)>>>(wb, sb, scratch.xq, out, n_a, dim, false);
+    fp8_gemv_k<<<dim, threads_for(n_a, 4)>>>(wb, sb, scratch.xq, out, n_a, dim, STORE);
     return cudaGetLastError();
 }
 
@@ -404,5 +451,22 @@ API int sclm_gpu_hc_pre_norm(const uint16_t* h, const float* pre, const uint16_t
 // out[hc * dim] (bf16) = Block.hc_post of the sublayer output x[dim] and the stream it started from.
 API int sclm_gpu_hc_post(const uint16_t* x, const uint16_t* residual, const float* post, const float* comb, uint16_t* out, int dim, int hc) {
     hc_post_k<<<(dim + 255) / 256, 256>>>(x, residual, post, comb, out, dim, hc);
+    return cudaGetLastError();
+}
+
+// pack[2 * topk + dim] (fp32) = upstream Gate.forward of one token x[dim] (bf16) with the "sqrtsoftplus" score: the
+// topk expert indices, their routing weights, then x itself as fp32. weight is bf16 [n, dim], bias fp32 [n].
+API int sclm_gpu_gate(const uint16_t* weight, const float* bias, const uint16_t* x, float* pack, int n, int topk, int dim,
+                      float temp, float route_scale, int norm) {
+    if (n > 1024) return -1;
+    ensure_scratch();
+    gate_scores_k<<<n, 128>>>(weight, x, scratch.dots, dim);
+    gate_pick_k<<<1, 1024>>>(scratch.dots, bias, x, pack, n, topk, dim, temp, route_scale, norm != 0);
+    return cudaGetLastError();
+}
+
+// out[n] (bf16) = routed[n] + shared[n] (fp32): the MoE's output from its two sums.
+API int sclm_gpu_moe_finish(const float* routed, const float* shared, uint16_t* out, int n) {
+    moe_finish_k<<<(n + 255) / 256, 256>>>(routed, shared, out, n);
     return cudaGetLastError();
 }
