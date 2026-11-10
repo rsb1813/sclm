@@ -105,3 +105,33 @@ class ExpertCache:
             self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale], non_blocking=True)
             self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
         self.uploading = self.store.is_cuda
+
+
+class EngramRows(torch.nn.Module):
+    """Rows of an engram hash table read from the checkpoint with the engine's unbuffered reader. A decode token
+    needs a few dozen rows scattered over a file of about 100 GB; mapping the file and faulting them in took 3 ms a
+    layer. Same output as upstream ParallelEngramEmbedding for one rank."""
+
+    def __init__(self, ck: Checkpoint, prefix: str, block_size: int = 32):
+        super().__init__()
+        (weight, self.at_w, n_w), (scale, self.at_s, n_s) = ck.extent([prefix + "weight"]), ck.extent([prefix + "scale"])
+        rows = ck._header(weight)[0][prefix + "weight"]["shape"][0]
+        self.dim, self.cols, self.block_size = n_w // rows, n_s // rows, block_size
+        self.reader = core.Reader([weight, scale])
+        self.room = self.dim + 2 * core.PAGE + -self.dim % core.PAGE  # a row's read, start rounded down and end up
+        self.buf = core.pages(0)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        rows, room = indices.reshape(-1).tolist(), self.room
+        if self.buf.nbytes < 2 * len(rows) * room:
+            self.buf = core.pages(2 * len(rows) * room)
+        at = []  # where each row's weights and scales land in the buffer
+        for i, r in enumerate(rows):
+            w, s = self.buf[2 * i * room:(2 * i + 1) * room], self.buf[(2 * i + 1) * room:(2 * i + 2) * room]
+            at.append((2 * i * room + self.reader.submit(0, self.at_w + r * self.dim, self.dim, w),
+                       (2 * i + 1) * room + self.reader.submit(1, self.at_s + r * self.cols, self.cols, s)))
+        self.reader.wait()
+        w = torch.from_numpy(np.stack([self.buf[a:a + self.dim] for a, _ in at])).to(indices.device).view(torch.float8_e4m3fn)
+        s = torch.from_numpy(np.stack([self.buf[b:b + self.cols] for _, b in at])).to(indices.device).view(torch.float8_e8m0fnu)
+        values = (w.float().unflatten(-1, (-1, self.block_size)) * s.float().unsqueeze(-1)).flatten(-2)
+        return values.to(torch.bfloat16).view(*indices.shape, -1)

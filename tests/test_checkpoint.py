@@ -81,6 +81,21 @@ def test_mapped_engram_matches_direct_gather():
     assert torch.equal(got, want)
 
 
+@needs_layers0_3
+def test_engram_rows_read_directly_match_the_mapped_table():
+    from sclm.checkpoint import Checkpoint, MappedEngramEmbedding
+    from sclm.ssd import EngramRows
+
+    ck = Checkpoint(CKPT)
+    w, s = ck.memmap("layers.1.engram.embed.weight"), ck.memmap("layers.1.engram.embed.scale")
+    rows = EngramRows(ck, "layers.1.engram.embed.")
+    g = torch.Generator().manual_seed(2)
+    for shape in ((1, 1, 24), (1, 7, 24)):  # a decode token, then more rows than the buffer held
+        idx = torch.randint(0, w.shape[0], shape, generator=g)
+        idx[0, 0, 1] = idx[0, 0, 0]  # a repeated row
+        assert torch.equal(rows(idx.cuda()), MappedEngramEmbedding(w, s)(idx.cuda()))
+
+
 @needs_layer0
 def test_layer0_loads_strictly_and_runs(runner):
     ids = torch.tensor([[0] + list(range(1000, 1255))])  # BOS then arbitrary ordinary tokens

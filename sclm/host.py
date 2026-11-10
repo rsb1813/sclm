@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sclm import core, gpu, ssd
-from sclm.checkpoint import Checkpoint, MappedEngramEmbedding, widen_fp8
+from sclm.checkpoint import Checkpoint, widen_fp8
 from sclm.layerwise import load_params_
 from sclm.tiered import TieredMoE
 from sclm.upstream import model as m
@@ -168,9 +168,7 @@ def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda
         skip = (".engram.embed.", ".ffn.experts.", ".ffn.gate.bias_vl", ".attn.wo_a.")
         load_params_(block, ckpt.module_state(prefix, skip=skip), prefix)
         if block.engram is not None:
-            block.engram.embed = MappedEngramEmbedding(
-                ckpt.memmap(prefix + "engram.embed.weight"), ckpt.memmap(prefix + "engram.embed.scale")
-            )
+            block.engram.embed = ssd.EngramRows(ckpt, prefix + "engram.embed.")
     load_params_(net.norm, {"weight": ckpt.get("norm.weight")}, "norm.")
     net.head = Bf16Head(ckpt.get("head.weight").to(device))
 
