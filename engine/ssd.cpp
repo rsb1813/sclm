@@ -3,10 +3,14 @@
 #define NOMINMAX
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -16,16 +20,42 @@ const uint64_t PAGE = 4096;  // a multiple of the sector size: unbuffered reads 
 struct Request {
     OVERLAPPED ov;
     DWORD need;  // bytes that have to arrive (a read reaching past the end of the file comes back short)
+    HANDLE file;
+    void* dst;
+    DWORD len;
 };
 
 }  // namespace
 
+// Starting a read costs about 0.3 ms per 18 MB (the buffer's pages are locked for the transfer), so a thread of its
+// own issues them: the caller queues a request and goes on computing.
 struct SclmReader {
     std::vector<HANDLE> files;
     HANDLE port = nullptr;
     uint64_t chunk = 0;
     std::deque<Request> requests;  // of the reads submitted since the last wait; a deque keeps their addresses
-    int pending = 0, failed = 0;
+    int pending = 0, failed = 0;   // the caller's: reads not yet completed, reads that failed
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<Request*> queue;  // submitted, not yet issued
+    bool stop = false;
+    std::thread issuer;
+
+    void issue() {
+        std::vector<Request*> batch;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [this] { return stop || !queue.empty(); });
+                if (stop) return;
+                batch.swap(queue);
+            }
+            for (Request* q : batch)
+                if (!ReadFile(q->file, q->dst, q->len, nullptr, &q->ov) && GetLastError() != ERROR_IO_PENDING)
+                    PostQueuedCompletionStatus(port, 0, 1, &q->ov);  // key 1: the read did not start
+            batch.clear();
+        }
+    }
 };
 
 struct SclmCache {
@@ -56,10 +86,17 @@ __declspec(dllexport) SclmReader* sclm_reader_new(const wchar_t* const* paths, i
             return nullptr;
         }
     }
+    R->issuer = std::thread([R] { R->issue(); });
     return R;
 }
 
 __declspec(dllexport) void sclm_reader_free(SclmReader* R) {
+    {
+        std::lock_guard lock(R->mutex);
+        R->stop = true;
+    }
+    R->wake.notify_one();
+    R->issuer.join();
     for (HANDLE h : R->files) CloseHandle(h);
     CloseHandle(R->port);
     delete R;
@@ -69,16 +106,21 @@ __declspec(dllexport) void sclm_reader_free(SclmReader* R) {
 // lands (the read starts on the page boundary below offset). dst is page-aligned and holds bytes + 2 pages.
 __declspec(dllexport) int sclm_reader_submit(SclmReader* R, int file, uint64_t offset, uint64_t bytes, uint8_t* dst) {
     const uint64_t head = offset % PAGE, begin = offset - head, end = (offset + bytes + PAGE - 1) / PAGE * PAGE;
+    const size_t first = R->requests.size();
     for (uint64_t at = begin; at < end; at += R->chunk) {
         const uint64_t len = std::min(R->chunk, end - at);
         Request& q = R->requests.emplace_back();
         q.ov = {};
         q.ov.Offset = DWORD(at), q.ov.OffsetHigh = DWORD(at >> 32);
         q.need = DWORD(std::min(len, offset + bytes - at));
+        q.file = R->files[file], q.dst = dst + (at - begin), q.len = DWORD(len);
         ++R->pending;
-        if (!ReadFile(R->files[file], dst + (at - begin), DWORD(len), nullptr, &q.ov) && GetLastError() != ERROR_IO_PENDING)
-            --R->pending, ++R->failed;  // no completion is queued for a read that failed to start
     }
+    {
+        std::lock_guard lock(R->mutex);
+        for (size_t i = first; i < R->requests.size(); ++i) R->queue.push_back(&R->requests[i]);
+    }
+    R->wake.notify_one();
     return int(head);
 }
 
@@ -91,7 +133,7 @@ __declspec(dllexport) int sclm_reader_wait(SclmReader* R) {
         const BOOL ok = GetQueuedCompletionStatus(R->port, &got, &key, &ov, INFINITE);
         if (!ov) return -1;  // the port itself failed
         --R->pending;
-        if (!ok || got < CONTAINING_RECORD(ov, Request, ov)->need) ++R->failed;
+        if (!ok || key == 1 || got < CONTAINING_RECORD(ov, Request, ov)->need) ++R->failed;
     }
     const int failed = R->failed;
     R->requests.clear(), R->failed = 0;
