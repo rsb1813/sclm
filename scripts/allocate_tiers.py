@@ -20,13 +20,16 @@ RAM_OPTIONS = {"1b128": (1.125, "gptq1_g128_ubnone"), "t128": (1.725, "gptqt_g12
                "v2c7": (3.503, "vq2c7_row")}
 
 
-def allocate(w: np.ndarray, f: np.ndarray, d: np.ndarray, c: np.ndarray, ram: float, ssd: float) -> np.ndarray:
+def allocate(w: np.ndarray, f: np.ndarray, d: np.ndarray, c: np.ndarray, ram: float, ssd: float,
+             calls: np.ndarray | None = None, nu: float = 0.0) -> np.ndarray:
     """argmin sum_e w_e d_o(e) s.t. sum_e c_o(e) <= ram and sum_{e on SSD} f_e <= ssd. Options are the RAM ones plus a
-    last SSD one (d 0, RAM cost 0); both constraints are priced by Lagrange multipliers found by nested bisection."""
+    last SSD one (d 0, RAM cost 0); both constraints are priced by Lagrange multipliers found by nested bisection.
+    nu prices what the CPU tier reads per token: calls_e (per token) times the option's size c."""
     d_x, c_x, s_x = np.append(d, 0.0), np.append(c, 0.0), np.append(np.zeros_like(c), 1.0)
+    read = nu * calls[:, None] * c_x if nu else 0.0
 
     def pick(lam: float, mu: float) -> np.ndarray:
-        return (w[:, None] * d_x + lam * c_x + mu * f[:, None] * s_x).argmin(1)
+        return (w[:, None] * d_x + lam * c_x + mu * f[:, None] * s_x + read).argmin(1)
 
     def fit_ram(mu: float) -> np.ndarray:
         lo, hi = 0.0, (float(w.max() * d.max()) + mu * float(f.max())) * 10 / float(c.min()) + 1.0  # hi: all on SSD
@@ -91,6 +94,8 @@ def main() -> None:
     ap.add_argument("--layer-weights", action="store_true", help="weight distortion by measured layer sensitivity")
     ap.add_argument("--ram-bpw", type=float, default=1.10, help="RAM for routed experts, as bpw over all of them")
     ap.add_argument("--options", default="1b128,t128,2b128,3b128")
+    ap.add_argument("--read-price", type=float, default=0.0, help="price of the CPU tier's reads per token (calls x "
+                    "bpw); 0 leaves them free. Raise it until the plan's reads fit the CPU time wanted")
     ap.add_argument("--name", required=True)
     cli = ap.parse_args()
     names = cli.options.split(",")
@@ -116,7 +121,8 @@ def main() -> None:
     def tiers(horizon: float) -> tuple[list, list, np.ndarray]:
         reads = np.stack([f[layer] * miss_share(idx[:, layer], n_exp, horizon) for layer in range(len(f))])
         if cli.global_budget:
-            picks = allocate(w.ravel(), reads.ravel(), d, c, cli.ram_bpw * w.size, ssd_reads * len(f)).reshape(w.shape)
+            picks = allocate(w.ravel(), reads.ravel(), d, c, cli.ram_bpw * w.size, ssd_reads * len(f), f.ravel(),
+                             cli.read_price).reshape(w.shape)
         else:
             picks = [allocate(w[layer], reads[layer], d, c, cli.ram_bpw * n_exp, ssd_reads) for layer in range(len(f))]
         plan, report = [], []
@@ -127,6 +133,7 @@ def main() -> None:
                            "ram_bpw_all": float(c[p[on_ram]].sum() / n_exp),
                            "ram_bpw_resident": float(c[p[on_ram]].mean()) if on_ram.any() else 0.0,
                            "ssd_call_share": float(f[layer][~on_ram].sum() / f[layer].sum()),
+                           "ram_read_mb": float((f[layer][on_ram] * c[p[on_ram]]).sum() * EXPERT_PARAMS / 8e6),
                            "distortion": float((w[layer][on_ram] * d[p[on_ram]]).sum() / w[layer].sum())})
             plan.append(opts)
         return plan, report, np.array([[o == "orig" for o in opts] for opts in plan])
@@ -160,6 +167,8 @@ def main() -> None:
     with open(os.path.join(DATA, f"alloc_{cli.name}.json"), "w") as fh:
         json.dump(out, fh)
     mean = lambda k: np.mean([x[k] for x in report])  # noqa: E731
+    print(f"CPU tier reads {sum(x['ram_read_mb'] for x in report):.0f} MB per token "
+          f"({sum(x['ram_read_mb'] for x in report) / 47.5:.1f} ms at 47.5 GB/s)")
     print(f"{cli.name}: SSD budget {ssd_reads:.3f} reads/layer/token, RAM {mean('ram_bpw_all'):.3f} bpw "
           f"(resident {mean('ram_bpw_resident'):.3f}), SSD call share {mean('ssd_call_share'):.3f}, "
           f"distortion {mean('distortion'):.4f} (sensitivity-weighted "
