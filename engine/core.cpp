@@ -1,9 +1,12 @@
 // CPU engine for the RAM tier: a layer's vector-coded SwiGLU experts, computed step for step as the reference computes
 // them (quant.VQLinear inside the upstream Expert), except that the GEMVs sum int8 tables instead of fp32 products.
+// A call is split into row tiles that a thread pool shares; the arithmetic does not depend on the thread count.
 #include <malloc.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "vq_kernel.h"
@@ -33,8 +36,72 @@ struct Rotation {
 struct Format {
     float* cb;
     int d;
-    Tables in, mid;  // over the layer input (w1, w3) and over an expert's hidden vector (w2)
+    Tables in;  // over the layer input: w1 and w3 of every expert of the format read them
 };
+
+// One expert of the call in progress.
+struct Slot {
+    const SclmExpert* ex = nullptr;
+    float weight = 0;
+    Tables mid;  // over the expert's hidden vector (w2)
+    std::vector<float> gate, up, out;
+};
+
+// Runs fn(ctx, i) for i < count on the calling thread and the workers. Idle workers spin for about 0.1 ms, then sleep.
+struct Pool {
+    std::vector<std::thread> workers;
+    std::atomic<uint64_t> next{0};   // count << 32 | first unclaimed index, so a claim reads and takes in one step
+    std::atomic<uint32_t> epoch{0};  // bumped per job: what sleeping workers wait on
+    std::atomic<int> done{0};
+    std::atomic<bool> stop{false};
+    void (*fn)(void*, int) = nullptr;
+    void* ctx = nullptr;
+
+    explicit Pool(int threads) {
+        for (int t = 1; t < threads; ++t) workers.emplace_back([this] { work(); });
+    }
+    ~Pool() {
+        stop = true, ++epoch, epoch.notify_all();
+        for (auto& w : workers) w.join();
+    }
+    bool claim(int& i) {
+        uint64_t v = next.load();
+        while (uint32_t(v) < uint32_t(v >> 32))
+            if (next.compare_exchange_weak(v, v + 1)) return i = int(uint32_t(v)), true;
+        return false;
+    }
+    void work() {
+        for (;;) {
+            uint32_t seen = epoch.load();
+            uint64_t t0 = __rdtsc();
+            int i;
+            while (!claim(i)) {
+                if (stop) return;
+                if (__rdtsc() - t0 < 400000) {
+                    _mm_pause();
+                } else {
+                    epoch.wait(seen);
+                    seen = epoch.load(), t0 = __rdtsc();  // a job's phases follow each other closely
+                }
+            }
+            fn(ctx, i);  // set before the job's `next`, and the job cannot end before this task does
+            ++done;
+        }
+    }
+    void run(int count, void (*f)(void*, int), void* c) {
+        if (workers.empty() || count < 2) {
+            for (int i = 0; i < count; ++i) f(c, i);
+            return;
+        }
+        fn = f, ctx = c, done = 0;
+        next = uint64_t(count) << 32;
+        ++epoch, epoch.notify_all();
+        for (int i; claim(i); ++done) f(c, i);
+        while (done.load() < count) _mm_pause();
+    }
+};
+
+Pool* pool = new Pool(1);
 
 // The reference's activation fake-quant before a quantized GEMM (kernel.act_quant: blocks of 32, power-of-2 scale):
 // a block is scaled so its largest magnitude is at most 448, then rounded to FP8 E4M3.
@@ -80,11 +147,11 @@ void rotate(float* x, int n, const Rotation& rot) {
     }
 }
 
-// out[0..rows) = the matrix's rows times the input the tables were built from.
-void matvec(const uint8_t* codes, const uint16_t* scales, const Tables& tb, int rows, float* out) {
+// out[rows of tile t] = those rows of the matrix times the input the tables were built from.
+void matvec_tile(const uint8_t* codes, const uint16_t* scales, const Tables& tb, int t, float* out) {
     const size_t tile_bytes = size_t(tb.groups) * (tb.codes == 256 ? TILE : 192);
-    for (int t = 0; t < rows / TILE; ++t) gemv_tile(codes + t * tile_bytes, tb, out + t * TILE);
-    for (int i = 0; i < rows; i += 16) {
+    gemv_tile(codes + t * tile_bytes, tb, out + t * TILE);
+    for (int i = t * TILE; i < (t + 1) * TILE; i += 16) {
         const __m512 s = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(scales + i)));
         _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_loadu_ps(out + i), s));
     }
@@ -103,9 +170,57 @@ struct SclmLayer {
     float limit;
     std::vector<Format> formats;
     Rotation rot_dim, rot_inter;
-    std::vector<char> built;
-    std::vector<float> x, gate, up, out;
+    std::vector<float> x;
+    std::vector<int> used;    // the formats of the call in progress
+    std::vector<Slot> slots;  // its experts
 };
+
+namespace {
+
+void build_in(void* ctx, int i) {
+    auto* L = (SclmLayer*)ctx;
+    Format& f = L->formats[L->used[i]];
+    build_tables(f.cb, f.d, L->x.data(), L->dim, f.in);
+}
+
+// w1 and w3: task i is one tile of one of the two matrices of one expert.
+void in_tile(void* ctx, int i) {
+    auto* L = (SclmLayer*)ctx;
+    const int tiles = L->inter / TILE, w = i / tiles % 2;
+    Slot& s = L->slots[i / (2 * tiles)];
+    matvec_tile(s.ex->codes[2 * w], s.ex->scales[2 * w], L->formats[s.ex->format].in, i % tiles, (w ? s.up : s.gate).data());
+}
+
+// SwiGLU with the routing weight, then the input of w2 prepared as the reference prepares it.
+void hidden(void* ctx, int e) {
+    auto* L = (SclmLayer*)ctx;
+    Slot& s = L->slots[e];
+    const Format& f = L->formats[s.ex->format];
+    const int inter = L->inter;
+    float *gate = s.gate.data(), *up = s.up.data();
+    bf16(gate, inter), bf16(up, inter);
+    for (int i = 0; i < inter; ++i) {
+        const float g = L->limit > 0 ? std::min(gate[i], L->limit) : gate[i];
+        const float u = L->limit > 0 ? std::clamp(up[i], -L->limit, L->limit) : up[i];
+        gate[i] = s.weight * (g / (1.0f + std::exp(-g)) * u);
+    }
+    bf16(gate, inter);
+    fp8_blocks(gate, inter);
+    rotate(gate, inter, L->rot_inter);
+    s.mid.codes = f.in.codes;
+    build_tables(f.cb, f.d, gate, inter, s.mid);
+}
+
+// w2: task i is one tile of one expert.
+void out_tile(void* ctx, int i) {
+    auto* L = (SclmLayer*)ctx;
+    const int tiles = L->dim / TILE, t = i % tiles;
+    Slot& s = L->slots[i / tiles];
+    matvec_tile(s.ex->codes[1], s.ex->scales[1], s.mid, t, s.out.data());
+    bf16(s.out.data() + t * TILE, TILE);
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -117,50 +232,54 @@ __declspec(dllexport) SclmLayer* sclm_layer_new(int dim, int inter, float swiglu
         const int d = formats[f].d, codes = 1 << formats[f].bits;
         float* cb = aligned<float>(size_t(d) * codes);
         std::memcpy(cb, formats[f].codebook, sizeof(float) * d * codes);
-        L->formats.push_back({cb, d, tables(dim / d, codes), tables(inter / d, codes)});
+        L->formats.push_back({cb, d, tables(dim / d, codes)});
     }
     L->rot_dim = {std::vector<float>(signs_dim, signs_dim + dim), block_dim};
     L->rot_inter = {std::vector<float>(signs_inter, signs_inter + inter), block_inter};
-    L->built.resize(n_formats), L->x.resize(dim), L->gate.resize(inter), L->up.resize(inter), L->out.resize(dim);
+    L->x.resize(dim);
     return L;
 }
 
 __declspec(dllexport) void sclm_layer_free(SclmLayer* L) {
     for (Format& f : L->formats)
-        for (void* p : {(void*)f.cb, (void*)f.in.t, (void*)f.in.tmp, (void*)f.mid.t, (void*)f.mid.tmp}) _aligned_free(p);
+        for (void* p : {(void*)f.cb, (void*)f.in.t, (void*)f.in.tmp}) _aligned_free(p);
+    for (Slot& s : L->slots)
+        for (void* p : {(void*)s.mid.t, (void*)s.mid.tmp}) _aligned_free(p);
     delete L;
+}
+
+// Threads that share a layer call (the caller's included). Not to be called while a forward runs.
+__declspec(dllexport) void sclm_set_threads(int threads) {
+    delete pool;
+    pool = new Pool(threads);
 }
 
 // y[dim] = sum of gates[e] * expert e of x[dim] over the n experts (MoE.forward's routed sum for one token).
 __declspec(dllexport) void sclm_layer_forward(SclmLayer* L, const SclmExpert* experts, const float* gates, int n, const float* x, float* y) {
     const int dim = L->dim, inter = L->inter;
-    float *xr = L->x.data(), *gate = L->gate.data(), *up = L->up.data(), *out = L->out.data();
+    float* xr = L->x.data();
     std::memcpy(xr, x, sizeof(float) * dim);
     fp8_blocks(xr, dim);
     rotate(xr, dim, L->rot_dim);
-    std::fill(L->built.begin(), L->built.end(), 0);
-    std::memset(y, 0, sizeof(float) * dim);
-    for (int e = 0; e < n; ++e) {
-        const SclmExpert& ex = experts[e];
-        Format& f = L->formats[ex.format];
-        if (!L->built[ex.format])  // w1 and w3 of every expert of a format read the same tables
-            build_tables(f.cb, f.d, xr, dim, f.in), L->built[ex.format] = 1;
-        matvec(ex.codes[0], ex.scales[0], f.in, inter, gate);
-        matvec(ex.codes[2], ex.scales[2], f.in, inter, up);
-        bf16(gate, inter), bf16(up, inter);
-        for (int i = 0; i < inter; ++i) {
-            const float g = L->limit > 0 ? std::min(gate[i], L->limit) : gate[i];
-            const float u = L->limit > 0 ? std::clamp(up[i], -L->limit, L->limit) : up[i];
-            gate[i] = gates[e] * (g / (1.0f + std::exp(-g)) * u);
-        }
-        bf16(gate, inter);
-        fp8_blocks(gate, inter);
-        rotate(gate, inter, L->rot_inter);
-        build_tables(f.cb, f.d, gate, inter, f.mid);
-        matvec(ex.codes[1], ex.scales[1], f.mid, dim, out);
-        bf16(out, dim);
-        for (int i = 0; i < dim; ++i) y[i] += out[i];
+    while (int(L->slots.size()) < n) {  // a slot's tables are sized for the largest format
+        size_t entries = 0;
+        for (const Format& f : L->formats) entries = std::max(entries, size_t(inter / f.d) * f.in.codes);
+        Slot& s = L->slots.emplace_back();
+        s.mid.t = aligned<int8_t>(entries), s.mid.tmp = aligned<float>(entries);
+        s.gate.resize(inter), s.up.resize(inter), s.out.resize(dim);
     }
+    L->used.clear();
+    for (int e = 0; e < n; ++e) {
+        L->slots[e].ex = experts + e, L->slots[e].weight = gates[e];
+        if (std::find(L->used.begin(), L->used.end(), experts[e].format) == L->used.end()) L->used.push_back(experts[e].format);
+    }
+    pool->run(int(L->used.size()), build_in, L);
+    pool->run(n * 2 * (inter / TILE), in_tile, L);
+    pool->run(n, hidden, L);
+    pool->run(n * (dim / TILE), out_tile, L);
+    std::memset(y, 0, sizeof(float) * dim);
+    for (int e = 0; e < n; ++e)  // in call order, as the reference adds them
+        for (int i = 0; i < dim; ++i) y[i] += L->slots[e].out[i];
 }
 
 }  // extern "C"

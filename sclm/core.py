@@ -25,6 +25,7 @@ def _dll():
                                    C.c_void_p, C.c_int, C.c_void_p, C.c_int]
     lib.sclm_layer_free.argtypes = [C.c_void_p]
     lib.sclm_layer_forward.argtypes = [C.c_void_p, C.POINTER(Expert), C.c_void_p, C.c_int, C.c_void_p, C.c_void_p]
+    lib.sclm_set_threads.argtypes = [C.c_int]
     lib.sclm_reader_new.restype = C.c_void_p
     lib.sclm_reader_new.argtypes = [C.POINTER(C.c_wchar_p), C.c_int, C.c_int]
     lib.sclm_reader_free.argtypes = [C.c_void_p]
@@ -35,6 +36,11 @@ def _dll():
     lib.sclm_cache_free.argtypes = [C.c_void_p]
     lib.sclm_cache_use.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_longlong, C.c_void_p, C.c_void_p]
     return lib
+
+
+def set_threads(threads: int) -> None:
+    """Threads that share each Layer.forward (1 at start). The output does not depend on it."""
+    _dll().sclm_set_threads(threads)
 
 
 class Layer:
