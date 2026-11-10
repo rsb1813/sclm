@@ -152,6 +152,13 @@ def gptq_vq(
     u = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
     w0 = W.clone() if refit else None
     cb = codebook.float()
+    # every code's d x d diagonal block of U inverted at once, and the codewords in each block's metric: one
+    # linalg.inv per code was a fifth of the run time
+    blocks = u.unflatten(-2, (k // d, d)).unflatten(-1, (k // d, d)).diagonal(dim1=-4, dim2=-2).movedim(-1, -3)
+    inv_all = torch.linalg.inv(blocks)  # [..., K/d, d, d]
+    ct_all = cb @ inv_all  # [..., K/d, C, d]
+    ct2_all = ct_all.pow(2).sum(-1)
+    del blocks
     rms = lambda g: g.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-12).half().float()  # noqa: E731
     codes = torch.empty(*batch, n, k // d, dtype=torch.long, device=w.device)
     scales = torch.empty(*batch, n, 1 if per_row else k // group, device=w.device, dtype=torch.float32)
@@ -167,9 +174,10 @@ def gptq_vq(
             if not per_row and col % group == 0:
                 scale = rms(w1[..., i : i + group])
                 scales[..., col // group] = scale.squeeze(-1)
-            inv = torch.linalg.inv(ub[..., i : i + d, i : i + d])
-            t, ct = w1[..., i : i + d] @ inv, cb @ inv  # targets [..., N, d] and codewords [..., C, d] in the metric
-            j = (scale.pow(2) * ct.pow(2).sum(-1).unsqueeze(-2) - 2 * scale * (t @ ct.transpose(-1, -2))).argmin(-1)
+            # targets [..., N, d] and codewords [..., C, d] in the metric
+            t, ct = w1[..., i : i + d] @ inv_all[..., col // d, :, :], ct_all[..., col // d, :, :]
+            # |t - scale * c|^2 up to terms and a factor that do not depend on the codeword
+            j = (scale / 2 * ct2_all[..., col // d, :].unsqueeze(-2) - t @ ct.transpose(-1, -2)).argmin(-1)
             codes[..., col // d] = j
             e = t - scale * ct.gather(-2, j.unsqueeze(-1).expand(*j.shape, d))
             w1[..., i + d :] -= e @ ub[..., i : i + d, i + d :]
