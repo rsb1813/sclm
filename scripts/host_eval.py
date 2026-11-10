@@ -1,0 +1,84 @@
+# Quality and speed of the runtime itself: the tiered host decodes eval text a token at a time (teacher forcing) and its
+# next-token distributions are compared with the original model's (data/eval_ref.pt, as scripts/quant_eval.py does).
+import argparse
+import json
+import os
+import time
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer
+
+from sclm import core, host
+from sclm.checkpoint import Checkpoint
+from sclm.layerwise import VRAM_MARGIN, load_args
+
+DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+CHUNK = 256  # positions per entry of eval_ref.pt
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100")
+    ap.add_argument("--slots", type=int, default=320)
+    ap.add_argument("--lam", type=float, default=0.1)
+    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--seqs", default="0,2,4,7", help="eval sequences (quant_eval's order: two en_web, ko_wiki, chat_en, "
+                    "chat_ko, code_inst, code_raw, math)")
+    ap.add_argument("--tokens", type=int, default=256, help="tokens decoded per sequence")
+    ap.add_argument("--topk", type=int, default=0, help="lossy: routed experts computed per token (0: all)")
+    ap.add_argument("--skip-miss", action="store_true", help="lossy: leave out experts that are not in the cache yet")
+    ap.add_argument("--name", required=True)
+    cli = ap.parse_args()
+
+    torch.set_default_dtype(torch.bfloat16)
+    free, total = torch.cuda.mem_get_info()
+    torch.cuda.set_per_process_memory_fraction((free - VRAM_MARGIN) / total)
+    tok = AutoTokenizer.from_pretrained(cli.ckpt)
+    ck = Checkpoint(cli.ckpt)
+    args = load_args(max_batch_size=1, max_seq_len=max(1024, cli.tokens), **host.TEXT_ONLY)
+    net = host.build_net(args, tok)
+    host.load_checkpoint_(net, ck)
+    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam)
+    cache.topk, cache.skip_miss = cli.topk, cli.skip_miss
+    core.set_threads(cli.threads)
+    decoder = host.Host(net, cache)
+
+    tokens = torch.from_numpy(np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))["tokens"]).long()[3::6][:8]
+    ref = torch.load(os.path.join(DATA, "eval_ref.pt"), weights_only=True)
+    names = np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))
+    cats = [str(names["names"][c]) for c in names["category"][3::6][:8]]
+    per_seq, seconds, stats = [], 0.0, {}
+    for s in map(int, cli.seqs.split(",")):
+        kl = agree = 0.0
+        cache.stats.clear()
+        for p in range(cli.tokens):
+            t0 = time.perf_counter()
+            logits = decoder.logits(tokens[s, p].view(1, 1), p)
+            lp = F.log_softmax(logits[0].float(), dim=-1)
+            entry = (s // 2) * (tokens.size(1) // CHUNK) + p // CHUNK
+            r_ids = ref["ids"][entry][s % 2, p % CHUNK].to(lp.device).long()
+            r_lp = ref["lp"][entry][s % 2, p % CHUNK].to(lp.device).float()
+            kl += float((r_lp.exp() * (r_lp - lp[r_ids])).sum())
+            agree += float(lp.argmax() == r_ids[0])
+            if p >= cli.tokens // 4:  # speed over the part after the cache has filled
+                seconds += time.perf_counter() - t0
+        for k, v in cache.stats.items():
+            stats[k] = stats.get(k, 0.0) + v
+        per_seq.append({"category": cats[s], "kl": kl / cli.tokens, "top1": agree / cli.tokens})
+        print(json.dumps(per_seq[-1]), flush=True)
+    n = len(per_seq) * cli.tokens
+    timed = len(per_seq) * (cli.tokens - cli.tokens // 4)
+    out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "skip_miss": cli.skip_miss, "tokens": n,
+           "kl_top64": sum(x["kl"] for x in per_seq) / len(per_seq), "top1_agree": sum(x["top1"] for x in per_seq) / len(per_seq),
+           "tok_s": timed / seconds, "ms_per_token": 1e3 * seconds / timed,
+           "per_token": {k: (1e3 * v / n if k.endswith("_s") else v / n) for k, v in stats.items()}, "per_seq": per_seq}
+    with open(os.path.join(DATA, f"hosteval_{cli.name}.json"), "w") as f:
+        json.dump(out, f, indent=1)
+    print(json.dumps({k: v for k, v in out.items() if k != "per_seq"}), flush=True)
+
+
+if __name__ == "__main__":
+    main()

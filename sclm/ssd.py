@@ -62,6 +62,9 @@ class ExpertCache:
         self.token = 0  # position of the first token of the forward in progress, set by the host
         self.stats = defaultdict(float)  # seconds and counts the tiered MoE adds up, for whoever measures
         self.uploading = False  # slot uploads may still be reading the staging buffers
+        # lossy speed options of the decode path (sclm.tiered), off by default
+        self.topk = 0  # > 0: only the best `topk` routed experts of a token are computed
+        self.skip_miss = False  # an expert that has to be read is left out of the token that asked for it
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)

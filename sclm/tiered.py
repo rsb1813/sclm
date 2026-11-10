@@ -33,9 +33,18 @@ class TieredMoE(nn.Module):
         host = pack.cpu().numpy()
         t1 = perf_counter()
         ids, gates = host[:topk].astype(np.int64).tolist(), host[topk:2 * topk].tolist()
+        total = sum(gates)
+        if cache.topk:  # lossy: the weakest picks are dropped (the gate lists them best first)
+            ids, gates = ids[:cache.topk], gates[:cache.topk]
         ram = [k for k, e in enumerate(ids) if e in self.ram.experts]
         ssd = [k for k, e in enumerate(ids) if e not in self.ram.experts]
         slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token)
+        if cache.skip_miss:  # lossy: the token goes on without the experts that are not in the cache yet
+            missed = {slot for slot, _, _ in pending}
+            ssd, slots = [k for k, s in zip(ssd, slots) if s not in missed], [s for s in slots if s not in missed]
+        kept = sum(gates[k] for k in ram + ssd)
+        if kept < total and kept > 0:  # what is computed keeps the routing weight of all six
+            gates = [g * (total / kept) for g in gates]
         self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:], cache.ram_out.numpy())
         t2 = perf_counter()
         cache.finish(pending)
