@@ -208,3 +208,42 @@ def test_kmeans_recovers_clusters_and_vq_error():
     cb = quant.kmeans(quant.to_vectors(wn, 8), 256)
     nmse = ((quant.vq_dequant(wn, cb) * s - w).pow(2).mean() / w.pow(2).mean()).item()
     assert 0.1 < nmse < 0.6  # 1 bpw on Gaussian data: well above 4-bit RTN, well below no-information (1.0)
+
+
+def test_gptq_vq_identity_hessian_is_nearest_codeword():
+    torch.manual_seed(9)
+    n, k, d = 16, 256, 8
+    w, cb = torch.randn(n, k, device=DEV), torch.randn(64, d, device=DEV)
+    for group in (128, k):  # a scale per 128 columns, and one per row
+        codes, scales = quant.gptq_vq(w, torch.eye(k, device=DEV), cb, group)
+        s = w.reshape(n, -1, group).pow(2).mean(-1).sqrt().half().float()
+        assert codes.shape == (n, k // d) and torch.equal(scales, s)
+        v = w.reshape(n, k // group, group // d, d) / s[..., None, None]
+        want = quant.vq_assign(v.reshape(-1, d), cb).reshape(n, k // d)
+        assert torch.equal(codes, want)
+        wq = quant.vq_codes_dequant(codes, scales, cb)
+        assert torch.allclose(wq, (cb[want].reshape(v.shape) * s[..., None, None]).reshape(n, k))
+
+
+def test_gptq_vq_beats_plain_vq_on_correlated_inputs():
+    torch.manual_seed(10)
+    k, n, m = 256, 64, 4096
+    x = torch.randn(m, 32, device=DEV) @ torch.randn(32, k, device=DEV) + 0.1 * torch.randn(m, k, device=DEV)
+    w = torch.randn(3, n, k, device=DEV)
+    h = (x.t() @ x).expand(3, k, k)
+    cb = quant.kmeans(torch.randn(1 << 16, 4, device=DEV), 256)  # 2 bpw
+    out_err = lambda wq: ((wq - w) @ x.t()).pow(2).sum() / (w @ x.t()).pow(2).sum()  # noqa: E731
+    codes, scales = quant.gptq_vq(w, h, cb, 128)
+    plain = quant.vq_codes_dequant(*quant.gptq_vq(w, torch.eye(k, device=DEV).expand(3, k, k), cb, 128), cb)
+    e_gptq, e_plain = out_err(quant.vq_codes_dequant(codes, scales, cb)), out_err(plain)
+    assert e_gptq < 0.5 * e_plain, (e_gptq, e_plain)
+    for b in range(3):  # batched ~ one at a time: a near-tie may flip a code and the feedback then carries it on
+        c1, s1 = quant.gptq_vq(w[b], h[b], cb, 128)
+        assert (codes[b] == c1).float().mean() > 0.9 and torch.allclose(scales[b], s1, rtol=2e-3)  # fp16 ulp
+        e1 = ((quant.vq_codes_dequant(c1, s1, cb) - w[b]) @ x.t()).pow(2).sum() / (w[b] @ x.t()).pow(2).sum()
+        assert abs(e1 / e_gptq - 1) < 0.1
+    # the refit keeps the codes and can only lower the error under h
+    c0, s0 = quant.gptq_vq(w, h, cb, k)
+    c1, s1 = quant.gptq_vq(w, h, cb, k, refit=True)
+    assert torch.equal(c0, c1) and s1.shape == (3, n, 1)
+    assert out_err(quant.vq_codes_dequant(c1, s1, cb)) < out_err(quant.vq_codes_dequant(c0, s0, cb))

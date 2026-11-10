@@ -128,6 +128,66 @@ def gptq_codes(
     return codes, steps
 
 
+def gptq_vq(
+    w: torch.Tensor, h: torch.Tensor, codebook: torch.Tensor, group: int, damp: float = 0.01, block: int = 128,
+    refit: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GPTQ with vector rounding: d columns at a time go to the row of `codebook` [C, d] (times the group's scale)
+    that is nearest in the metric the error feedback leaves on them, |delta U_BB^-1|^2 with U the Cholesky factor
+    gptq_codes uses, i.e. the cost that remains after the later columns have compensated. A group's scale is the rms
+    of its columns once earlier feedback has landed (fp16; group >= K: one per row, the rms of the row as given, or
+    with `refit` the least-squares scale of the chosen codes under h). Batch dims as in gptq_codes.
+    Returns codes (long [..., N, K/d]) and scales (fp32 [..., N, K/group or 1])."""
+    d = codebook.size(-1)
+    *batch, n, k = w.shape
+    per_row = group >= k
+    assert block % d == 0 and k % d == 0 and (per_row or (block % group == 0 and group % d == 0))
+    assert per_row or not refit
+    W, H = w.float().clone(), h.float().clone()
+    diag = torch.diagonal(H, dim1=-2, dim2=-1)  # a view: edits below land in H
+    dead = diag == 0
+    diag.masked_fill_(dead, 1)
+    W.masked_fill_(dead.unsqueeze(-2), 0)
+    diag += damp * diag.mean(-1, keepdim=True)
+    u = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
+    w0 = W.clone() if refit else None
+    cb = codebook.float()
+    rms = lambda g: g.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-12).half().float()  # noqa: E731
+    codes = torch.empty(*batch, n, k // d, dtype=torch.long, device=w.device)
+    scales = torch.empty(*batch, n, 1 if per_row else k // group, device=w.device, dtype=torch.float32)
+    if per_row:
+        scale = rms(W)
+        scales[..., 0] = scale.squeeze(-1)
+    for b0 in range(0, k, block):
+        b1 = min(b0 + block, k)
+        w1, err = W[..., b0:b1].clone(), torch.zeros(*batch, n, b1 - b0, device=w.device, dtype=torch.float32)
+        ub = u[..., b0:b1, b0:b1]
+        for i in range(0, b1 - b0, d):
+            col = b0 + i
+            if not per_row and col % group == 0:
+                scale = rms(w1[..., i : i + group])
+                scales[..., col // group] = scale.squeeze(-1)
+            inv = torch.linalg.inv(ub[..., i : i + d, i : i + d])
+            t, ct = w1[..., i : i + d] @ inv, cb @ inv  # targets [..., N, d] and codewords [..., C, d] in the metric
+            j = (scale.pow(2) * ct.pow(2).sum(-1).unsqueeze(-2) - 2 * scale * (t @ ct.transpose(-1, -2))).argmin(-1)
+            codes[..., col // d] = j
+            e = t - scale * ct.gather(-2, j.unsqueeze(-1).expand(*j.shape, d))
+            w1[..., i + d :] -= e @ ub[..., i : i + d, i + d :]
+            err[..., i : i + d] = e
+        W[..., b1:] -= err @ u[..., b0:b1, b1:]
+    if refit:
+        q = cb[codes].flatten(-2)
+        qh = q @ H
+        scales = ((qh * w0).sum(-1, keepdim=True) / (qh * q).sum(-1, keepdim=True).clamp_min(1e-12)).half().float()
+    return codes, scales
+
+
+def vq_codes_dequant(codes: torch.Tensor, scales: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    """Weights [..., N, K] of gptq_vq's codes and scales."""
+    q = codebook.float()[codes]  # [..., N, K/d, d]
+    return (q.unflatten(-2, (scales.size(-1), -1)) * scales[..., None, None]).flatten(-3)
+
+
 def rtn_dequant(codes: torch.Tensor, step: torch.Tensor, bits: int, group: int,
                 levels: int | None = None) -> torch.Tensor:
     lo, _, off = _grid(levels or 2**bits)
