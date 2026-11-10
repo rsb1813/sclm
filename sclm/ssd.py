@@ -32,9 +32,9 @@ class ExpertReader:
     def staging(self) -> np.ndarray:
         return core.pages(self.nbytes)
 
-    def submit(self, layer: int, expert: int, buf: np.ndarray) -> tuple[int, int]:
+    def submit(self, layer: int, expert: int, buf: np.ndarray, ticket: int = 0) -> tuple[int, int]:
         """Starts reading the expert into buf (from staging()). Returns where its scales and its weights begin in buf,
-        valid once wait() returns."""
+        valid once wait() returns (ticket 0) or the reader says the ticket is done."""
         runs = self.where.get((layer, expert))
         if runs is None:
             found = self.extents(layer, expert)
@@ -43,35 +43,43 @@ class ExpertReader:
         at, starts = 0, []
         for (file, offset), size in zip(runs, self.sizes):
             room = size + 2 * core.PAGE
-            starts.append(at + self.reader.submit(file, offset, size, buf[at:at + room]))
+            starts.append(at + self.reader.submit(file, offset, size, buf[at:at + room], ticket))
             at += room
         return starts[0], starts[1]
 
     def wait(self) -> None:
-        self.reader.wait()
+        """Waits for the reads submitted under ticket 0."""
+        self.reader.wait(0)
 
 
 class ExpertCache:
     """Original FP4 experts held in device memory: `slots` of them chosen by the engine's policy (core.Cache), plus
     `scratch` slots for experts the policy does not keep. A slot is the expert's bytes as they lie in the checkpoint
-    (scales, then weights), and the upstream kernels compute from views of them."""
+    (scales, then weights), and the upstream kernels compute from views of them. `background`: staging buffers for
+    experts read without anyone waiting (request's wait argument)."""
 
     def __init__(self, reader: ExpertReader, n_layers: int, n_experts: int, dim: int, inter: int, limit: float,
-                 slots: int, lam: float, device, scratch: int):
-        self.reader, self.n_experts = reader, n_experts
+                 slots: int, lam: float, device, scratch: int, background: int = 0):
+        self.reader, self.n_experts, self.n_slots = reader, n_experts, slots
+        self.loaded = [None] * slots  # slot -> the key whose bytes it holds (or is being given by a waited read)
+        self.loads = {}  # staging buffer -> (slot, key, where the bytes land) of the background read filling it
+        self.idle = list(range(scratch, scratch + background))  # staging buffers free for a background read
+        self.cooling = []  # buffers whose upload was queued by the last request: idle again at the next one
         self.token = 0  # position of the first token of the forward in progress, set by the host
         self.stats = defaultdict(float)  # seconds and counts the tiered MoE adds up, for whoever measures
         self.uploading = False  # slot uploads may still be reading the staging buffers
         # lossy speed options of the decode path (sclm.tiered), off by default
         self.topk = 0  # > 0: only the best `topk` routed experts of a token are computed
-        self.skip_miss = False  # an expert that has to be read is left out of the token that asked for it
+        # > 0: an expert that has to be read is waited for only if it carries at least this share of the token's
+        # routing weight; otherwise the token goes on without it and it is read in the background
+        self.wait_share = 0.0
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
         pin = torch.device(device).type == "cuda"
         self.ram_out = torch.empty(dim, dtype=torch.float32, pin_memory=pin)  # where the CPU tier writes a token's sum
         self.staging = []  # page-aligned host buffers the reader fills, one per expert a call can miss
-        for _ in range(scratch):
+        for _ in range(scratch + background):
             buf = torch.empty(reader.nbytes + core.PAGE, dtype=torch.uint8, pin_memory=pin)
             start = -buf.data_ptr() % core.PAGE
             self.staging.append(buf[start:start + reader.nbytes])
@@ -86,28 +94,61 @@ class ExpertCache:
             assert (at_s, at_w) == (n_scale, n_scale + n_weight)
             self.experts.append(SimpleNamespace(**mats, swiglu_limit=limit))
 
-    def request(self, layer: int, experts: list, token: int) -> tuple[list, list]:
+    def _upload(self, slot: int, buf: torch.Tensor, at_s: int, at_w: int) -> None:
+        n_scale, n_weight = self.reader.sizes
+        self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale], non_blocking=True)
+        self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
+        self.uploading = self.store.is_cuda
+
+    def request(self, layer: int, experts: list, token: int, wait: list | None = None) -> tuple[list, list]:
         """Slots of a layer's SSD-tier experts at a token, with the reads of the missing ones started.
-        Returns (slots, pending); finish(pending) has to run before the slots are used."""
+        Returns (slots, pending); finish(pending) has to run before the slots are used.
+        wait[i] False (lossy): if the expert's bytes are not in its slot, its slot comes back None; it is read in the
+        background when a staging buffer is free, and is there for the tokens after."""
         if self.uploading:  # the reads below go into the buffers those uploads copy from
             torch.cuda.synchronize()
             self.uploading = False
-        slots, miss = self.policy.use([layer * self.n_experts + e for e in experts], token)
-        pending = []
-        for e, slot, buf in zip(np.asarray(experts)[miss].tolist(), slots[miss].tolist(), self.staging):
-            pending.append((slot, buf, self.reader.submit(layer, e, buf.numpy())))
-        return slots.tolist(), pending
+        self.idle += self.cooling
+        self.cooling = []
+        if self.loads:
+            self.reader.reader.poll()
+            for i in [i for i in self.loads if self.reader.reader.done(i)]:
+                slot, key, (at_s, at_w) = self.loads.pop(i)
+                if self.loaded[slot] is None:  # else a waited read has given the slot to another expert since
+                    self._upload(slot, self.staging[i], at_s, at_w)
+                    self.loaded[slot] = key
+                self.cooling.append(i)
+        keys = [layer * self.n_experts + e for e in experts]
+        slots = self.policy.use(keys, token)[0].tolist()
+        out, pending, loading = [], [], {slot for slot, _, _ in self.loads.values()}
+        for k, (e, key, slot) in enumerate(zip(experts, keys, slots)):
+            kept = slot < self.n_slots  # not a scratch slot
+            if kept and self.loaded[slot] == key:
+                out.append(slot)
+            elif wait is None or wait[k]:
+                buf = self.staging[len(pending)]
+                pending.append((slot, buf, self.reader.submit(layer, e, buf.numpy())))
+                if kept:
+                    self.loaded[slot] = key
+                out.append(slot)
+            else:
+                out.append(None)
+                # a slot whose previous owner is still arriving waits its turn: the expert is asked for again
+                if kept and slot not in loading and self.idle:
+                    i = self.idle.pop()
+                    self.loaded[slot] = None
+                    self.loads[i] = (slot, key, self.reader.submit(layer, e, self.staging[i].numpy(), i))
+                    loading.add(slot)
+                    self.stats["loads"] += 1
+        return out, pending
 
     def finish(self, pending: list) -> None:
         """Waits for the reads and copies each expert into its slot."""
         if not pending:
             return
         self.reader.wait()
-        n_scale, n_weight = self.reader.sizes
         for slot, buf, (at_s, at_w) in pending:
-            self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale], non_blocking=True)
-            self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
-        self.uploading = self.store.is_cuda
+            self._upload(slot, buf, at_s, at_w)
 
 
 class EngramRows(torch.nn.Module):

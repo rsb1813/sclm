@@ -38,10 +38,10 @@ class TieredMoE(nn.Module):
             ids, gates = ids[:cache.topk], gates[:cache.topk]
         ram = [k for k, e in enumerate(ids) if e in self.ram.experts]
         ssd = [k for k, e in enumerate(ids) if e not in self.ram.experts]
-        slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token)
-        if cache.skip_miss:  # lossy: the token goes on without the experts that are not in the cache yet
-            missed = {slot for slot, _, _ in pending}
-            ssd, slots = [k for k, s in zip(ssd, slots) if s not in missed], [s for s in slots if s not in missed]
+        wait = [gates[k] >= cache.wait_share * total for k in ssd] if cache.wait_share else None
+        slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token, wait)
+        if wait:  # lossy: the token goes on without the light experts that are not in the cache yet
+            ssd, slots = [k for k, s in zip(ssd, slots) if s is not None], [s for s in slots if s is not None]
         kept = sum(gates[k] for k in ram + ssd)
         if kept < total and kept > 0:  # what is computed keeps the routing weight of all six
             gates = [g * (total / kept) for g in gates]

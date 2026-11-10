@@ -23,7 +23,10 @@ struct Request {
     HANDLE file;
     void* dst;
     DWORD len;
+    int ticket;  // the caller's name for the read this chunk belongs to
 };
+
+const int TICKETS = 256;
 
 }  // namespace
 
@@ -35,6 +38,7 @@ struct SclmReader {
     uint64_t chunk = 0;
     std::deque<Request> requests;  // of the reads submitted since the last wait; a deque keeps their addresses
     int pending = 0, failed = 0;   // the caller's: reads not yet completed, reads that failed
+    int open[TICKETS] = {};        // the caller's: chunks not yet completed, per ticket
     std::mutex mutex;
     std::condition_variable wake;
     std::vector<Request*> queue;  // submitted, not yet issued
@@ -104,7 +108,8 @@ __declspec(dllexport) void sclm_reader_free(SclmReader* R) {
 
 // Starts reading bytes [offset, offset + bytes) of file `file` into dst and returns where in dst the first of them
 // lands (the read starts on the page boundary below offset). dst is page-aligned and holds bytes + 2 pages.
-__declspec(dllexport) int sclm_reader_submit(SclmReader* R, int file, uint64_t offset, uint64_t bytes, uint8_t* dst) {
+// `ticket` (below 256) names the read for sclm_reader_open and sclm_reader_wait_ticket.
+__declspec(dllexport) int sclm_reader_submit(SclmReader* R, int file, uint64_t offset, uint64_t bytes, uint8_t* dst, int ticket) {
     const uint64_t head = offset % PAGE, begin = offset - head, end = (offset + bytes + PAGE - 1) / PAGE * PAGE;
     const size_t first = R->requests.size();
     for (uint64_t at = begin; at < end; at += R->chunk) {
@@ -113,8 +118,8 @@ __declspec(dllexport) int sclm_reader_submit(SclmReader* R, int file, uint64_t o
         q.ov = {};
         q.ov.Offset = DWORD(at), q.ov.OffsetHigh = DWORD(at >> 32);
         q.need = DWORD(std::min(len, offset + bytes - at));
-        q.file = R->files[file], q.dst = dst + (at - begin), q.len = DWORD(len);
-        ++R->pending;
+        q.file = R->files[file], q.dst = dst + (at - begin), q.len = DWORD(len), q.ticket = ticket;
+        ++R->pending, ++R->open[ticket];
     }
     {
         std::lock_guard lock(R->mutex);
@@ -124,20 +129,52 @@ __declspec(dllexport) int sclm_reader_submit(SclmReader* R, int file, uint64_t o
     return int(head);
 }
 
-// Waits for every read submitted since the last wait. Returns how many of them failed.
-__declspec(dllexport) int sclm_reader_wait(SclmReader* R) {
-    while (R->pending) {
-        DWORD got;
-        ULONG_PTR key;
-        OVERLAPPED* ov;
-        const BOOL ok = GetQueuedCompletionStatus(R->port, &got, &key, &ov, INFINITE);
-        if (!ov) return -1;  // the port itself failed
-        --R->pending;
-        if (!ok || key == 1 || got < CONTAINING_RECORD(ov, Request, ov)->need) ++R->failed;
-    }
+// Takes one completed chunk off the port, waiting up to `wait` ms. Returns 1, 0 if none completed, -1 if the port failed.
+static int take(SclmReader* R, DWORD wait) {
+    DWORD got;
+    ULONG_PTR key;
+    OVERLAPPED* ov;
+    const BOOL ok = GetQueuedCompletionStatus(R->port, &got, &key, &ov, wait);
+    if (!ov) return GetLastError() == WAIT_TIMEOUT ? 0 : -1;
+    const Request* q = CONTAINING_RECORD(ov, Request, ov);
+    --R->pending, --R->open[q->ticket];
+    if (!ok || key == 1 || got < q->need) ++R->failed;
+    return 1;
+}
+
+// How many reads failed since the last call that reported them.
+static int settle(SclmReader* R) {
+    if (!R->pending) R->requests.clear();
     const int failed = R->failed;
-    R->requests.clear(), R->failed = 0;
+    R->failed = 0;
     return failed;
+}
+
+// Takes in the reads that have completed, without waiting. Returns how many failed.
+__declspec(dllexport) int sclm_reader_poll(SclmReader* R) {
+    while (R->pending) {
+        const int took = take(R, 0);
+        if (took < 0) return -1;
+        if (!took) break;
+    }
+    return settle(R);
+}
+
+// Chunks of the ticket's reads that have not completed, as of the last poll or wait.
+__declspec(dllexport) int sclm_reader_open(SclmReader* R, int ticket) { return R->open[ticket]; }
+
+// Waits for the reads submitted under the ticket (others may still run). Returns how many reads failed.
+__declspec(dllexport) int sclm_reader_wait_ticket(SclmReader* R, int ticket) {
+    while (R->open[ticket])
+        if (take(R, INFINITE) < 0) return -1;
+    return settle(R);
+}
+
+// Waits for every read submitted. Returns how many of them failed.
+__declspec(dllexport) int sclm_reader_wait(SclmReader* R) {
+    while (R->pending)
+        if (take(R, INFINITE) < 0) return -1;
+    return settle(R);
 }
 
 // A cache of `slots` experts out of n_keys; lam is the score's decay per token.

@@ -29,7 +29,10 @@ def _dll():
     lib.sclm_reader_new.restype = C.c_void_p
     lib.sclm_reader_new.argtypes = [C.POINTER(C.c_wchar_p), C.c_int, C.c_int]
     lib.sclm_reader_free.argtypes = [C.c_void_p]
-    lib.sclm_reader_submit.argtypes = [C.c_void_p, C.c_int, C.c_uint64, C.c_uint64, C.c_void_p]
+    lib.sclm_reader_submit.argtypes = [C.c_void_p, C.c_int, C.c_uint64, C.c_uint64, C.c_void_p, C.c_int]
+    lib.sclm_reader_poll.argtypes = [C.c_void_p]
+    lib.sclm_reader_open.argtypes = [C.c_void_p, C.c_int]
+    lib.sclm_reader_wait_ticket.argtypes = [C.c_void_p, C.c_int]
     lib.sclm_reader_wait.argtypes = [C.c_void_p]
     lib.sclm_cache_new.restype = C.c_void_p
     lib.sclm_cache_new.argtypes = [C.c_int, C.c_int, C.c_double]
@@ -102,15 +105,28 @@ class Reader:
         self.handle = self.lib.sclm_reader_new((C.c_wchar_p * len(paths))(*paths), len(paths), chunk)
         assert self.handle, "a checkpoint file could not be opened"
 
-    def submit(self, file: int, offset: int, nbytes: int, dst: np.ndarray) -> int:
+    def submit(self, file: int, offset: int, nbytes: int, dst: np.ndarray, ticket: int = 0) -> int:
         """Starts reading bytes [offset, offset + nbytes) of paths[file] into dst (from pages(), nbytes + 2 pages or
-        more, alive until wait returns). Returns where in dst the first byte lands."""
+        more, alive until the read is done). Returns where in dst the first byte lands. `ticket` (below 256) names the
+        read for wait(ticket) and done(ticket)."""
         assert dst.ctypes.data % PAGE == 0 and dst.nbytes >= nbytes + 2 * PAGE
-        return self.lib.sclm_reader_submit(self.handle, file, offset, nbytes, dst.ctypes.data)
+        return self.lib.sclm_reader_submit(self.handle, file, offset, nbytes, dst.ctypes.data, ticket)
 
-    def wait(self) -> None:
-        failed = self.lib.sclm_reader_wait(self.handle)
+    def wait(self, ticket: int | None = None) -> None:
+        """Waits for every read submitted, or only for those submitted under the ticket."""
+        if ticket is None:
+            failed = self.lib.sclm_reader_wait(self.handle)
+        else:
+            failed = self.lib.sclm_reader_wait_ticket(self.handle, ticket)
         assert failed == 0, f"{failed} reads failed"
+
+    def poll(self) -> None:
+        """Takes in the reads that have completed, without waiting; done() answers as of the last poll or wait."""
+        failed = self.lib.sclm_reader_poll(self.handle)
+        assert failed == 0, f"{failed} reads failed"
+
+    def done(self, ticket: int) -> bool:
+        return self.lib.sclm_reader_open(self.handle, ticket) == 0
 
     def __del__(self):
         if getattr(self, "handle", None):

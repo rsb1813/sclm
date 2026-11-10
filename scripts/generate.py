@@ -28,6 +28,10 @@ def main() -> None:
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--max-seq-len", type=int, default=1024)
     ap.add_argument("--min-ram-margin", type=float, default=1.0, help="GiB of RAM that must stay free after loading")
+    ap.add_argument("--wait-share", type=float, default=0.0, help="lossy: an expert that has to be read from the SSD is "
+                    "waited for only if it carries this share of the token's routing weight (above 1: never); else the "
+                    "token goes on without it and it is read in the background")
+    ap.add_argument("--topk", type=int, default=0, help="lossy: routed experts computed per token (0: all six)")
     ap.add_argument("--name", default="stage3")
     cli = ap.parse_args()
 
@@ -52,7 +56,8 @@ def main() -> None:
     print(f"RAM: {total_ram - used:.1f} GiB available, the codes take {need:.1f} GiB", flush=True)
     if out["ram_margin_gib"] < cli.min_ram_margin:
         raise SystemExit(f"only {out['ram_margin_gib']:.1f} GiB of RAM would be left (--min-ram-margin {cli.min_ram_margin})")
-    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam)
+    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam, background=12 if cli.wait_share else 0)
+    cache.topk, cache.wait_share = cli.topk, cli.wait_share
     out.update(load_s=time.perf_counter() - t0, allocated_gib=torch.cuda.memory_allocated() / GIB,
                ram_used_loaded_gib=status.ram()[0])
     print(f"loaded in {out['load_s']:.0f}s: resident {out['resident_gib']:.2f} GiB, with the cache "

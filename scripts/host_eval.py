@@ -29,7 +29,9 @@ def main() -> None:
                     "chat_ko, code_inst, code_raw, math)")
     ap.add_argument("--tokens", type=int, default=256, help="tokens decoded per sequence")
     ap.add_argument("--topk", type=int, default=0, help="lossy: routed experts computed per token (0: all)")
-    ap.add_argument("--skip-miss", action="store_true", help="lossy: leave out experts that are not in the cache yet")
+    ap.add_argument("--wait-share", type=float, default=0.0, help="lossy: an expert that has to be read is waited for "
+                    "only if it carries this share of the token's routing weight (above 1: never); else it is left out "
+                    "of the token and read in the background")
     ap.add_argument("--name", required=True)
     cli = ap.parse_args()
 
@@ -41,8 +43,8 @@ def main() -> None:
     args = load_args(max_batch_size=1, max_seq_len=max(1024, cli.tokens), **host.TEXT_ONLY)
     net = host.build_net(args, tok)
     host.load_checkpoint_(net, ck)
-    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam)
-    cache.topk, cache.skip_miss = cli.topk, cli.skip_miss
+    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam, background=12 if cli.wait_share else 0)
+    cache.topk, cache.wait_share = cli.topk, cli.wait_share
     core.set_threads(cli.threads)
     decoder = host.Host(net, cache)
 
@@ -71,7 +73,7 @@ def main() -> None:
         print(json.dumps(per_seq[-1]), flush=True)
     n = len(per_seq) * cli.tokens
     timed = len(per_seq) * (cli.tokens - cli.tokens // 4)
-    out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "skip_miss": cli.skip_miss, "tokens": n,
+    out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "wait_share": cli.wait_share, "tokens": n,
            "kl_top64": sum(x["kl"] for x in per_seq) / len(per_seq), "top1_agree": sum(x["top1"] for x in per_seq) / len(per_seq),
            "tok_s": timed / seconds, "ms_per_token": 1e3 * seconds / timed,
            "per_token": {k: (1e3 * v / n if k.endswith("_s") else v / n) for k, v in stats.items()}, "per_seq": per_seq}

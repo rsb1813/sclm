@@ -174,11 +174,12 @@ def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda
 
 
 def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, codes_dir: str, slots: int, lam: float,
-                  device: str = "cuda") -> ssd.ExpertCache:
+                  device: str = "cuda", background: int = 0) -> ssd.ExpertCache:
     """Gives every block its coded experts (codes_dir/layer_NN.safetensors, held in RAM) and the shared cache of
     original experts, read from `ckpt` on demand."""
     cache = ssd.ExpertCache(ssd.ExpertReader(ckpt), args.n_layers, args.n_routed_experts, args.dim, args.moe_inter_dim,
-                            args.swiglu_limit, slots, lam, device, scratch=args.n_activated_experts)
+                            args.swiglu_limit, slots, lam, device, scratch=args.n_activated_experts,
+                            background=background)
     for i, block in enumerate(net.layers):
         path = os.path.join(codes_dir, f"layer_{i:02d}.safetensors")
         block.ffn.ram = core.Layer(path, args.dim, args.moe_inter_dim, args.swiglu_limit)
@@ -192,13 +193,17 @@ class Host:
 
     def __init__(self, net: "m.Transformer", cache: ssd.ExpertCache, device: str = "cuda", kernels: bool | None = None):
         self.net, self.cache, self.device = net, cache, device
+        self.origin = self.end = 0  # the cache's clock at the start of this sequence and after its last token
         on_gpu = torch.device(device).type == "cuda"
         self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
 
     @torch.inference_mode()
     def logits(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         """Next-token logits [batch, vocab] (fp32) after input_ids, which continue the sequence at start_pos."""
-        self.cache.token = start_pos
+        if start_pos == 0:  # a new sequence: the cache's clock goes on, its experts are still there
+            self.origin = self.end
+        self.cache.token = self.origin + start_pos
+        self.end = self.cache.token + input_ids.size(-1)
         gpu.active, m.linear = self.kernels, kernel_linear if self.kernels else _upstream_linear
         try:
             with torch.device(self.device):  # upstream creates index tensors on the default device

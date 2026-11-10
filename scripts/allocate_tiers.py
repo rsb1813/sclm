@@ -21,15 +21,20 @@ RAM_OPTIONS = {"1b128": (1.125, "gptq1_g128_ubnone"), "t128": (1.725, "gptqt_g12
 
 
 def allocate(w: np.ndarray, f: np.ndarray, d: np.ndarray, c: np.ndarray, ram: float, ssd: float,
-             calls: np.ndarray | None = None, nu: float = 0.0) -> np.ndarray:
+             calls: np.ndarray | None = None, nu: float = 0.0, fallback: tuple | None = None) -> np.ndarray:
     """argmin sum_e w_e d_o(e) s.t. sum_e c_o(e) <= ram and sum_{e on SSD} f_e <= ssd. Options are the RAM ones plus a
     last SSD one (d 0, RAM cost 0); both constraints are priced by Lagrange multipliers found by nested bisection.
-    nu prices what the CPU tier reads per token: calls_e (per token) times the option's size c."""
+    nu prices what the CPU tier reads per token: calls_e (per token) times the option's size c.
+    fallback = (bpw, distortion, miss share per expert): an SSD expert also keeps a code of that size in RAM, and a
+    call that misses the cache is computed from it instead of waiting for the read."""
     d_x, c_x, s_x = np.append(d, 0.0), np.append(c, 0.0), np.append(np.zeros_like(c), 1.0)
     read = nu * calls[:, None] * c_x if nu else 0.0
+    cost = w[:, None] * d_x
+    if fallback:
+        c_x[-1], cost[:, -1] = fallback[0], w * fallback[2] * fallback[1]
 
     def pick(lam: float, mu: float) -> np.ndarray:
-        return (w[:, None] * d_x + lam * c_x + mu * f[:, None] * s_x + read).argmin(1)
+        return (cost + lam * c_x + mu * f[:, None] * s_x + read).argmin(1)
 
     def fit_ram(mu: float) -> np.ndarray:
         lo, hi = 0.0, (float(w.max() * d.max()) + mu * float(f.max())) * 10 / float(c.min()) + 1.0  # hi: all on SSD
@@ -96,6 +101,8 @@ def main() -> None:
     ap.add_argument("--options", default="1b128,t128,2b128,3b128")
     ap.add_argument("--read-price", type=float, default=0.0, help="price of the CPU tier's reads per token (calls x "
                     "bpw); 0 leaves them free. Raise it until the plan's reads fit the CPU time wanted")
+    ap.add_argument("--fallback", help="RAM option an SSD expert also keeps, used when it is not in the cache (the "
+                    "speed mode: nothing waits for the SSD); such experts are named f<option> in the plan")
     ap.add_argument("--name", required=True)
     cli = ap.parse_args()
     names = cli.options.split(",")
@@ -118,25 +125,30 @@ def main() -> None:
     if cli.layer_weights:
         w *= sens[:, None]
 
+    ssd_name = "f" + cli.fallback[1:] if cli.fallback else "orig"
+    fb = (RAM_OPTIONS[cli.fallback][0], probe[RAM_OPTIONS[cli.fallback][1]]["nrd_rel"] ** 2) if cli.fallback else (0.0, 0.0)
+
     def tiers(horizon: float) -> tuple[list, list, np.ndarray]:
-        reads = np.stack([f[layer] * miss_share(idx[:, layer], n_exp, horizon) for layer in range(len(f))])
+        miss = np.stack([miss_share(idx[:, layer], n_exp, horizon) for layer in range(len(f))])
+        reads = f * miss
         if cli.global_budget:
             picks = allocate(w.ravel(), reads.ravel(), d, c, cli.ram_bpw * w.size, ssd_reads * len(f), f.ravel(),
-                             cli.read_price).reshape(w.shape)
+                             cli.read_price, (*fb, miss.ravel()) if cli.fallback else None).reshape(w.shape)
         else:
             picks = [allocate(w[layer], reads[layer], d, c, cli.ram_bpw * n_exp, ssd_reads) for layer in range(len(f))]
         plan, report = [], []
         for layer, p in enumerate(picks):
             on_ram = p < len(c)
-            opts = [names[i] if i < len(c) else "orig" for i in p]
-            report.append({"counts": {o: opts.count(o) for o in names + ["orig"]},
-                           "ram_bpw_all": float(c[p[on_ram]].sum() / n_exp),
+            opts = [names[i] if i < len(c) else ssd_name for i in p]
+            report.append({"counts": {o: opts.count(o) for o in names + [ssd_name]},
+                           "fallback_distortion": float((w[layer][~on_ram] * miss[layer][~on_ram]).sum() * fb[1] / w[layer].sum()),
+                           "ram_bpw_all": float((c[p[on_ram]].sum() + fb[0] * (~on_ram).sum()) / n_exp),
                            "ram_bpw_resident": float(c[p[on_ram]].mean()) if on_ram.any() else 0.0,
                            "ssd_call_share": float(f[layer][~on_ram].sum() / f[layer].sum()),
                            "ram_read_mb": float((f[layer][on_ram] * c[p[on_ram]]).sum() * EXPERT_PARAMS / 8e6),
                            "distortion": float((w[layer][on_ram] * d[p[on_ram]]).sum() / w[layer].sum())})
             plan.append(opts)
-        return plan, report, np.array([[o == "orig" for o in opts] for opts in plan])
+        return plan, report, np.array([[o == ssd_name for o in opts] for opts in plan])
 
     # an SSD expert costs its cache misses, modeled as calls more than `horizon` tokens after the previous one. The
     # model is optimistic for a shared LRU (misses come in bursts), so the horizon is the largest one whose plan still
@@ -169,6 +181,9 @@ def main() -> None:
     mean = lambda k: np.mean([x[k] for x in report])  # noqa: E731
     print(f"CPU tier reads {sum(x['ram_read_mb'] for x in report):.0f} MB per token "
           f"({sum(x['ram_read_mb'] for x in report) / 47.5:.1f} ms at 47.5 GB/s)")
+    if cli.fallback:
+        print(f"fallback {cli.fallback}: distortion of the cache misses {mean('fallback_distortion'):.4f} on the calibration "
+              f"trace; if nothing were cached {np.mean([(w[i][on_ssd[i]].sum() * fb[1] / w[i].sum()) for i in range(len(f))]):.4f}")
     print(f"{cli.name}: SSD budget {ssd_reads:.3f} reads/layer/token, RAM {mean('ram_bpw_all'):.3f} bpw "
           f"(resident {mean('ram_bpw_resident'):.3f}), SSD call share {mean('ssd_call_share'):.3f}, "
           f"distortion {mean('distortion'):.4f} (sensitivity-weighted "

@@ -105,3 +105,25 @@ def test_tiered_moe_matches_the_sum_over_reference_experts(tmp_path, monkeypatch
         assert 0 < len(reads) < calls  # some experts were read, some came from the cache
     finally:
         torch.set_default_dtype(prev)
+
+
+def test_cache_reads_unwaited_experts_in_the_background(tmp_path):
+    rng = np.random.default_rng(1)
+    data = write_checkpoint(tmp_path, {
+        f"layers.0.ffn.experts.{e}.{w}.{part}": rng.integers(0, 256, (out, k // per_byte), dtype=np.uint8)
+        for e in range(3) for w, (out, k) in SHAPES.items() for part, per_byte in (("scale", m.fp4_block_size), ("weight", 2))})
+    reader = ssd.ExpertReader(Checkpoint(str(tmp_path)), chunk=64 * 1024)
+    cache = ssd.ExpertCache(reader, 1, 3, tc.DIM, tc.INTER, tc.LIMIT, slots=2, lam=0.1, device="cpu", scratch=TOPK, background=2)
+
+    def holds(slot: int, e: int) -> bool:
+        want = [data[f"layers.0.ffn.experts.{e}.{w}.{part}"].ravel() for part in ("scale", "weight") for w in SHAPES]
+        return np.array_equal(cache.store[slot].numpy(), np.concatenate(want))
+
+    slots, pending = cache.request(0, [0, 1], 0, wait=[False, False])
+    assert slots == [None, None] and not pending  # nothing is waited for, the token goes on without them
+    reader.reader.wait()  # (the background reads complete)
+    slots, pending = cache.request(0, [0, 1], 1, wait=[False, False])
+    assert not pending and all(holds(slot, e) for slot, e in zip(slots, (0, 1)))
+    slots, pending = cache.request(0, [2, 0], 2, wait=[True, False])  # a waited expert is read as before
+    cache.finish(pending)
+    assert len(pending) == 1 and holds(slots[0], 2) and holds(slots[1], 0)
