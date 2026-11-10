@@ -13,7 +13,11 @@ ORIG_BYTES = EXPERT_PARAMS * 4.25 / 8  # FP4 + e8m0 scale per 32, read straight 
 # RAM option -> (bpw incl. the fp16 step per group, its layer-10 probe in data/gptq_L10.json: GPTQ without unbiasing,
 # which beats H-metric unbiasing at every width); ternary packs 5 per byte
 RAM_OPTIONS = {"1b128": (1.125, "gptq1_g128_ubnone"), "t128": (1.725, "gptqt_g128_ubnone"),
-               "2b128": (2.125, "gptq2_g128_ubnone"), "3b128": (3.125, "gptq3_g128_ubnone")}
+               "2b128": (2.125, "gptq2_g128_ubnone"), "3b128": (3.125, "gptq3_g128_ubnone"),
+               # vector codes (quant.gptq_vq) with one fp16 scale per row: v<columns per code>c<code bits>
+               "v16c8": (0.503, "vq16c8_rowls"), "v8c8": (1.003, "vq8c8_rowls"), "v4c6": (1.503, "vq4c6_row"),
+               "v4c8": (2.003, "vq4c8_row"), "v2c5": (2.503, "vq2c5_row"), "v2c6": (3.003, "vq2c6_row"),
+               "v2c7": (3.503, "vq2c7_row")}
 
 
 def allocate(w: np.ndarray, f: np.ndarray, d: np.ndarray, c: np.ndarray, ram: float, ssd: float) -> np.ndarray:
@@ -86,7 +90,7 @@ def main() -> None:
     ap.add_argument("--global-budget", action="store_true", help="share RAM and SSD across layers, not per layer")
     ap.add_argument("--layer-weights", action="store_true", help="weight distortion by measured layer sensitivity")
     ap.add_argument("--ram-bpw", type=float, default=1.10, help="RAM for routed experts, as bpw over all of them")
-    ap.add_argument("--options", default=",".join(RAM_OPTIONS))
+    ap.add_argument("--options", default="1b128,t128,2b128,3b128")
     ap.add_argument("--name", required=True)
     cli = ap.parse_args()
     names = cli.options.split(",")
