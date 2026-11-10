@@ -62,6 +62,14 @@ class Checkpoint:
                 done += n
         return buf.view(ST_DTYPES[info["dtype"]]).reshape(info["shape"])
 
+    def extent(self, names: list[str]) -> tuple[str, int, int]:
+        """(shard path, file offset, byte count) of tensors stored back to back in one shard, in this order."""
+        path = self.path(names[0])
+        header, data_start = self._header(path)
+        spans = [header[n]["data_offsets"] for n in names]
+        assert all(self.path(n) == path for n in names) and all(a[1] == b[0] for a, b in zip(spans, spans[1:])), names
+        return path, data_start + spans[0][0], spans[-1][1] - spans[0][0]
+
     def module_state(self, prefix: str, skip: tuple[str, ...] = ()) -> dict[str, torch.Tensor]:
         """Tensors under `prefix`, keyed relative to it, converted as upstream convert.py does for one rank:
         wo_a is dequantized from fp8 to bf16 and routed-expert int8 storage is reinterpreted as packed fp4."""

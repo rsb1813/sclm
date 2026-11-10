@@ -1,4 +1,5 @@
-# ctypes binding of the CPU engine (engine/core.cpp): a layer's RAM-tier experts computed from its sclm-vq-1 file.
+# ctypes binding of the engine core: a layer's RAM-tier experts computed from its sclm-vq-1 file (engine/core.cpp),
+# and the SSD tier's file reader and cache policy (engine/ssd.cpp).
 import ctypes as C
 import json
 import os
@@ -24,6 +25,15 @@ def _dll():
                                    C.c_void_p, C.c_int, C.c_void_p, C.c_int]
     lib.sclm_layer_free.argtypes = [C.c_void_p]
     lib.sclm_layer_forward.argtypes = [C.c_void_p, C.POINTER(Expert), C.c_void_p, C.c_int, C.c_void_p, C.c_void_p]
+    lib.sclm_reader_new.restype = C.c_void_p
+    lib.sclm_reader_new.argtypes = [C.POINTER(C.c_wchar_p), C.c_int, C.c_int]
+    lib.sclm_reader_free.argtypes = [C.c_void_p]
+    lib.sclm_reader_submit.argtypes = [C.c_void_p, C.c_int, C.c_uint64, C.c_uint64, C.c_void_p]
+    lib.sclm_reader_wait.argtypes = [C.c_void_p]
+    lib.sclm_cache_new.restype = C.c_void_p
+    lib.sclm_cache_new.argtypes = [C.c_int, C.c_int, C.c_double]
+    lib.sclm_cache_free.argtypes = [C.c_void_p]
+    lib.sclm_cache_use.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_longlong, C.c_void_p, C.c_void_p]
     return lib
 
 
@@ -58,3 +68,56 @@ class Layer:
     def __del__(self):
         if getattr(self, "handle", None):
             self.lib.sclm_layer_free(self.handle)
+
+
+PAGE = 4096
+
+
+def pages(nbytes: int) -> np.ndarray:
+    """A page-aligned uint8 buffer, as unbuffered reads need."""
+    buf = np.empty(nbytes + PAGE, np.uint8)
+    start = -buf.ctypes.data % PAGE
+    return buf[start:start + nbytes]
+
+
+class Reader:
+    """Unbuffered overlapped reads from the checkpoint shards: nothing passes through the OS file cache."""
+
+    def __init__(self, paths: list, chunk: int = 4 << 20):
+        self.lib = _dll()
+        self.handle = self.lib.sclm_reader_new((C.c_wchar_p * len(paths))(*paths), len(paths), chunk)
+        assert self.handle, "a checkpoint file could not be opened"
+
+    def submit(self, file: int, offset: int, nbytes: int, dst: np.ndarray) -> int:
+        """Starts reading bytes [offset, offset + nbytes) of paths[file] into dst (from pages(), nbytes + 2 pages or
+        more, alive until wait returns). Returns where in dst the first byte lands."""
+        assert dst.ctypes.data % PAGE == 0 and dst.nbytes >= nbytes + 2 * PAGE
+        return self.lib.sclm_reader_submit(self.handle, file, offset, nbytes, dst.ctypes.data)
+
+    def wait(self) -> None:
+        failed = self.lib.sclm_reader_wait(self.handle)
+        assert failed == 0, f"{failed} reads failed"
+
+    def __del__(self):
+        if getattr(self, "handle", None):
+            self.lib.sclm_reader_free(self.handle)
+
+
+class Cache:
+    """Which SSD-tier experts the VRAM cache holds: LRFU over every expert's history, with bypass."""
+
+    def __init__(self, n_keys: int, slots: int, lam: float):
+        self.lib = _dll()
+        self.handle = self.lib.sclm_cache_new(n_keys, slots, lam)
+
+    def use(self, keys: list, t: int) -> tuple[np.ndarray, np.ndarray]:
+        """One layer's SSD-tier experts at token t -> (slot each is computed from, whether it has to be read first).
+        Slots past the cache size are scratch (the expert is not kept)."""
+        k, slot, miss = np.asarray(keys, np.int32), np.empty(len(keys), np.int32), np.empty(len(keys), np.int32)
+        self.lib.sclm_cache_use(self.handle, k.ctypes.data, len(k), t, slot.ctypes.data, miss.ctypes.data)
+        return slot, miss.astype(bool)
+
+    def __del__(self):
+        if getattr(self, "handle", None):
+            self.lib.sclm_cache_free(self.handle)
+
