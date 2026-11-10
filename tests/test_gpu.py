@@ -113,3 +113,32 @@ def test_hyper_connection_steps_match_upstream_block():
 
     x = rand(1, 1, dim).to(torch.bfloat16)
     close(gpu.hc_post(x, h, post.flatten().contiguous(), comb.flatten().contiguous()), m.Block.hc_post(None, x, h, post, comb))
+
+
+def test_sparse_attn_matches_upstream():
+    g = torch.Generator(device=DEV).manual_seed(4)
+    heads, d, win, more = 8, 64, 16, 40
+    rand = lambda *shape: torch.randn(*shape, generator=g, device=DEV, dtype=torch.float32)  # noqa: E731
+    q, window, compressed = (rand(*shape).to(torch.bfloat16) for shape in ((heads, d), (win, d), (more, d)))
+    sink = rand(heads)
+    idx = torch.cat([torch.arange(win, device=DEV), win + torch.randperm(more, generator=g, device=DEV)[:24]]).int()
+    idx[3], idx[20] = -1, -1  # empty slots
+    for use in (idx, torch.full_like(idx, -1)):  # the second: nothing to attend to, the output is zero
+        want = kernel.sparse_attn(q.view(1, 1, heads, d), torch.cat([window, compressed])[None], sink, use.view(1, 1, -1), d**-0.5)
+        close(gpu.sparse_attn(q.flatten(), window, compressed, use, sink, heads, win, d**-0.5), want)
+
+
+def test_fp8_expert_matches_upstream_expert():
+    g = torch.Generator(device=DEV).manual_seed(5)
+    dim, inter, limit = 512, 256, 10.0
+    m.default_dtype = torch.float8_e4m3fn
+    expert = m.Expert(dim, inter, swiglu_limit=limit).to(DEV)
+    with torch.no_grad():
+        for lin in (expert.w1, expert.w2, expert.w3):
+            weight, scale = rand_fp8(g, *lin.weight.shape)
+            lin.weight.copy_(weight)
+            lin.scale.copy_(scale)
+    x = (3 * torch.randn(1, dim, generator=g, device=DEV, dtype=torch.float32)).to(torch.bfloat16)
+    y = torch.zeros(dim, dtype=torch.float32, device=DEV)
+    gpu.fp8_expert(expert, limit, gpu.act_quant(x), y)
+    close(y, expert(x))

@@ -41,7 +41,7 @@ class TieredMoE(nn.Module):
             t2 = perf_counter()
             self.cache.finish(pending)
             t3 = perf_counter()
-            if ssd and gpu.active:  # straight from the slots' FP4 bytes
+            if gpu.active:  # straight from the slots' FP4 bytes
                 xq = gpu.act_quant(x[r])
                 for k, slot in zip(ssd, slots):
                     gpu.fp4_expert(self.cache.store[slot], self.dim, self.inter, self.limit, xq, gates[r][k], y[r])
@@ -56,5 +56,8 @@ class TieredMoE(nn.Module):
             stats["ssd_calls"] += len(ssd)
             stats["reads"] += len(pending)
             t1 = t4
-        y += self.shared_experts(x)
+        if gpu.active and len(rows) == 1:
+            gpu.fp8_expert(self.shared_experts, self.limit, xq, y[0])
+        else:
+            y += self.shared_experts(x)
         return y.type_as(x).view(shape)

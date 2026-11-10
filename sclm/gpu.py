@@ -20,6 +20,11 @@ def lib():
         _lib.sclm_gpu_hc_mixes.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int, C.c_float, C.c_float, C.c_int]
         _lib.sclm_gpu_hc_pre_norm.argtypes = [C.c_void_p] * 4 + [C.c_int, C.c_int, C.c_float]
         _lib.sclm_gpu_hc_post.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int]
+        _lib.sclm_gpu_fp8_expert.argtypes = [C.c_void_p] * 6 + [C.c_int, C.c_int, C.c_float, C.c_void_p, C.c_void_p]
+        _lib.sclm_gpu_attn_q.argtypes = [C.c_void_p] * 9 + [C.c_int] * 5 + [C.c_float]
+        _lib.sclm_gpu_attn_kv.argtypes = [C.c_void_p] * 6 + [C.c_int] * 3 + [C.c_float]
+        _lib.sclm_gpu_sparse_attn.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float]
+        _lib.sclm_gpu_attn_out.argtypes = [C.c_void_p] * 7 + [C.c_int] * 6
     return _lib
 
 
@@ -79,4 +84,60 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
     assert post.is_contiguous() and comb.is_contiguous() and comb.numel() == hc * hc
     out = torch.empty(hc, dim, dtype=torch.bfloat16, device=x.device)
     _check(lib().sclm_gpu_hc_post(x.data_ptr(), residual.data_ptr(), post.data_ptr(), comb.data_ptr(), out.data_ptr(), dim, hc))
+    return out
+
+
+def fp8_expert(expert, limit: float, xq: torch.Tensor, y: torch.Tensor) -> None:
+    """y (fp32 [dim]) += an upstream Expert with fp8 weights (the shared expert) on the layer input quantized as xq."""
+    w1, w2, w3 = expert.w1.weight, expert.w2.weight, expert.w3.weight
+    assert xq.dtype == y.dtype == torch.float32 and xq.numel() == y.numel() == w1.size(1)
+    _check(lib().sclm_gpu_fp8_expert(w1.data_ptr(), w1.scale.data_ptr(), w2.data_ptr(), w2.scale.data_ptr(), w3.data_ptr(),
+                                     w3.scale.data_ptr(), w1.size(1), w1.size(0), limit, xq.data_ptr(), y.data_ptr()))
+
+
+def attn_q(wq_a, norm_weight: torch.Tensor, wq_b, x: torch.Tensor, freqs: int, heads: int, head_dim: int, rd: int,
+           eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """The query side of upstream Attention.forward for one token x (bf16 [dim]): (qr [rank], q [heads * head_dim]),
+    q carrying the rotary embedding. wq_a and wq_b are upstream fp8 Linears; freqs is the address of the position's
+    row of freqs_cis."""
+    assert x.dtype == torch.bfloat16 and x.is_contiguous()
+    rank = wq_a.weight.size(0)
+    qr = torch.empty(rank, dtype=torch.bfloat16, device=x.device)
+    q = torch.empty(heads * head_dim, dtype=torch.bfloat16, device=x.device)
+    _check(lib().sclm_gpu_attn_q(wq_a.weight.data_ptr(), wq_a.scale.data_ptr(), norm_weight.data_ptr(), wq_b.weight.data_ptr(),
+                                 wq_b.scale.data_ptr(), x.data_ptr(), freqs, qr.data_ptr(), q.data_ptr(), x.numel(), rank,
+                                 heads, head_dim, rd, eps))
+    return qr, q
+
+
+def attn_kv(wkv, norm_weight: torch.Tensor, x: torch.Tensor, freqs: int, kv: torch.Tensor, rd: int, eps: float) -> None:
+    """Writes one token's key/value (upstream Attention._window_kv: projected, normed, rotated, fp8-quantized) into
+    kv, its slot of the window ring (bf16 [head_dim])."""
+    assert x.dtype == kv.dtype == torch.bfloat16 and x.is_contiguous() and kv.is_contiguous()
+    _check(lib().sclm_gpu_attn_kv(wkv.weight.data_ptr(), wkv.scale.data_ptr(), norm_weight.data_ptr(), x.data_ptr(), freqs,
+                                  kv.data_ptr(), x.numel(), kv.numel(), rd, eps))
+
+
+def sparse_attn(q: torch.Tensor, window: torch.Tensor, compressed: torch.Tensor, idx: torch.Tensor, sink: torch.Tensor,
+                heads: int, win: int, scale: float) -> torch.Tensor:
+    """upstream sparse_attn for one token: q (bf16 [heads * d]) over the positions idx (int32) names, a position below
+    `win` in `window` ([win, d]) and the rest in `compressed` ([.., d]), -1 for none -> bf16 [heads * d]."""
+    assert q.dtype == window.dtype == compressed.dtype == torch.bfloat16 and idx.dtype == torch.int32 and sink.dtype == torch.float32
+    assert q.is_contiguous() and window.is_contiguous() and compressed.is_contiguous() and idx.is_contiguous()
+    out = torch.empty_like(q)
+    _check(lib().sclm_gpu_sparse_attn(q.data_ptr(), window.data_ptr(), compressed.data_ptr(), idx.data_ptr(), sink.data_ptr(),
+                                      out.data_ptr(), heads, q.numel() // heads, idx.numel(), win, scale))
+    return out
+
+
+def attn_out(o: torch.Tensor, freqs: int, wo_a_weight: torch.Tensor, wo_a_scale: torch.Tensor, wo_b, heads: int, rd: int,
+             groups: int) -> torch.Tensor:
+    """The output side of upstream Attention.forward for one token: o (bf16 [heads * head_dim], changed in place)
+    -> bf16 [dim]. wo_a is fp8 with block scales, block-diagonal over `groups`; wo_b an upstream fp8 Linear."""
+    assert o.dtype == torch.bfloat16 and o.is_contiguous()
+    dim = wo_b.weight.size(0)
+    out = torch.empty(dim, dtype=torch.bfloat16, device=o.device)
+    _check(lib().sclm_gpu_attn_out(o.data_ptr(), freqs, wo_a_weight.data_ptr(), wo_a_scale.data_ptr(), wo_b.weight.data_ptr(),
+                                   wo_b.scale.data_ptr(), out.data_ptr(), heads, o.numel() // heads, rd, groups,
+                                   wo_a_weight.size(0), dim))
     return out

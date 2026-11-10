@@ -67,27 +67,25 @@ def kernel_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
 
 
 class HostAttention(m.Attention):
-    """upstream Attention; decoding one token with the kernels on, the output projection reads wo_a as stored
-    (Fp8Weight) through the engine's grouped kernel instead of widening it."""
+    """upstream Attention; decoding one token with the kernels on, the engine computes the query, the token's
+    key/value, the attention itself and the output projection (wo_a read as stored, see Fp8Weight). The compressed
+    KV and its index stay upstream's code."""
 
     def forward(self, x: torch.Tensor, start_pos: int):
         if not (gpu.active and x.size(0) * x.size(1) == 1):
             return super().forward(x, start_pos)
-        bsz, seqlen, _ = x.size()  # upstream's forward up to the output projection
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-        rd = self.rope_head_dim
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        m.apply_rotary_emb(q[..., -rd:], freqs_cis)
-        kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+        rd, win, heads = self.rope_head_dim, self.window_size, self.n_local_heads
+        freqs = self.freqs_cis.data_ptr() + start_pos * rd * 4  # the position's row: rd / 2 complex64
+        token = x.contiguous()
+        qr, q = gpu.attn_q(self.wq_a, self.q_norm.weight, self.wq_b, token, freqs, heads, self.head_dim, rd, self.eps)
+        gpu.attn_kv(self.wkv, self.kv_norm.weight, token, freqs, self.window_kv_cache[0, start_pos % win], rd, self.eps)
+        idxs, compressed = m.get_window_topk_idxs(win, 1, 1, start_pos).view(-1), self.window_kv_cache
         if self.compress_ratio:
-            compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
-            kv = torch.cat([kv, compress_kv], dim=1)
-            topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
-        o = m.sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
-        m.apply_rotary_emb(o[..., -rd:], freqs_cis, True)
-        o = gpu.fp8_linear(o.contiguous(), self.wo_a.fp8, self.wo_a.scale, self.n_local_groups)
-        return self.wo_b(o.view(bsz, seqlen, -1))
+            compressed, compress_idxs = self._compress_kv(x, qr.view(1, 1, -1), start_pos, win)
+            idxs = torch.cat([idxs, compress_idxs.view(-1)])
+        o = gpu.sparse_attn(q, self.window_kv_cache, compressed, idxs, self.attn_sink, heads, win, self.softmax_scale)
+        out = gpu.attn_out(o, freqs, self.wo_a.fp8, self.wo_a.scale, self.wo_b, heads, rd, self.n_local_groups)
+        return out.view(1, 1, -1)
 
 
 class HostBlock(m.Block):
