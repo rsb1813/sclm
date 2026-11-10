@@ -65,3 +65,11 @@ def test_saved_layer_reproduces_the_weights(tmp_path):
                     c = codes.untile_codes(buf[k], scales.size(1), mod.codes.size(1), bits)
                     w = quant.vq_codes_dequant(c.long(), scales[k].float().unsqueeze(-1), cb)
                     assert torch.equal(w, mod.weight_dequant().cpu())
+
+    loaded = codes.load_layer(path, DEV)
+    assert sorted(loaded) == [e for e, o in enumerate(plan) if o != "orig"]
+    for e, mods in loaded.items():
+        for name, mod in zip(("w1", "w2", "w3"), mods):
+            ref = getattr(experts[e], name)
+            x = torch.randn(3, mod.rot.signs.numel(), device=DEV)
+            assert torch.equal(mod.weight_dequant(), ref.weight_dequant()) and torch.equal(mod(x), ref(x))

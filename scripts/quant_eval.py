@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 
 from sclm import quant
 from sclm.checkpoint import Checkpoint
-from sclm.codes import save_layer
+from sclm.codes import load_layer, save_layer
 from sclm.layerwise import LayerwiseRunner, load_args, load_params_
 from sclm.upstream import model as m
 
@@ -42,7 +42,9 @@ CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had"
            # per-expert GPTQ option or the original FP4 expert (the SSD tier) from scripts/allocate_tiers.py
            "tier20": ("gptq_alloc", "tier20", False), "tier20g": ("gptq_alloc", "tier20g", False),
            "tier20v": ("gptq_alloc", "tier20v", False), "tier20v110": ("gptq_alloc", "tier20v110", False),
-           "tier20v100": ("gptq_alloc", "tier20v100", False)}
+           "tier20v100": ("gptq_alloc", "tier20v100", False),
+           # the codes a gptq_alloc run saved (--codes DIR): no calibration, the experts not in a file stay original
+           "codes": "codes"}
 # GPTQ storage options: name -> (bits, levels, group); "orig" keeps the original FP4 expert
 GPTQ_OPTIONS = {"1b128": (1, 2, 128), "t128": (2, 3, 128), "2b128": (2, 4, 128), "2b64": (2, 4, 64),
                 "3b64": (3, 8, 64), "3b128": (3, 8, 128)}
@@ -67,6 +69,15 @@ def dense_experts_(block) -> None:
     for expert in block.ffn.experts:
         for name in ("w1", "w2", "w3"):
             setattr(expert, name, DenseFP4Linear(getattr(expert, name)))
+
+
+def coded_experts_(layer: int, block, codes_dir: str, tables: bool) -> None:
+    """Replaces the routed experts found in the layer's saved code file (sclm/codes.py) by their VQLinear modules.
+    tables: they sum int8 tables as the engine does instead of an fp32 GEMM."""
+    for e, mods in load_layer(os.path.join(codes_dir, f"layer_{layer:02d}.safetensors"), DEV).items():
+        for name, mod in zip(("w1", "w2", "w3"), mods):
+            mod.tables = tables
+            setattr(block.ffn.experts[e], name, mod)
 
 
 def act_q(x: torch.Tensor) -> torch.Tensor:
@@ -451,6 +462,8 @@ def main() -> None:
     ap.add_argument("--calib-extra", help="token set (e.g. calib_v2, disjoint from calib_v1) added to that pool")
     ap.add_argument("--checkpoint-every", type=int, help="GPTQ configs: save the state between layers to "
                     "data/ckpt_<tag>.pt every this many layers, and resume from that file when it exists")
+    ap.add_argument("--codes", help="config codes: directory with each layer's saved codes")
+    ap.add_argument("--tables", action="store_true", help="config codes: int8 table sums as the engine computes them")
     ap.add_argument("--save-codes", help="gptq_alloc configs with vector options: directory for each layer's codes "
                     "(sclm/codes.py), the allocation and the evaluation result")
     cli = ap.parse_args()
@@ -463,6 +476,8 @@ def main() -> None:
     cfg = CONFIGS[cli.config]
     if cfg == "dense":
         before_block = lambda i, block: dense_experts_(block)  # noqa: E731
+    elif cfg == "codes":
+        before_block = lambda i, block: coded_experts_(i, block, cli.codes, cli.tables)  # noqa: E731
     elif isinstance(cfg, tuple) and cfg[0] == "proj":
         before_block = lambda i, block: project_experts_(i, block, *cfg[1:])  # noqa: E731
     elif isinstance(cfg, tuple) and cfg[0] == "alloc":
@@ -483,6 +498,8 @@ def main() -> None:
     # cannot serve: it was traced before the bf16-operand GEMM change and differs from today's reference path
     routing_path = os.path.join(DATA, "eval_routing_ref.pt")
     before_batch, tag, cur = None, cli.config, {"batch": 0}
+    if cfg == "codes":
+        tag += "_" + os.path.basename(os.path.normpath(cli.codes)) + ("_tables" if cli.tables else "")
     if cli.layers:
         tag += "_L" + cli.layers.replace(":", "-")
     if cli.freeze_routing or cli.record_routing:

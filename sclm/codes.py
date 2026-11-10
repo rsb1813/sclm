@@ -3,6 +3,7 @@ import json
 import os
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 TILE = 256  # rows per tile (bench/vq_gemv.cpp)
@@ -55,3 +56,28 @@ def save_layer(path: str, plan: list, experts, options: dict, rots: dict) -> Non
     meta["options"] = json.dumps(meta["options"])
     save_file(tensors, path + ".tmp", metadata=meta)
     os.replace(path + ".tmp", path)  # a killed run leaves no half-written layer
+
+
+def load_layer(path: str, device: str = "cpu") -> dict:
+    """Inverse of save_layer: expert index -> its (w1, w2, w3) as quant.VQLinear on `device`."""
+    from . import quant
+
+    out = {}
+    with safe_open(path, "pt", device=device) as f:
+        meta = f.metadata()
+        rots = {}
+        for key in (k for k in meta if k.startswith("rot")):
+            k = int(key[3:-len(".block")])
+            rots[k] = quant.BlockHadamard(k, 0, device)
+            rots[k].signs, rots[k].b = f.get_tensor(f"rot{k}.signs").float(), int(meta[key])
+        for opt, (d, bits) in json.loads(meta["options"]).items():
+            codebook = f.get_tensor(f"{opt}.codebook").t().contiguous()
+            mats = {name: (f.get_tensor(f"{opt}.{name}.codes"), f.get_tensor(f"{opt}.{name}.scales")) for name in ("w1", "w2", "w3")}
+            for i, e in enumerate(f.get_tensor(f"{opt}.experts").tolist()):
+                mods = []
+                for codes, scales in mats.values():
+                    n = scales.size(1)
+                    k = next(k for k in rots if k != n) if len(rots) > 1 else n  # a matrix maps one width to the other
+                    mods.append(quant.VQLinear(untile_codes(codes[i], n, k // d, bits), scales[i].float().view(-1, 1), codebook, rots[k]))
+                out[e] = tuple(mods)
+    return out

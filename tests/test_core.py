@@ -63,6 +63,11 @@ def test_layer_forward_matches_the_reference_expert(tmp_path):
                         for es in (experts, tabled))
             y = torch.from_numpy(layer.forward(ids, gates.tolist(), x.float().numpy()[0]))
             assert rel(y, emu) < 1e-9, ids  # code layout, rotation, FP8 and bf16 rounding all as the reference
+            for e in ids:  # the evaluation's batched table path is the same emulation, several tokens at once
+                mod, xs = experts[e].w1, torch.cat([x, 2 * x, -x])
+                mod.tables = True
+                assert torch.equal(mod(xs).float(), torch.cat([table_linear(mod, v[None]) for v in xs]).float())
+                mod.tables = False
             assert rel(y, ref) < 1e-2, ids  # what the int8 tables cost at this toy size
             for threads in (2, 5, 1):  # the same bits however the tiles are shared out
                 core.set_threads(threads)

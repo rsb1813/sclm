@@ -306,6 +306,9 @@ class RTNLinear(torch.nn.Module):
         return F.linear(xq, self.weight_dequant()).to(torch.get_default_dtype())
 
 
+TABLE_GATHER = 1 << 30  # table entries gathered at once by VQLinear's table path (one byte each)
+
+
 class VQLinear(RTNLinear):
     """RTNLinear's drop-in role for gptq_vq's output: one code byte per codebook vector, one fp16 scale per row (or
     per group) and the codebook [C <= 256, d] the layer's experts share, in the block-Hadamard-rotated basis."""
@@ -320,6 +323,30 @@ class VQLinear(RTNLinear):
 
     def weight_dequant(self) -> torch.Tensor:
         return vq_codes_dequant(self.codes.long(), self.scales.float(), self.codebook)
+
+    tables = False  # True: forward sums int8 tables as the engine does (engine/vq_kernel.h), not an fp32 GEMM
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.tables:
+            return super().forward(x)
+        from . import upstream  # noqa: F401  (puts kernel on sys.path)
+        import kernel
+
+        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+        xr = self.rot.rotate(xq.float().reshape(-1, xq.size(-1)))
+        cb, g = self.codebook.float(), self.codes.size(1)
+        # per token, table[step][code] = <codebook[code], the step's inputs> as int8 on one scale; a row's product is
+        # the sum of its codes' entries
+        index = (self.codes.long() + cb.size(0) * torch.arange(g, device=xr.device)).reshape(-1)
+        out = []
+        for part in xr.split(max(1, TABLE_GATHER // index.numel())):
+            t = part.view(part.size(0), g, -1) @ cb.t()
+            scale = t.abs().amax((1, 2)) / 127
+            entries = torch.round(t * (1 / scale)[:, None, None]).to(torch.int8).flatten(1)
+            sums = entries[:, index].view(part.size(0), -1, g).sum(-1, dtype=torch.int32)
+            out.append(sums.float() * scale[:, None])
+        y = torch.cat(out) * self.scales.float().view(-1)
+        return y.view(*x.shape[:-1], -1).to(torch.get_default_dtype())
 
 
 def kmeanspp_init(x: torch.Tensor, n_codes: int, seed: int = 0, max_points: int = 64) -> torch.Tensor:

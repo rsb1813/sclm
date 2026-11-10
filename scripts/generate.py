@@ -27,6 +27,7 @@ def main() -> None:
     ap.add_argument("--raw", action="store_true", help="continue the prompt as plain text, without the chat template")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--max-seq-len", type=int, default=1024)
+    ap.add_argument("--min-ram-margin", type=float, default=1.0, help="GiB of RAM that must stay free after loading")
     ap.add_argument("--name", default="stage3")
     cli = ap.parse_args()
 
@@ -44,6 +45,13 @@ def main() -> None:
     net = host.build_net(args, tok)
     host.load_checkpoint_(net, ck)
     out["resident_gib"] = torch.cuda.memory_allocated() / GIB
+    # the code files go into RAM whole: stop here rather than push the machine into paging
+    need = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
+    used, total_ram = status.ram()
+    out.update(codes_gib=need, ram_margin_gib=total_ram - used - need)
+    print(f"RAM: {total_ram - used:.1f} GiB available, the codes take {need:.1f} GiB", flush=True)
+    if out["ram_margin_gib"] < cli.min_ram_margin:
+        raise SystemExit(f"only {out['ram_margin_gib']:.1f} GiB of RAM would be left (--min-ram-margin {cli.min_ram_margin})")
     cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam)
     out.update(load_s=time.perf_counter() - t0, allocated_gib=torch.cuda.memory_allocated() / GIB,
                ram_used_loaded_gib=status.ram()[0])
