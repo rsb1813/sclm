@@ -50,6 +50,19 @@ def test_layer_major_batches_match_single_runs(runner):
     assert torch.equal(both[1], runner.hidden(b, n_layers=4).cpu())
 
 
+@needs_layer0
+@needs_layers0_3
+def test_resume_from_checkpoint_matches_uninterrupted_run(runner, tmp_path):
+    g = torch.Generator().manual_seed(0)
+    a, b = (torch.randint(1000, 100000, (1, 512), generator=g) for _ in range(2))
+    path = str(tmp_path / "state.pt")
+    # every=3: the file holds the cross-layer state layer 2 published for layer 3
+    full = runner.hidden_batches([a, b], n_layers=4, checkpoint=path, every=3)
+    seen = []
+    resumed = runner.hidden_batches([a, b], n_layers=4, before_block=lambda i, _block: seen.append(i), checkpoint=path)
+    assert seen == [3] and all(torch.equal(x, y) for x, y in zip(full, resumed))
+
+
 @needs_layers0_3
 def test_mapped_engram_matches_direct_gather():
     """Threaded, deduplicated row reads must equal a plain per-row gather, including repeated indices."""

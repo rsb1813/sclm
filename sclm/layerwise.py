@@ -1,6 +1,7 @@
 # Runs the upstream model one block at a time, so a checkpoint far larger than VRAM can do full-sequence forwards.
 import gc
 import json
+import os
 from typing import Callable
 
 import torch
@@ -99,26 +100,34 @@ class LayerwiseRunner:
         n_layers: int | None = None,
         before_block: Callable[[int, "m.Block"], None] | None = None,
         before_batch: Callable[[int, int], None] | None = None,
+        checkpoint: str | None = None,
+        every: int = 4,
     ) -> list[torch.Tensor]:
         """Like hidden() for each batch of input ids, returned on CPU, but every block is loaded once and run over
-        all batches. `before_batch(layer_id, batch_index)` runs before each batch passes through a block."""
+        all batches. `before_batch(layer_id, batch_index)` runs before each batch passes through a block.
+        `checkpoint`: a file that receives the state between layers after every `every` of them; when it exists the
+        run resumes from it, so the caller names it after everything the state depends on and removes it when done
+        (hooks see only the remaining layers)."""
         # upstream creates index tensors without a device and relies on the default device (generate.py sets cuda)
         with torch.device(self.device):
-            return self._hidden_batches(batches, n_layers, before_block, before_batch)
+            return self._hidden_batches(batches, n_layers, before_block, before_batch, checkpoint, every)
 
-    def _hidden_batches(self, batches, n_layers, before_block, before_batch) -> list[torch.Tensor]:
+    def _hidden_batches(self, batches, n_layers, before_block, before_batch, checkpoint, every) -> list[torch.Tensor]:
         args = self.args
-        embed = self.ckpt.get("embed.weight").to(self.device)
-        hashes, hs, mixes, shared = [], [], [], []
-        for ids in batches:
-            ids = ids.to(self.device)
-            hashes.append(self.hash(ids, 0))
-            h = F.embedding(ids, embed).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
-            mixes.append(m.make_identity_pre_mix(h, args.hc_mult))
-            hs.append(h.cpu())
-            shared.append({})
-        del embed
-        for i in range(args.n_layers if n_layers is None else n_layers):
+        n_layers = args.n_layers if n_layers is None else n_layers
+        hashes = [self.hash(ids.to(self.device), 0) for ids in batches]
+        if checkpoint and os.path.exists(checkpoint):
+            start, hs, mixes, shared = torch.load(checkpoint, weights_only=True)
+        else:
+            embed = self.ckpt.get("embed.weight").to(self.device)
+            start, hs, mixes, shared = 0, [], [], []
+            for ids in batches:
+                h = F.embedding(ids.to(self.device), embed).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
+                mixes.append(m.make_identity_pre_mix(h, args.hc_mult))
+                hs.append(h.cpu())
+                shared.append({})
+            del embed
+        for i in range(start, n_layers):
             block = self.build_block(i)
             if before_block is not None:
                 before_block(i, block)
@@ -138,6 +147,9 @@ class LayerwiseRunner:
             del block
             gc.collect()
             torch.cuda.empty_cache()
+            if checkpoint and (i + 1) % every == 0 and i + 1 < n_layers:
+                torch.save((i + 1, hs, mixes, shared), checkpoint + ".tmp")
+                os.replace(checkpoint + ".tmp", checkpoint)
         return [m.Block.hc_pre(None, h.to(self.device), mix).cpu() for h, mix in zip(hs, mixes)]
 
     @torch.inference_mode()
