@@ -43,6 +43,16 @@ CONFIGS = {
     "gptqt_g128_refit": ("gptq", 2, 0.5, "plain", 3, 128, "none", True),
     "gptq2_g128_refit": ("gptq", 2, 0.5, "plain", 4, 128, "none", True),
     "gptq3_g128_refit": ("gptq", 3, 0.5, "plain", 8, 128, "none", True),
+    # optional Hessian estimate for data-starved experts: "n0=N" sets beta per expert to N / (n_eff + N) (Kish
+    # effective count of its weighted tokens), "nb=M,lam=L" adds the tokens that rank the expert 7..6+M, weighted by
+    # L times the gate weight they would have had squared
+    "gptq1_g128_n025": ("gptq", 1, 0.5, "plain", 2, 128, "none", False, "n0=25"),
+    "gptq1_g128_n050": ("gptq", 1, 0.5, "plain", 2, 128, "none", False, "n0=50"),
+    "gptq1_g128_n0100": ("gptq", 1, 0.5, "plain", 2, 128, "none", False, "n0=100"),
+    "gptq1_g128_nb6": ("gptq", 1, 0.5, "plain", 2, 128, "none", False, "nb=6,lam=1"),
+    "gptq1_g128_nb6h": ("gptq", 1, 0.5, "plain", 2, 128, "none", False, "nb=6,lam=0.5"),
+    "gptq2_g128_n050": ("gptq", 2, 0.5, "plain", 4, 128, "none", False, "n0=50"),
+    "gptq2_g128_nb6": ("gptq", 2, 0.5, "plain", 4, 128, "none", False, "nb=6,lam=1"),
 }
 
 
@@ -111,6 +121,13 @@ def main() -> None:
                "nrd": tr_norm(xq[fit].t() @ (omega[fit, None] * xq[fit]))}
     tok_fit = [torch.where(idx[fit] == e) for e in range(N_EXP)]
     tok_ev = [torch.where(idx[ev] == e) for e in range(N_EXP)]
+    # router ranks beyond the top 6 on the fit tokens (routing_trace's selection score), with the gate weight a
+    # neighbor would get if selected: its score over the top-6 score sum, times the route scale
+    scores = F.softplus(x[fit] @ state["gate.weight"].to(DEV).float().t()).sqrt()
+    order = (scores + state["gate.bias"].to(DEV).float()).argsort(-1, descending=True)
+    print(f"router top-6 matches recorded routing: {(order[:, :6].sort(-1)[0] == idx[fit].sort(-1)[0]).all(-1).float().mean():.4f}")
+    gw_nb = scores.gather(1, order[:, 6:18]) / scores.gather(1, order[:, :6]).sum(-1, keepdim=True) * gw[fit].sum(-1).mean()
+    nb_idx = order[:, 6:18]
     xe, gwe = x[ev], gw[ev]
     r_hat = r[ev] / r[ev].norm(dim=-1, keepdim=True)
 
@@ -129,7 +146,24 @@ def main() -> None:
         return y
 
     def compressed(method: str, bits: int, beta, weighting, levels: int | None = None, group: int = GROUP,
-                   ub: str = "fit", refit: bool = False):
+                   ub: str = "fit", refit: bool = False, hess: str = ""):
+        opt = dict(kv.split("=") for kv in hess.split(",")) if hess else {}
+        n0, m, lam = float(opt.get("n0", 0)), int(opt.get("nb", 0)), float(opt.get("lam", 1))
+        assert not (refit and opt), "the refit builds its token sets from the routed tokens only"
+
+        def tokens(e: int):  # absolute positions, gate weights, Hessian weight multipliers (lam for neighbors)
+            rows, slot = tok_fit[e]
+            pos, gt = fit[rows], gw[fit[rows], slot]
+            lw = torch.ones(rows.numel(), device=DEV, dtype=torch.float32)
+            if m:
+                r2, s2 = torch.where(nb_idx[:, :m] == e)
+                pos, gt = torch.cat([pos, fit[r2]]), torch.cat([gt, gw_nb[r2, s2]])
+                lw = torch.cat([lw, torch.full((r2.numel(),), lam, device=DEV, dtype=torch.float32)])
+            return pos, gt, lw
+
+        def mix(wt: torch.Tensor) -> float:  # shrinkage toward the prior falls as the effective token count grows
+            return float(n0 / (wt.sum() ** 2 / wt.pow(2).sum().clamp_min(1e-30) + n0)) if n0 else beta
+
         rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (5120, 2304)}
         eye = torch.eye(2304, device=DEV, dtype=torch.float32)
         ub1, ub2 = (h_layer[weighting], eye) if ub == "prior" else (ub, ub)
@@ -142,13 +176,14 @@ def main() -> None:
             w1, w2, w3 = (torch.stack([w[j] for w in ws]) for j in range(3))
             h1 = None
             if method == "gptq":
-                h1 = []
+                h1, betas = [], []
                 for e in es:
-                    rows, slot = tok_fit[e]
-                    xr = xq[fit[rows]]
-                    wt = gw[fit[rows], slot].pow(2) * (omega[fit[rows]] if weighting == "nrd" else 1.0)
-                    h_e = tr_norm(xr.t() @ (wt[:, None] * xr)) if rows.numel() else h_layer[weighting]
-                    h1.append((1 - beta) * h_e + beta * h_layer[weighting])
+                    pos, gt, lw = tokens(e)
+                    xr = xq[pos]
+                    wt = gt.pow(2) * lw * (omega[pos] if weighting == "nrd" else 1.0)
+                    betas.append(mix(wt) if pos.numel() else beta)
+                    h_e = tr_norm(xr.t() @ (wt[:, None] * xr)) if pos.numel() else h_layer[weighting]
+                    h1.append((1 - betas[-1]) * h_e + betas[-1] * h_layer[weighting])
                 h1 = torch.stack(h1)
             sets1 = None
             if refit:
@@ -164,17 +199,17 @@ def main() -> None:
             if method == "gptq":
                 h2 = []
                 for i, e in enumerate(es):
-                    rows, slot = tok_fit[e]
-                    if not rows.numel():
+                    pos, gt, lw = tokens(e)
+                    if not pos.numel():
                         h2.append(eye)
                         if refit:
                             sets2.append([(eye, ones(eye), 1.0)])
                         continue
-                    xr = xq[fit[rows]]
+                    xr = xq[pos]
                     g, u = xr @ w1q[i].t(), (xr @ w3q[i].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-                    hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[fit[rows], slot, None])
-                    wt = omega[fit[rows]] if weighting == "nrd" else torch.ones(rows.numel(), device=DEV, dtype=torch.float32)
-                    h2.append((1 - beta) * tr_norm(hid.t() @ (wt[:, None] * hid)) + beta * eye)
+                    hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gt[:, None])
+                    wt = (omega[pos] if weighting == "nrd" else 1.0) * lw
+                    h2.append((1 - betas[i]) * tr_norm(hid.t() @ (wt[:, None] * hid)) + betas[i] * eye)
                     if refit:
                         sets2.append([(hid, wt, 1 - beta), (eye, ones(eye), beta)])
                 h2 = torch.stack(h2)
