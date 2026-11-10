@@ -160,8 +160,8 @@ class GPTQExperts:
         block.ffn.gate.register_forward_hook(self.on_gate)
 
     def on_gate(self, _mod, inp, out) -> None:
-        if self.cur < self.n_cal:
-            self.store.append((inp[0].detach().to(torch.bfloat16), out[0].float(), out[1]))
+        if self.cur < self.n_cal:  # inputs wait on the CPU: 100K+ calibration tokens would crowd the Hessians out
+            self.store.append((inp[0].detach().to("cpu", torch.bfloat16), out[0].float(), out[1]))
 
     def before_batch(self, i: int, j: int) -> None:
         self.cur = j
@@ -173,14 +173,14 @@ class GPTQExperts:
         from scripts.gptq_probe import tr_norm
 
         t0 = time.time()
-        xq = torch.cat([act_q(s[0]).bfloat16() for s in self.store])  # fp8 values with power-of-two scales: exact
         gw = torch.cat([s[1] for s in self.store])
         idx = torch.cat([s[2] for s in self.store]).long()
-        self.store = []
-        h_layer = 0
-        for chunk in xq.split(8192):  # fp32 accumulation without an fp32 copy of every token
-            chunk = chunk.float()
+        xq, h_layer = [], 0
+        for s in self.store:  # fp8 values with power-of-two scales: exact in bf16; fp32 accumulation per batch
+            chunk = act_q(s[0].to(DEV))
             h_layer = h_layer + chunk.t() @ chunk
+            xq.append(chunk.bfloat16().cpu())
+        xq, self.store = torch.cat(xq), []
         h_layer = tr_norm(h_layer)
         experts = block.ffn.experts
         experts.to("cpu")  # frees ~7GB of FP4 weights for the Hessians; each batch is copied back for its GPTQ
@@ -208,11 +208,12 @@ class GPTQExperts:
         for e0 in range(0, len(members), self.batch):
             es = members[e0 : e0 + self.batch]
             toks = [torch.where(idx == e) for e in es]
+            rows_cpu = [rows.cpu() for rows, _ in toks]
             w1, w2, w3 = (torch.stack([fp4_dense(getattr(experts[e], n).to(DEV)) for e in es])
                           for n in ("w1", "w2", "w3"))
             h1 = []
-            for rows, slot in toks:
-                xr = xq[rows].float()
+            for (rows, slot), rc in zip(toks, rows_cpu):
+                xr = xq[rc].to(DEV).float()
                 h_e = tr_norm(xr.t() @ (gw[rows, slot].pow(2)[:, None] * xr)) if rows.numel() else h_layer
                 h1.append((1 - self.beta) * h_e + self.beta * h_layer)
             h1 = rotate_h(torch.stack(h1), self.rots[5120])
@@ -224,7 +225,7 @@ class GPTQExperts:
                 if not rows.numel():
                     h2.append(eye)
                     continue
-                xr = xq[rows].float()
+                xr = xq[rows_cpu[k]].to(DEV).float()
                 g, u = xr @ q1[k].t(), (xr @ q3[k].t()).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
                 hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[rows, slot, None])
                 h2.append((1 - self.beta) * tr_norm(hid.t() @ hid) + self.beta * eye)
@@ -328,6 +329,7 @@ def main() -> None:
     ap.add_argument("--hedge", type=float, help="T7: hedge the 6th slot with sigma = this x the --flip-stats fit")
     ap.add_argument("--calib-seqs", type=int, help="GPTQ calibration sequences, spread over the non-eval ones "
                     "(default: the 15 of collect_bases.calib_indices)")
+    ap.add_argument("--calib-extra", help="token set (e.g. calib_v2, disjoint from calib_v1) added to that pool")
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)
 
@@ -414,13 +416,20 @@ def main() -> None:
         assert not (cli.freeze_routing or cli.record_routing)
         from scripts.collect_bases import calib_indices
 
+        pool_tokens = tokens
+        if cli.calib_extra:
+            extra = np.load(os.path.join(DATA, cli.calib_extra, "tokens.npz"))["tokens"]
+            pool_tokens = torch.cat([tokens, torch.from_numpy(extra).long()])
+            tag += "_" + cli.calib_extra
         if cli.calib_seqs:
-            pool = [i for i in range(tokens.size(0)) if i % 6 != 3]  # every sequence but the eval ones
-            chosen = pool[:: max(1, len(pool) // cli.calib_seqs)][: cli.calib_seqs]
+            # every sequence but the eval ones
+            pool = [i for i in range(pool_tokens.size(0)) if i >= tokens.size(0) or i % 6 != 3]
+            chosen = [pool[i] for i in np.linspace(0, len(pool) - 1, min(cli.calib_seqs, len(pool))).round().astype(int)]
             tag += f"_cal{len(chosen)}"
         else:
+            assert not cli.calib_extra, "--calib-extra needs --calib-seqs"
             chosen = calib_indices(tokens.size(0), 16)  # 15 sequences, none of them eval
-        cal = list(tokens[chosen].split(2))
+        cal = list(pool_tokens[chosen].split(2))
         n_cal, batches = len(cal), cal + batches
         if cfg[0] == "gptq":
             plan = lambda i: [f"{cfg[1]}b64"] * runner.args.n_routed_experts  # noqa: E731

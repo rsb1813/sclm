@@ -124,7 +124,7 @@ class LayerwiseRunner:
                 before_block(i, block)
             for j in range(len(batches)):
                 for name, value in shared[j].items():
-                    setattr(m.shared_attn, name, value)
+                    setattr(m.shared_attn, name, value.to(self.device))
                 if before_batch is not None:
                     before_batch(i, j)
                 h = hs[j].to(self.device)
@@ -132,8 +132,9 @@ class LayerwiseRunner:
                     h = block.engram(h, hashes[j][:, :, block.engram.layer_hash_index, :], None)
                 h, mixes[j] = block(h, 0, mixes[j], None)
                 hs[j] = h.cpu()
-                # source layers publish their own persistent caches here, which the next batch overwrites: copy
-                shared[j] = {n: v.clone() for n in SHARED_ATTN_FIELDS if (v := getattr(m.shared_attn, n)) is not None}
+                # source layers publish their own persistent caches here, which the next batch overwrites: copy (to
+                # the CPU, so hundreds of calibration batches do not pile up in VRAM)
+                shared[j] = {n: v.to("cpu", copy=True) for n in SHARED_ATTN_FIELDS if (v := getattr(m.shared_attn, n)) is not None}
             del block
             gc.collect()
             torch.cuda.empty_cache()
