@@ -43,6 +43,14 @@ def set_threads(threads: int) -> None:
     _dll().sclm_set_threads(threads)
 
 
+def phase_seconds() -> list:
+    """Seconds the engine has spent so far in each phase of Layer.forward: input quantization and rotation, input
+    tables, w1 and w3, hidden vectors with their tables, w2, sum."""
+    out = (C.c_double * 6)()
+    _dll().sclm_phase_seconds(out)
+    return list(out)
+
+
 class Layer:
     """The quantized routed experts of one layer file (codes.save_layer), held in RAM."""
 

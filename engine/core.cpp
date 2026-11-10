@@ -4,6 +4,7 @@
 #include <malloc.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -102,6 +103,16 @@ struct Pool {
 };
 
 Pool* pool = new Pool(1);
+
+// Seconds spent in each phase of sclm_layer_forward since the process started (a measuring aid).
+double phase_seconds[6];
+struct Phase {
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    void end(int i) {
+        const auto now = std::chrono::steady_clock::now();
+        phase_seconds[i] += std::chrono::duration<double>(now - t).count(), t = now;
+    }
+};
 
 // The reference's activation fake-quant before a quantized GEMM (kernel.act_quant: blocks of 32, power-of-2 scale):
 // a block is scaled so its largest magnitude is at most 448, then rounded to FP8 E4M3.
@@ -257,6 +268,7 @@ __declspec(dllexport) void sclm_set_threads(int threads) {
 // y[dim] = sum of gates[e] * expert e of x[dim] over the n experts (MoE.forward's routed sum for one token).
 __declspec(dllexport) void sclm_layer_forward(SclmLayer* L, const SclmExpert* experts, const float* gates, int n, const float* x, float* y) {
     const int dim = L->dim, inter = L->inter;
+    Phase phase;
     float* xr = L->x.data();
     std::memcpy(xr, x, sizeof(float) * dim);
     fp8_blocks(xr, dim);
@@ -273,13 +285,23 @@ __declspec(dllexport) void sclm_layer_forward(SclmLayer* L, const SclmExpert* ex
         L->slots[e].ex = experts + e, L->slots[e].weight = gates[e];
         if (std::find(L->used.begin(), L->used.end(), experts[e].format) == L->used.end()) L->used.push_back(experts[e].format);
     }
+    phase.end(0);
     pool->run(int(L->used.size()), build_in, L);
+    phase.end(1);
     pool->run(n * 2 * (inter / TILE), in_tile, L);
+    phase.end(2);
     pool->run(n, hidden, L);
+    phase.end(3);
     pool->run(n * (dim / TILE), out_tile, L);
+    phase.end(4);
     std::memset(y, 0, sizeof(float) * dim);
     for (int e = 0; e < n; ++e)  // in call order, as the reference adds them
         for (int i = 0; i < dim; ++i) y[i] += L->slots[e].out[i];
+    phase.end(5);
 }
+
+// out[6] = seconds so far in the phases of sclm_layer_forward: input quantization and rotation, the input tables,
+// w1 and w3, the hidden vectors with their tables, w2, the sum.
+__declspec(dllexport) void sclm_phase_seconds(double* out) { std::memcpy(out, phase_seconds, sizeof(phase_seconds)); }
 
 }  // extern "C"
