@@ -1,5 +1,6 @@
 # SSD tier: a routed expert's original bytes (FP4 weights and their scales) read from the checkpoint into a staging
 # buffer, and the device-memory cache of such experts that the upstream kernels compute from.
+from collections import defaultdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -54,6 +55,7 @@ class ExpertCache:
                  slots: int, lam: float, device, scratch: int):
         self.reader, self.n_experts = reader, n_experts
         self.token = 0  # position of the first token of the forward in progress, set by the host
+        self.stats = defaultdict(float)  # seconds and counts the tiered MoE adds up, for whoever measures
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
