@@ -22,6 +22,7 @@ DEV = "cuda"
 TOPK = 64  # reference distribution kept as its top-64 tokens per position
 CHUNK = 256
 SCALES = (0.9, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3)  # logit multipliers for the oracle-temperature KL diagnostic
+MARGIN_EDGES = torch.logspace(-5, 0, 26)  # bins of the 6th-7th selection-score margin (--flip-stats)
 # name -> (bits, group, hadamard) for routed experts; "none" is the uncompressed reference, "dense" runs the
 # uncompressed FP4 weights through the same fp32 path RTNLinear uses (isolates the GEMM path from compression)
 CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had": (2, 64, True),
@@ -258,6 +259,63 @@ def freeze_routing_(block, layer: int, ref_idx: list, cur: dict) -> None:
     gate.forward = forward
 
 
+def selection(gate, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gate.forward's scores and the bias-shifted ones it picks experts by (the sqrtsoftplus gate of this model)."""
+    assert gate.score_func == "sqrtsoftplus"
+    s = F.softplus(m.linear(x.float(), gate.weight.float()) / gate.gate_temp).sqrt()
+    return s, s + gate.bias
+
+
+def flip_stats_(block, layer: int, ref_idx: list, cur: dict, stats: list) -> None:
+    """Per bin of the model's own 6th-7th selection margin: tokens, and how often the reference picked the own 7th
+    expert but not the own 6th (a boundary flip, design.md T7)."""
+    gate = block.ffn.gate
+
+    def hook(_mod, inp, _out):
+        _, sel = selection(gate, inp[0])
+        top = sel.topk(7, dim=-1)
+        ref = ref_idx[cur["batch"]][:, layer].to(sel.device)
+        in_ref = (ref[:, :, None] == top.indices[:, None, 5:7]).any(1)
+        flip = (in_ref[:, 1] & ~in_ref[:, 0]).double()
+        b = torch.bucketize(top.values[:, 5] - top.values[:, 6], MARGIN_EDGES.to(sel.device))
+        stats[layer][0] += torch.bincount(b, minlength=len(MARGIN_EDGES) + 1).cpu()
+        stats[layer][1] += torch.bincount(b, weights=flip, minlength=len(MARGIN_EDGES) + 1).cpu()
+
+    gate.register_forward_hook(hook)
+
+
+def fit_sigma(n: torch.Tensor, k: torch.Tensor) -> float:
+    """Maximum-likelihood sigma of p(flip | margin) = Phi(-margin / sigma) over margin bins (counts n, flips k)."""
+    e = MARGIN_EDGES.double()
+    centers = torch.cat([e[:1] / 2, (e[1:] * e[:-1]).sqrt(), e[-1:] * 2])
+    best = None
+    for sig in torch.logspace(-6, 0, 241, dtype=torch.float64):
+        p = (0.5 * torch.erfc(centers / (sig * 2**0.5))).clamp(1e-12, 1 - 1e-12)
+        ll = float((k * p.log() + (n - k) * (1 - p).log()).sum())
+        best = max(best or (ll, 0.0), (ll, float(sig)))
+    return best[1]
+
+
+def hedge_routing_(block, layer: int, sigma: float, hedged: torch.Tensor, p_min: float = 0.02) -> None:
+    """T7: route the own 7th expert too and split the 6th slot's weight, (1 - p) to the 6th and p to the 7th, where
+    p = Phi(-margin / sigma) is the chance the 6th-7th order is flipped. Tokens with p < p_min keep top-6."""
+    gate = block.ffn.gate
+
+    def forward(x, image_mask=None):
+        s, sel = selection(gate, x)
+        top = sel.topk(7, dim=-1)
+        w = s.gather(1, top.indices)
+        w = w / (w[:, :6].sum(-1, keepdim=True) + 1e-20) * gate.route_scale  # norm_topk_prob over the top 6
+        p = 0.5 * torch.erfc((top.values[:, 5] - top.values[:, 6]) / (sigma * 2**0.5))
+        p = torch.where(p < p_min, 0.0, p)
+        w[:, 5] *= 1 - p
+        w[:, 6] *= p
+        hedged[layer] += torch.tensor([float((p > 0).sum()), p.numel()], dtype=torch.float64, device="cpu")
+        return w, top.indices
+
+    gate.forward = forward
+
+
 @torch.inference_mode()
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -266,6 +324,8 @@ def main() -> None:
     ap.add_argument("--freeze-routing", action="store_true", help="force the reference model's expert choices")
     ap.add_argument("--record-routing", action="store_true", help="with --config none: save the expert choices")
     ap.add_argument("--layers", help="lo:hi, compress only layers lo..hi-1 (per-block configs; layer sensitivity)")
+    ap.add_argument("--flip-stats", action="store_true", help="T7: boundary-flip rate by margin, fit sigma per layer")
+    ap.add_argument("--hedge", type=float, help="T7: hedge the 6th slot with sigma = this x the --flip-stats fit")
     ap.add_argument("--calib-seqs", type=int, help="GPTQ calibration sequences, spread over the non-eval ones "
                     "(default: the 15 of collect_bases.calib_indices)")
     cli = ap.parse_args()
@@ -318,6 +378,32 @@ def main() -> None:
             else:
                 block.ffn.gate.register_forward_hook(
                     lambda _m, _inp, out: recorded[cur["batch"]].append(out[1].to(torch.int16).cpu()))
+
+        def before_batch(i, j):
+            cur["batch"] = j
+
+    stats = hedged = None
+    if cli.flip_stats or cli.hedge:
+        assert not (cli.freeze_routing or cli.record_routing or (isinstance(cfg, tuple) and cfg[0] in ("gptq", "gptq_alloc")))
+        inner_t7 = before_block
+        n_layers = runner.args.n_layers
+        if cli.flip_stats:
+            tag += "_flips"
+            ref_idx = [torch.stack(layers, 1).long() for layers in torch.load(routing_path, weights_only=True)]
+            stats = [torch.zeros(2, len(MARGIN_EDGES) + 1, dtype=torch.float64) for _ in range(n_layers)]
+        else:
+            tag += f"_hedge{cli.hedge:g}"
+            with open(os.path.join(DATA, f"flips_{cli.config}.json")) as f:
+                sigma = [cli.hedge * sg for sg in json.load(f)["sigma"]]
+            hedged = torch.zeros(n_layers, 2, dtype=torch.float64)
+
+        def before_block(i, block):
+            if inner_t7 is not None:
+                inner_t7(i, block)
+            if stats is not None:
+                flip_stats_(block, i, ref_idx, cur, stats)
+            else:
+                hedge_routing_(block, i, sigma[i], hedged)
 
         def before_batch(i, j):
             cur["batch"] = j
@@ -399,6 +485,14 @@ def main() -> None:
         for i, s in enumerate(per_seq):
             s.update({"kl": float(acc["kl"][i] / acc["n_pos"][i]), "top1": float(acc["agree"][i] / acc["n_pos"][i])})
     result["per_seq"] = per_seq
+    if stats is not None:
+        n, k = torch.stack([st[0] for st in stats]), torch.stack([st[1] for st in stats])
+        sig = [fit_sigma(n[i], k[i]) for i in range(len(stats))]
+        result.update({"flip_rate": float(k.sum() / n.sum()), "sigma": sig})
+        with open(os.path.join(DATA, f"flips_{cli.config}.json"), "w") as f:
+            json.dump({"edges": MARGIN_EDGES.tolist(), "tokens": n.tolist(), "flips": k.tolist(), "sigma": sig}, f)
+    if hedged is not None:
+        result["hedged_share"] = float(hedged[:, 0].sum() / hedged[:, 1].sum())
     with open(os.path.join(DATA, f"eval_{tag}.json"), "w") as f:
         json.dump(result, f, indent=1)
     print(json.dumps(result), flush=True)
