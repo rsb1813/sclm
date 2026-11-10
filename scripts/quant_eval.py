@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shutil
 import time
 import weakref
 
@@ -12,6 +13,7 @@ from transformers import AutoTokenizer
 
 from sclm import quant
 from sclm.checkpoint import Checkpoint
+from sclm.codes import save_layer
 from sclm.layerwise import LayerwiseRunner, load_args, load_params_
 from sclm.upstream import model as m
 
@@ -39,7 +41,8 @@ CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had"
            "gptq2": ("gptq", 2, True), "gptq3": ("gptq", 3, True),
            # per-expert GPTQ option or the original FP4 expert (the SSD tier) from scripts/allocate_tiers.py
            "tier20": ("gptq_alloc", "tier20", False), "tier20g": ("gptq_alloc", "tier20g", False),
-           "tier20v": ("gptq_alloc", "tier20v", False), "tier20v110": ("gptq_alloc", "tier20v110", False)}
+           "tier20v": ("gptq_alloc", "tier20v", False), "tier20v110": ("gptq_alloc", "tier20v110", False),
+           "tier20v100": ("gptq_alloc", "tier20v100", False)}
 # GPTQ storage options: name -> (bits, levels, group); "orig" keeps the original FP4 expert
 GPTQ_OPTIONS = {"1b128": (1, 2, 128), "t128": (2, 3, 128), "2b128": (2, 4, 128), "2b64": (2, 4, 64),
                 "3b64": (3, 8, 64), "3b128": (3, 8, 128)}
@@ -169,10 +172,12 @@ class GPTQExperts:
     `n_tok`: calibration tokens in all (their FFN inputs of the current layer wait in one CPU buffer).
     The calibration batches skip the routed experts (unpacking all 384 for every batch was two thirds of a layer's
     forward time): quantize_ adds each expert's output over all of its tokens at once, and finish_ completes the
-    batches' block outputs."""
+    batches' block outputs. `save_dir`: each layer's codes are written there (sclm/codes.py, vector options only)."""
 
-    def __init__(self, plan, n_cal: int, n_tok: int, unbias: bool, beta: float = 0.5, batch: int = 8):
+    def __init__(self, plan, n_cal: int, n_tok: int, unbias: bool, beta: float = 0.5, batch: int = 8,
+                 save_dir: str | None = None):
         self.plan, self.n_cal, self.unbias, self.beta, self.batch = plan, n_cal, unbias, beta, batch
+        self.save_dir = save_dir
         self.block, self.cur, self.t0 = None, 0, time.time()
         self.xq = torch.empty(n_tok, 5120, dtype=torch.bfloat16, device="cpu")
         self.y = torch.empty(n_tok, 5120, dtype=torch.float32, device="cpu")  # the layer's FFN outputs
@@ -264,6 +269,9 @@ class GPTQExperts:
                                           gw[rows[c : c + TOKEN_CHUNK], slot[c : c + TOKEN_CHUNK], None], rc[c : c + TOKEN_CHUNK])
             else:
                 self.quantize_option_(experts, es, opt, xq, gw, idx, h_layer)
+        if self.save_dir:
+            save_layer(os.path.join(self.save_dir, f"layer_{self.layer:02d}.safetensors"), plan, experts, VQ_OPTIONS,
+                       self.rots)
         experts.to(DEV)
         counts = {o: plan.count(o) for o in dict.fromkeys(plan)}
         print(f"gptq layer {self.layer:2d}: {xq.size(0)} calib tokens, {counts}, {time.time() - t0:.0f}s, "
@@ -443,6 +451,8 @@ def main() -> None:
     ap.add_argument("--calib-extra", help="token set (e.g. calib_v2, disjoint from calib_v1) added to that pool")
     ap.add_argument("--checkpoint-every", type=int, help="GPTQ configs: save the state between layers to "
                     "data/ckpt_<tag>.pt every this many layers, and resume from that file when it exists")
+    ap.add_argument("--save-codes", help="gptq_alloc configs with vector options: directory for each layer's codes "
+                    "(sclm/codes.py), the allocation and the evaluation result")
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)
 
@@ -549,7 +559,10 @@ def main() -> None:
         else:
             with open(os.path.join(DATA, f"alloc_{cfg[1]}.json")) as f:
                 plan = json.load(f)["options"].__getitem__
-        gq = GPTQExperts(plan, n_cal, sum(b.numel() for b in cal), cfg[2])
+        if cli.save_codes:
+            os.makedirs(cli.save_codes, exist_ok=True)
+            shutil.copy(os.path.join(DATA, f"alloc_{cfg[1]}.json"), os.path.join(cli.save_codes, "alloc.json"))
+        gq = GPTQExperts(plan, n_cal, sum(b.numel() for b in cal), cfg[2], save_dir=cli.save_codes)
         before_block, before_batch = gq.before_block, gq.before_batch
     ckpt = None
     if cli.checkpoint_every:
@@ -624,6 +637,8 @@ def main() -> None:
         result["hedged_share"] = float(hedged[:, 0].sum() / hedged[:, 1].sum())
     with open(os.path.join(DATA, f"eval_{tag}.json"), "w") as f:
         json.dump(result, f, indent=1)
+    if cli.save_codes:
+        shutil.copy(os.path.join(DATA, f"eval_{tag}.json"), os.path.join(cli.save_codes, "eval.json"))
     print(json.dumps(result), flush=True)
 
 
