@@ -116,7 +116,8 @@
   - [ ] int8 표 반올림이 모델 전체 KL에 주는 영향 평가 (GPU 작업, 평가에 표 반올림을 넣어 재실행)
   - [x] 2단계: SSD 계층 리더(`engine/ssd.cpp`, 버퍼 없는 overlapped 읽기)와 캐시 정책(LRFU, 파이썬 재생과 일치). 실측 7.0~7.3GB/s, miss당 2.67~3.0ms, tier20v100의 SSD 상한 17~19 tok/s
   - [ ] 20 tok/s에 맞는 SSD 예산 재배분 (읽기 16~17회/토큰 이하, 3단계 실측 뒤 확정). 왜곡 계산으로는 RAM 1.10bpw라야 지금 품질이 유지됨 (`--tok-s 24`: 1.00bpw 0.0566, 1.05bpw 0.0516, 1.10bpw 0.0472)
-  - [ ] 3단계: PyTorch 호스트 연결, tok/s·VRAM·RAM·생성 품질 실측
+  - [x] 3단계 준비 (CPU): 두 계층 MoE(`sclm/tiered.py`)와 호스트(`sclm/host.py`). 작은 모델의 프리필+디코드 logit이 레퍼런스와 정확히 일치
+  - [ ] 3단계: 실제 체크포인트로 GPU에서 실행, tok/s·VRAM·RAM·생성 품질 실측 (게임이 끝난 뒤)
   - [ ] 4단계: 상시 경로를 코어의 CUDA 커널로 이전
 - [ ] Phase 3 캐시·예측·스케줄러
 - [ ] Phase 4 speculative

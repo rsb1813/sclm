@@ -15,26 +15,26 @@ def bf16_cuda_defaults():
     torch.set_default_dtype(prev_dtype)
 
 
-def init_random_(model: torch.nn.Module, seed: int = 0) -> None:
+def init_random_(model: torch.nn.Module, seed: int = 0, dev: str = DEV) -> None:
     """Fill uninitialized parameters with values of a plausible scale for each storage dtype."""
-    g = torch.Generator(device=DEV).manual_seed(seed)
+    g = torch.Generator(device=dev).manual_seed(seed)
     for name, p in model.named_parameters():
         leaf = name.rsplit(".", 1)[-1]
         with torch.no_grad():
             if p.dtype == torch.float4_e2m1fn_x2:
-                p.view(torch.uint8).copy_(torch.randint(0, 256, p.shape, generator=g, device=DEV, dtype=torch.uint8))
+                p.view(torch.uint8).copy_(torch.randint(0, 256, p.shape, generator=g, device=dev, dtype=torch.uint8))
             elif p.dtype == torch.float8_e4m3fn:
-                p.copy_(torch.randn(p.shape, generator=g, device=DEV).to(torch.float8_e4m3fn))
+                p.copy_(torch.randn(p.shape, generator=g, device=dev).to(torch.float8_e4m3fn))
             elif p.dtype == torch.float8_e8m0fnu:
                 # fp4 codes have std ~3 and fp8 weights std ~1; aim for weight std ~0.02
                 is_fp4 = "experts" in name and "shared" not in name
-                p.copy_(torch.full(p.shape, 2.0**-7 if is_fp4 else 2.0**-5, device=DEV).to(torch.float8_e8m0fnu))
+                p.copy_(torch.full(p.shape, 2.0**-7 if is_fp4 else 2.0**-5, device=dev).to(torch.float8_e8m0fnu))
             elif "norm" in name or leaf in ("hc_attn_scale", "hc_ffn_scale", "q_weight", "k_weight"):
                 p.fill_(1.0)
             elif leaf in ("attn_sink", "bias", "bias_vl", "hc_attn_base", "hc_ffn_base"):
                 p.zero_()
             else:
-                p.copy_(torch.randn(p.shape, generator=g, device=DEV) * 0.02)
+                p.copy_(torch.randn(p.shape, generator=g, device=dev) * 0.02)
 
 
 @pytest.fixture

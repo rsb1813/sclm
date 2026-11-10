@@ -23,15 +23,11 @@ TOPK = 4
 SHAPES = {"w1": (tc.INTER, tc.DIM), "w2": (tc.DIM, tc.INTER), "w3": (tc.INTER, tc.DIM)}  # (out, in)
 
 
-def write_checkpoint(root, rng) -> dict:
+def write_checkpoint(root, experts: dict) -> dict:
     """One shard laid out as the released ones: every expert's three scales back to back, then every expert's three
-    packed-FP4 weights back to back. Returns the bytes by tensor name."""
-    data = {}
-    for part, per_byte in (("scale", m.fp4_block_size), ("weight", 2)):
-        for e in range(len(PLAN)):
-            for w, (out, k) in SHAPES.items():
-                lo, hi = (119, 123) if part == "scale" else (0, 256)  # scales of 2^-8 .. 2^-5, any FP4 code pair
-                data[f"layers.0.ffn.experts.{e}.{w}.{part}"] = rng.integers(lo, hi, (out, k // per_byte), dtype=np.uint8)
+    packed-FP4 weights back to back. `experts` maps "layers.L.ffn.experts.E.w1.scale" and so on to uint8 arrays;
+    returns them in file order."""
+    data = {name: a for part in ("scale", "weight") for name, a in experts.items() if name.endswith(part)}
     header, at = {}, 0
     for name, a in data.items():
         header[name] = {"dtype": "F8_E8M0" if name.endswith("scale") else "I8", "shape": list(a.shape), "data_offsets": [at, at + a.size]}
@@ -63,7 +59,11 @@ def test_tiered_moe_matches_the_sum_over_reference_experts(tmp_path, monkeypatch
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)  # as the model runs
     try:
-        data = write_checkpoint(tmp_path, np.random.default_rng(0))
+        rng = np.random.default_rng(0)
+        data = write_checkpoint(tmp_path, {  # scales of 2^-8 .. 2^-5, any FP4 code pair
+            f"layers.0.ffn.experts.{e}.{w}.{part}": rng.integers(lo, hi, (out, k // per_byte), dtype=np.uint8)
+            for e in range(len(PLAN)) for w, (out, k) in SHAPES.items()
+            for part, per_byte, lo, hi in (("scale", m.fp4_block_size, 119, 123), ("weight", 2, 0, 256))})
         coded = tc.make_layer(str(tmp_path / "layer_00.safetensors"), PLAN)
         experts = [original_expert(data, e) if c is None else
                    SimpleNamespace(**{w: (lambda v, mod=getattr(c, w): tc.table_linear(mod, v)) for w in SHAPES}, swiglu_limit=tc.LIMIT)
