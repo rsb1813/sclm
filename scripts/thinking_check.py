@@ -6,6 +6,7 @@
 import argparse
 import json
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 from sclm import CKPT, CODES, DATA
 
 TOPK = 64
+FAR = 2048  # from this position on a ratio-4 layer holds more compressed positions than its index keeps
 QUESTION = "Rust로 간단하게 숫자 값을 양자화하는 코드 만들어줄래?"
 
 
@@ -23,11 +25,16 @@ def write(cli) -> None:
     tok, cache, decoder, _ = load_runtime(cli)
     kept, logits_of = [], decoder.logits
 
-    def recording(ids, pos):  # the distribution after every token fed, as its top entries
+    def recording(ids, pos):  # the distribution after every token fed, as its top entries, and what the token cost
+        cache.stats.clear()
+        t0 = time.perf_counter()
         out = logits_of(ids, pos)
         top = F.log_softmax(out[0].float(), dim=-1).topk(TOPK)
         kept.append((int(ids), top.indices.to(torch.int32).cpu(), top.values.cpu()))
+        costs.append({"total_s": time.perf_counter() - t0, **cache.stats})
         return out
+
+    costs = []
 
     decoder.logits = recording
     session = Session(tok, decoder, cli.max_seq_len)
@@ -41,6 +48,13 @@ def write(cli) -> None:
                 "temperature": cli.temperature, "top_p": cli.top_p, "seed": cli.seed, "looped": stats["looped"]}, path)
     print("".join(text)[-600:])
     print(f"{stats['tokens']} tokens written ({stats['tokens'] / stats['seconds']:.1f} tok/s), looped: {stats['looped']} -> {path}")
+    first = stats["prompt_tokens"] + 64  # the first tokens also fill the cache
+    for label, part in ((f"positions below {FAR}", costs[first:FAR]), (f"positions from {FAR}", costs[FAR:])):
+        if part:
+            mean = {k: sum(c.get(k, 0.0) for c in part) / len(part) for k in sorted({k for c in part for k in c})}
+            rest = mean["total_s"] - sum(mean.get(k, 0.0) for k in ("device_s", "ram_s", "read_s", "launch_s"))
+            print(f"{label}: {len(part)} tokens, {1 / mean['total_s']:.1f} tok/s; per token: " + ", ".join(
+                f"{k[:-2]} {1e3 * v:.1f} ms" if k.endswith("_s") else f"{k} {v:.1f}" for k, v in mean.items()) + f", rest {1e3 * rest:.1f} ms")
 
 
 def score(cli) -> None:
@@ -81,7 +95,9 @@ def score(cli) -> None:
     cut = (chosen == think_end).nonzero()
     n_think = int(cut[0]) + 1 if len(cut) else len(chosen)
     out = {"name": cli.name, "codes": run["codes"], "tokens": len(chosen), "thinking_tokens": n_think, "looped": run["looped"]}
-    for label, part in (("all", slice(None)), ("thinking", slice(0, n_think)), ("answer", slice(n_think, None))):
+    far = max(0, FAR - (first + 1))  # the written token whose position is FAR
+    for label, part in (("all", slice(None)), ("thinking", slice(0, n_think)), ("answer", slice(n_think, None)),
+                        (f"positions_below_{FAR}", slice(0, far)), (f"positions_from_{FAR}", slice(far, None))):
         if kl[part].numel():
             out[label] = {"kl": float(kl[part].mean()), "top1_agree": float(agree[part].mean()),
                           "confident_where_original_below_2pct": int(sure[part].sum()),
