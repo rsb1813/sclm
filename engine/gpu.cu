@@ -262,13 +262,21 @@ __global__ void swiglu_k(const uint16_t* gate, const uint16_t* up, uint16_t* h, 
 }
 
 // Hyper-connection mixes, first half (Block.hc_mixes): block i < rows computes <fn[i], h> over the n values of the
-// flattened stream h (bf16), block `rows` its sum of squares.
+// flattened stream h (bf16), block `rows` its sum of squares. The additions keep one order (a thread adds every
+// 256th value in turn; the mixes magnify a changed last bit), but four reads are under way at a time.
 __global__ void hc_dots_k(const uint16_t* h, const float* fn, float* dots, int n, int rows) {
-    const int row = blockIdx.x;
+    const int row = blockIdx.x, step = blockDim.x;
+    const float* f = fn + size_t(row < rows ? row : 0) * n;
     float acc = 0;
-    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+    int c = threadIdx.x;
+    for (; c + 3 * step < n; c += 4 * step) {
+        float v[4], w[4];
+        for (int k = 0; k < 4; ++k) v[k] = from_bf16(h[c + k * step]), w[k] = row < rows ? f[c + k * step] : v[k];
+        for (int k = 0; k < 4; ++k) acc += w[k] * v[k];
+    }
+    for (; c < n; c += step) {
         const float v = from_bf16(h[c]);
-        acc += (row < rows ? fn[size_t(row) * n + c] : v) * v;
+        acc += (row < rows ? f[c] : v) * v;
     }
     acc = block_reduce(acc, false);
     if (threadIdx.x == 0) dots[row] = acc;
@@ -454,7 +462,7 @@ API int sclm_gpu_hc_mixes(const uint16_t* h, const float* fn, const float* scale
     if (hc > 5) return -1;  // hc_split_k keeps comb in one warp
     ensure_scratch();
     const int rows = (2 + hc) * hc;
-    hc_dots_k<<<rows + 1, 1024>>>(h, fn, scratch.dots, hc * dim, rows);
+    hc_dots_k<<<rows + 1, 256>>>(h, fn, scratch.dots, hc * dim, rows);
     hc_split_k<<<1, 32>>>(scratch.dots, scale, base, mixes, hc * dim, hc, norm_eps, eps, iters);
     return cudaGetLastError();
 }
