@@ -257,8 +257,11 @@ class EngramRows(torch.nn.Module):
         self.reader = core.Reader([weight, scale])
         self.room = self.dim + 2 * core.PAGE + -self.dim % core.PAGE  # a row's read, start rounded down and end up
         self.buf = core.pages(0)
+        self.started = None  # (the rows, where they land) of reads start() has under way
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+    def start(self, indices: torch.Tensor) -> None:
+        """Starts reading the rows the next forward(indices) returns. A decode token knows them before its first
+        layer, and the layers before the engram's hide the read (0.85 ms)."""
         rows, room = indices.reshape(-1).tolist(), self.room
         if self.buf.nbytes < 2 * len(rows) * room:
             self.buf = core.pages(2 * len(rows) * room)
@@ -267,6 +270,12 @@ class EngramRows(torch.nn.Module):
             w, s = self.buf[2 * i * room:(2 * i + 1) * room], self.buf[(2 * i + 1) * room:(2 * i + 2) * room]
             at.append((2 * i * room + self.reader.submit(0, self.at_w + r * self.dim, self.dim, w),
                        (2 * i + 1) * room + self.reader.submit(1, self.at_s + r * self.cols, self.cols, s)))
+        self.started = (rows, at)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.started is None or len(self.started[0]) != indices.numel():
+            self.start(indices)
+        (_, at), self.started = self.started, None
         self.reader.wait()
         w = torch.from_numpy(np.stack([self.buf[a:a + self.dim] for a, _ in at])).to(indices.device).view(torch.float8_e4m3fn)
         s = torch.from_numpy(np.stack([self.buf[b:b + self.cols] for _, b in at])).to(indices.device).view(torch.float8_e8m0fnu)

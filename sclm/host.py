@@ -285,7 +285,12 @@ class Host:
         """upstream Transformer.forward for one text token (on the CPU) down to its logits: nothing is sampled
         from them."""
         net = self.net
-        hashes = self.hash(input_ids, start_pos).to(self.device) if self.hash is not None else None
+        hashes = self.hash(input_ids, start_pos) if self.hash is not None else None
+        if hashes is not None:
+            for layer in net.layers:  # the rows are read while the layers before run
+                if layer.engram is not None:
+                    layer.engram.embed.start(hashes[:, :, layer.engram.layer_hash_index, :])
+            hashes = hashes.to(self.device)
         h = net.embed(input_ids).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1)
         if self.first_mix is None:
             self.first_mix = m.make_identity_pre_mix(h, net.hc_mult)

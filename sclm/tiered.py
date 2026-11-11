@@ -22,7 +22,27 @@ class TieredMoE(nn.Module):
         self.layer_id, self.dim, self.inter, self.limit = layer_id, args.dim, args.moe_inter_dim, args.swiglu_limit
         self.gate = m.Gate(layer_id, args)
         self.shared_experts = m.Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
-        self.ram = self.cache = self.after = self.stream = None
+        self.ram = self.cache = self.after = self.stream = self.bound = None
+
+    def bind(self, buf, guess: int) -> tuple:
+        """gpu.moe_begin and gpu.moe_end with this layer's arguments bound (gpu.bind). Their wrappers took 15 to 20 us
+        each, and what the host does between the CPU tier's result and the next layer's first kernels is time the
+        device stands idle."""
+        gate, ex, ahead = self.gate, self.shared_experts, (None, None, None, None, None, 0, 0, 0.0, 0.0)
+        w1, w2, w3 = ex.w1.weight, ex.w2.weight, ex.w3.weight
+        n, dim = gate.weight.shape
+        assert gate.score_func == "sqrtsoftplus" and dim == self.dim == w1.size(1) and buf.pack.numel() >= 2 * (gate.topk + guess) + dim
+        if guess:
+            later, norm_weight, eps = self.after
+            h, pre = self.stream
+            assert later.gate.score_func == "sqrtsoftplus" and later.gate.weight.shape == gate.weight.shape
+            ahead = (later.gate.weight, later.gate.bias, h, pre, norm_weight, guess, pre.numel(), later.gate.gate_temp, eps)
+        begin = gpu.bind("moe_begin", gate.weight, gate.bias, gpu.LATER, buf.pack, buf.host, n, gate.topk, dim, gate.gate_temp,
+                         gate.route_scale, gate.norm_topk_prob, *ahead, w1, w1.scale, w2, w2.scale, w3, w3.scale, w1.size(0),
+                         self.limit, buf.xq, buf.shared, buf.routed)  # the token
+        end = gpu.bind("moe_end", buf.routed, self.cache.ram_out, buf.ram, buf.shared, buf.out, dim)
+        self.bound = (begin, end, buf, guess)
+        return self.bound
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """forward for one token (bf16 [dim]) on the engine's GPU kernels. The host waits for the device once, to
@@ -31,11 +51,11 @@ class TieredMoE(nn.Module):
         cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
         guess = cache.guess if self.after else 0
         buf = gpu.moe_buffers(topk, self.dim, cache.guess, x.device)
-        if guess:  # what the next layer's gate makes of this layer's input: its SSD experts are read a layer early
-            later, norm_weight, eps = self.after
-            gpu.moe_begin(self.gate, x, self.shared_experts, self.limit, buf, guess, later.gate, norm_weight, *self.stream, eps)
-        else:
-            gpu.moe_begin(self.gate, x, self.shared_experts, self.limit, buf)
+        # with guess: what the next layer's gate makes of this layer's input, so its SSD experts are read a layer early
+        bound = self.bound
+        begin, end, _, _ = bound if bound is not None and bound[2] is buf and bound[3] == guess else self.bind(buf, guess)
+        later = self.after[0] if guess else None
+        begin(x.data_ptr())
         cache.uploading = False  # the routing was copied after every slot upload queued so far
         host, xq, y = buf.host.numpy(), buf.xq, buf.routed
         t1 = perf_counter()
@@ -70,7 +90,8 @@ class TieredMoE(nn.Module):
             gpu.fp4_experts(cache.store, *zip(*read), self.dim, self.inter, self.limit, xq, y)
         # the CPU tier's sum is not waited for: the device takes the buffer before the next layer's routing comes
         # back, and the CPU tier writes it again only after that
-        out = gpu.moe_end(buf, cache.ram_out)
+        end()
+        out = buf.out
         t4 = perf_counter()
         for key, value in (("device_s", t1 - t0), ("ram_s", t2 - t1), ("read_s", t3 - t2), ("launch_s", t4 - t3),
                            ("ram_calls", len(ram)), ("ssd_calls", len(ssd)),
