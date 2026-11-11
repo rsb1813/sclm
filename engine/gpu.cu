@@ -11,6 +11,17 @@ namespace {
 const int SCRATCH = 1 << 16;  // widest vector a call handles
 const int NORM_MAX = 8192;  // longest vector norm_quant handles (it keeps it in shared memory)
 
+// How the model at hand quantizes (sclm_gpu_set_model). The defaults are DeepSeek-V4.1-Flash's; DeepSeek-V4-Flash-0731
+// has 128, 7, 64, false, true, false.
+struct Model {
+    int act = 32;           // activations per scale of the FP8 rounding before a quantized GEMM (a multiple of 32)
+    int ws = 5;             // log2 of the rows, and of the columns, per scale of an FP8 weight
+    int kv_block = 32;      // a window key/value: its values per FP8 scale,
+    bool kv_rope = true;    // and whether its rotated values are rounded too
+    bool head_norm = false; // the query is normalized head by head before its rotation
+    bool quant_o = true;    // the attention's output is FP8-rounded before wo_a
+} model;
+
 __device__ __forceinline__ float e4m3(uint32_t b) {
     const uint32_t e = (b >> 3) & 15, m = b & 7;
     const float v = e ? __uint_as_float((e + 120) << 23 | m << 20) : float(m) * 0.001953125f;  // below 2^-6: m * 2^-9
@@ -102,7 +113,7 @@ int* done_counts() {  // last_block's counters: SCRATCH / 32 of them, zero betwe
     return counts;
 }
 
-// One value of kernel.act_quant(x, 32, "ue8m0", inplace), mx being the largest magnitude of its block of 32.
+// One value of kernel.act_quant(x, block, "ue8m0", inplace), mx being the largest magnitude of its block.
 __device__ __forceinline__ float fp8_round(float v, float mx) {
     const uint32_t bits = __float_as_uint(fmaxf(mx, 1e-4f) * float(1.0 / 448.0));
     const int se = int(bits >> 23 & 255) - 127 + ((bits & 0x7fffff) != 0);  // the scale is 2^ceil(log2(amax / 448))
@@ -111,15 +122,16 @@ __device__ __forceinline__ float fp8_round(float v, float mx) {
     return scalbnf(rintf(scalbnf(t, -q)), q + se);
 }
 
-// kernel.act_quant(x, 32, "ue8m0", inplace): a block of 32 is scaled by a power of two so that its largest magnitude
-// is at most 448, and rounded to E4M3. One CUDA block of 32 threads per quantization block. Out is fp32, or bf16
-// (which holds every such value exactly); xq may be x.
+// kernel.act_quant(x, block, "ue8m0", inplace): a block of values is scaled by a power of two so that its largest
+// magnitude is at most 448, and rounded to E4M3. One CUDA block per quantization block (32 threads, or a multiple).
+// Out is fp32, or bf16 (which holds every such value exactly); xq may be x.
 template <class Out>
 __global__ void act_quant_k(const uint16_t* x, Out* xq) {
-    const int i = blockIdx.x * 32 + threadIdx.x;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const float v = from_bf16(x[i]);
     float mx = fabsf(v);
     for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    if (blockDim.x > 32) mx = block_reduce(mx, true);
     const float r = fp8_round(v, mx);
     if (sizeof(Out) == 2)
         xq[i] = Out(to_bf16(r));
@@ -130,13 +142,15 @@ __global__ void act_quant_k(const uint16_t* x, Out* xq) {
 // What attention does with a projection's output y[n] (bf16), by one block, a warp taking 32 values at a time:
 // upstream RMSNorm with weight w, normed = bf16(w * y * rsqrt(mean(y^2) + eps)) (stored if asked for); with freqs,
 // upstream apply_rotary_emb on its last rd values (adjacent pairs are complex numbers multiplied by freqs[pair]
-// (re, im), rounded to bf16); then kernel.act_quant -> xq (fp32) or q (bf16). n is a multiple of 32, n - rd even.
+// (re, im), rounded to bf16); then kernel.act_quant over blocks of qb on the first qn values (the rest stay as they
+// are) -> xq (fp32) or q (bf16). n is a multiple of the block's threads, which are a multiple of qb; n - rd is even.
 // The squares are added up as one block of 1024 threads would: a thread every 1024th value, its warps by shuffles,
 // then the warps in order.
 __device__ void norm_quant(const volatile uint16_t* y, const uint16_t* w, const float* freqs, uint16_t* normed, float* xq,
-                           uint16_t* q, int n, int rd, float eps) {
+                           uint16_t* q, int n, int rd, float eps, int qb, int qn) {
     extern __shared__ float vals[];  // y
     __shared__ float part[33];
+    __shared__ float warp_max[32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
     for (int i = threadIdx.x; i < n; i += blockDim.x) vals[i] = from_bf16(y[i]);
     __syncthreads();
@@ -165,7 +179,13 @@ __device__ void norm_quant(const volatile uint16_t* y, const uint16_t* w, const 
         }
         float mx = fabsf(v);
         for (int s = 16; s; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
-        const float rounded = fp8_round(v, mx);
+        if (qb > 32) {  // a quantization block is qb / 32 neighbouring warps
+            if (lane == 0) warp_max[warp] = mx;
+            __syncthreads();
+            for (int k = warp / (qb / 32) * (qb / 32), end = k + qb / 32; k < end; ++k) mx = fmaxf(mx, warp_max[k]);
+            __syncthreads();
+        }
+        const float rounded = i < qn ? fp8_round(v, mx) : v;
         if (xq)
             xq[i] = rounded;
         else
@@ -175,17 +195,22 @@ __device__ void norm_quant(const volatile uint16_t* y, const uint16_t* w, const 
 
 // The start of the output side of upstream Attention.forward for one token: the query's rotation is taken back off
 // o[heads][head_dim] (bf16; apply_rotary_emb's inverse on the last rd values of each head, rounded to bf16) and the
-// result quantized (kernel.act_quant) as fp32. A block of 32 threads per 32 values; head_dim - rd is even.
-__global__ void unrope_quant_k(const uint16_t* o, const float* freqs, float* xq, int head_dim, int rd) {
-    const int i = blockIdx.x * 32 + threadIdx.x, at = i % head_dim - (head_dim - rd);
+// result, quantized (kernel.act_quant, a CUDA block per quantization block) if asked for, as fp32. head_dim - rd is even.
+__global__ void unrope_quant_k(const uint16_t* o, const float* freqs, float* xq, int head_dim, int rd, bool quant) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, at = i % head_dim - (head_dim - rd);
     float v = from_bf16(o[i]);
     const float other = __shfl_xor_sync(0xffffffff, v, 1);  // the pair's other value
     if (at >= 0) {
         const float c = freqs[at & ~1], d = -freqs[(at & ~1) + 1];
         v = from_bf16(to_bf16(at & 1 ? other * d + v * c : v * c - other * d));
     }
+    if (!quant) {
+        xq[i] = v;
+        return;
+    }
     float mx = fabsf(v);
     for (int s = 16; s; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
+    if (blockDim.x > 32) mx = block_reduce(mx, true);
     xq[i] = fp8_round(v, mx);
 }
 
@@ -255,7 +280,8 @@ __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const u
     }
 }
 
-// y[row] = sum over k of w[row][k] * scale[row / 32][k / 32] * xq[k], w in E4M3 and scale in E8M0.
+// y[row] = sum over k of w[row][k] * scale[row >> ws][k >> ws] * xq[k], w in E4M3 and scale in E8M0 (a scale to a
+// block of 2^ws rows and columns).
 // Rows come in groups of rows_per_group, group g reading xq[g * k ..] (attention's block-diagonal wo_a; one group
 // otherwise).
 // The sum is rounded to bf16 as the reference's GEMM output is, then stored as bf16 (STORE), added to the fp32 y
@@ -281,21 +307,21 @@ __device__ __forceinline__ float fp8_dot4(uint32_t b, const float* x) {
 // columns in turn, a warp adds its threads up by shuffles, then the row's warps are added in order. Four reads are
 // under way at a time.
 __device__ __forceinline__ float fp8_row(const uint8_t* w, const uint8_t* scale, const float* xq, int k, int rows_per_group,
-                                         int per_row, int& row) {
+                                         int per_row, int& row, int ws) {
     __shared__ float part[32];
     row = blockIdx.x * (blockDim.x / per_row) + threadIdx.x / per_row;
     const int step = per_row * 4;
     const uint8_t* wr = w + size_t(row) * k;
-    const uint8_t* sr = scale + size_t(row >> 5) * (k >> 5);
+    const uint8_t* sr = scale + size_t(row >> ws) * (k >> ws);
     const float* x = xq + size_t(row / rows_per_group) * k;
     float acc = 0;
     int c = threadIdx.x % per_row * 4;
     for (; c + 3 * step < k; c += 4 * step) {
         uint32_t b[4];
         for (int i = 0; i < 4; ++i) b[i] = *(const uint32_t*)(wr + c + i * step);
-        for (int i = 0; i < 4; ++i) acc += e8m0(sr[(c + i * step) >> 5]) * fp8_dot4(b[i], x + c + i * step);
+        for (int i = 0; i < 4; ++i) acc += e8m0(sr[(c + i * step) >> ws]) * fp8_dot4(b[i], x + c + i * step);
     }
-    for (; c < k; c += step) acc += e8m0(sr[c >> 5]) * fp8_dot4(*(const uint32_t*)(wr + c), x + c);
+    for (; c < k; c += step) acc += e8m0(sr[c >> ws]) * fp8_dot4(*(const uint32_t*)(wr + c), x + c);
     for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
     __syncthreads();
@@ -306,9 +332,9 @@ __device__ __forceinline__ float fp8_row(const uint8_t* w, const uint8_t* scale,
 }
 
 __global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, int rows_per_group, Mode mode,
-                           int per_row) {
+                           int per_row, int ws) {
     int row;
-    const float acc = fp8_row(w, scale, xq, k, rows_per_group, per_row, row);
+    const float acc = fp8_row(w, scale, xq, k, rows_per_group, per_row, row, ws);
     if (threadIdx.x % per_row == 0) put(y, row, acc, mode);
 }
 
@@ -316,10 +342,10 @@ __global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* 
 // apply_rotary_emb on the last rd values of each head, as in norm_quant. A block holds an even number of rows, so
 // both values of a pair; head_dim and rd are even.
 __global__ void fp8_gemv_rope_k(const uint8_t* w, const uint8_t* scale, const float* xq, uint16_t* q, int k, int per_row,
-                                const float* freqs, int head_dim, int rd) {
+                                const float* freqs, int head_dim, int rd, int ws) {
     __shared__ float vals[32];  // the block's rows
     int row;
-    float v = from_bf16(to_bf16(fp8_row(w, scale, xq, k, 1 << 30, per_row, row)));
+    float v = from_bf16(to_bf16(fp8_row(w, scale, xq, k, 1 << 30, per_row, row, ws)));
     const bool first = threadIdx.x % per_row == 0;
     const int at = row % head_dim - (head_dim - rd), mine = threadIdx.x / per_row;
     if (first) vals[mine] = v;
@@ -332,31 +358,58 @@ __global__ void fp8_gemv_rope_k(const uint8_t* w, const uint8_t* scale, const fl
     q[row] = to_bf16(v);
 }
 
+// What DeepSeek-V4-Flash-0731 does to the query q[heads][head_dim] (bf16) after wq_b, in place, block h for head h
+// (head_dim threads): q *= rsqrt(mean(q^2) + eps), every step a bf16 tensor operation upstream, then apply_rotary_emb
+// on the head's last rd values as in norm_quant.
+__global__ void head_norm_rope_k(uint16_t* q, const float* freqs, int head_dim, int rd, float eps) {
+    uint16_t* qh = q + size_t(blockIdx.x) * head_dim;
+    const int i = threadIdx.x, at = i - (head_dim - rd);
+    const float x = from_bf16(qh[i]);
+    const float mean = from_bf16(to_bf16(block_reduce(from_bf16(to_bf16(x * x)), false) / float(head_dim)));
+    const float r = from_bf16(to_bf16(rsqrtf(from_bf16(to_bf16(mean + eps)))));
+    float v = from_bf16(to_bf16(x * r));
+    const float other = __shfl_xor_sync(0xffffffff, v, 1);  // the pair's other value
+    if (at >= 0) {
+        const float c = freqs[at & ~1], d = freqs[(at & ~1) + 1];
+        v = from_bf16(to_bf16(at & 1 ? other * d + v * c : v * c - other * d));
+    }
+    qh[i] = to_bf16(v);
+}
+
 // fp8_gemv_k for a projection that attention normalizes: the rows go to y[n] (bf16), and the block that finishes
 // last does the rest (norm_quant), which saves the launches of three small kernels.
 __global__ void fp8_gemv_norm_k(const uint8_t* w, const uint8_t* scale, const float* xq_in, uint16_t* y, int k, int per_row, int n,
                                 int* count, const uint16_t* norm_w, const float* freqs, uint16_t* normed, float* xq,
-                                uint16_t* q, int rd, float eps) {
+                                uint16_t* q, int rd, float eps, int ws, int qb, int qn) {
     int row;
-    const float acc = fp8_row(w, scale, xq_in, k, n, per_row, row);
+    const float acc = fp8_row(w, scale, xq_in, k, n, per_row, row, ws);
     if (threadIdx.x % per_row == 0) y[row] = to_bf16(acc);
-    if (last_block(count, gridDim.x)) norm_quant(y, norm_w, freqs, normed, xq, q, n, rd, eps);
+    if (last_block(count, gridDim.x)) norm_quant(y, norm_w, freqs, normed, xq, q, n, rd, eps, qb, qn);
 }
 
-// fp8_gemv_k for attention's wo_a: the rows go to y (bf16), and of the blocks that share 32 rows, the one that
-// finishes last quantizes them for wo_b as act_quant_k does -> xq (fp32), which is not xq_in. A block's rows divide 32.
+// fp8_gemv_k for attention's wo_a: the rows go to y (bf16), and of the blocks that share a quantization block of
+// `act` rows, the one that finishes last quantizes them for wo_b as act_quant_k does -> xq (fp32), which is not
+// xq_in. A block's rows divide act, and its threads are at least act.
 __global__ void fp8_gemv_quant_k(const uint8_t* w, const uint8_t* scale, const float* xq_in, uint16_t* y, int k, int rows_per_group,
-                                 int per_row, int* counts, float* xq) {
+                                 int per_row, int* counts, float* xq, int ws, int act) {
     int row;
-    const float acc = fp8_row(w, scale, xq_in, k, rows_per_group, per_row, row);
+    const float acc = fp8_row(w, scale, xq_in, k, rows_per_group, per_row, row, ws);
     if (threadIdx.x % per_row == 0) y[row] = to_bf16(acc);
-    const int blocks = 32 * per_row / blockDim.x, group = blockIdx.x / blocks;
-    if (!last_block(counts + group, blocks) || threadIdx.x >= 32) return;
-    const int i = group * 32 + threadIdx.x;
-    const float v = from_bf16(((const volatile uint16_t*)y)[i]);
-    float mx = fabsf(v);
-    for (int s = 16; s; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
-    xq[i] = fp8_round(v, mx);
+    const int blocks = act * per_row / blockDim.x, group = blockIdx.x / blocks;
+    if (!last_block(counts + group, blocks)) return;
+    const int i = group * act + threadIdx.x;
+    if (act == 32) {
+        if (threadIdx.x >= 32) return;
+        const float v = from_bf16(((const volatile uint16_t*)y)[i]);
+        float mx = fabsf(v);
+        for (int s = 16; s; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
+        xq[i] = fp8_round(v, mx);
+        return;
+    }
+    const bool mine = threadIdx.x < act;
+    const float v = mine ? from_bf16(((const volatile uint16_t*)y)[i]) : 0.0f;
+    const float mx = block_reduce(fabsf(v), true);
+    if (mine) xq[i] = fp8_round(v, mx);
 }
 
 // What the expert kernels need of one SwiGLU expert: its weights with their scales, and its routing weight.
@@ -373,7 +426,7 @@ struct Batch {
 // an E8M0 scale per 32 columns) or FP8 (as fp8_gemv_k reads it); sr is the row's scales. Lane 0 gets the sum. The
 // additions run in fp8_gemv_k's order, which gives a long row 64 threads: a lane then does the work of two in turn.
 template <bool FP4>
-__device__ __forceinline__ float row_dot(const uint8_t* wr, const uint8_t* sr, const float* x, int k, int lane) {
+__device__ __forceinline__ float row_dot(const uint8_t* wr, const uint8_t* sr, const float* x, int k, int lane, int ws) {
     const int per = FP4 ? 8 : 4, warps = k / per >= 512 ? 2 : 1;
     float total = 0;
     for (int w = 0; w < warps; ++w) {
@@ -386,7 +439,7 @@ __device__ __forceinline__ float row_dot(const uint8_t* wr, const uint8_t* sr, c
                 acc += 0.5f * e8m0(sr[c >> 5]) * s;
             } else {
                 const uint32_t b = *(const uint32_t*)(wr + c);
-                acc += e8m0(sr[c >> 5]) * (e4m3(b & 255) * x[c] + e4m3(b >> 8 & 255) * x[c + 1] + e4m3(b >> 16 & 255) * x[c + 2] +
+                acc += e8m0(sr[c >> ws]) * (e4m3(b & 255) * x[c] + e4m3(b >> 8 & 255) * x[c + 1] + e4m3(b >> 16 & 255) * x[c + 2] +
                                            e4m3(b >> 24) * x[c + 3]);
             }
         }
@@ -399,12 +452,14 @@ __device__ __forceinline__ float row_dot(const uint8_t* wr, const uint8_t* sr, c
 // The first half of the reference Expert for a batch of experts on the quantized layer input xq. A block computes
 // 32 rows of the hidden vector of expert blockIdx / (inter / 32), a warp per row: the row of w1 and of w3 (each
 // rounded to bf16 as the reference's GEMM output is), h = weight * silu(min(gate, limit)) * clamp(up, -limit, limit)
-// rounded to bf16, and the block's 32 values quantized as kernel.act_quant does before w2 -> hq[expert][inter].
+// rounded to bf16, and the values quantized as kernel.act_quant does before w2 -> hq[expert][inter]: the block's own
+// 32 when act is 32; otherwise they go to hq as they are, and of the act / 32 blocks of a quantization block the one
+// that finishes last rounds all of its values.
 // The block first copies xq into shared memory: every weight takes one read of x, and with those reads going to
 // global memory an FP4 expert (half the bytes of an FP8 one) took longer than an FP8 one, 51 us against 43; with
 // both kernels reading x from shared memory it takes 33 us (28 in a batch of three).
 template <bool FP4>
-__global__ void expert_hidden_k(Batch b, const float* xq, float* hq, int dim, int inter, float limit) {
+__global__ void expert_hidden_k(Batch b, const float* xq, float* hq, int dim, int inter, float limit, int act, int ws, int* counts) {
     __shared__ float vals[32];
     extern __shared__ float xs[];  // xq: every row of the block reads all of it
     for (int i = threadIdx.x; i < dim; i += blockDim.x) xs[i] = xq[i];
@@ -412,35 +467,48 @@ __global__ void expert_hidden_k(Batch b, const float* xq, float* hq, int dim, in
     const int blocks = inter / 32, e = blockIdx.x / blocks, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = (blockIdx.x % blocks) * 32 + warp;
     const Mats& m = b.m[e];
-    const size_t at = size_t(row) * (FP4 ? dim / 2 : dim), scale_at = size_t(FP4 ? row : row >> 5) * (dim >> 5);
-    const float gate = row_dot<FP4>(m.w1 + at, m.s1 + scale_at, xs, dim, lane);
-    const float up = row_dot<FP4>(m.w3 + at, m.s3 + scale_at, xs, dim, lane);
+    const size_t at = size_t(row) * (FP4 ? dim / 2 : dim);
+    const size_t scale_at = FP4 ? size_t(row) * (dim >> 5) : size_t(row >> ws) * (dim >> ws);
+    const float gate = row_dot<FP4>(m.w1 + at, m.s1 + scale_at, xs, dim, lane, ws);
+    const float up = row_dot<FP4>(m.w3 + at, m.s3 + scale_at, xs, dim, lane, ws);
     if (lane == 0) {
         float g = from_bf16(to_bf16(gate)), u = from_bf16(to_bf16(up));
         if (limit > 0) g = fminf(g, limit), u = fminf(fmaxf(u, -limit), limit);
         vals[warp] = from_bf16(to_bf16(m.weight * (g / (1.0f + expf(-g)) * u)));
     }
     __syncthreads();
-    if (lane) return;
-    float mx = 0;
-    for (int i = 0; i < 32; ++i) mx = fmaxf(mx, fabsf(vals[i]));
-    hq[size_t(e) * inter + row] = fp8_round(vals[warp], mx);
+    if (act == 32) {
+        if (lane) return;
+        float mx = 0;
+        for (int i = 0; i < 32; ++i) mx = fmaxf(mx, fabsf(vals[i]));
+        hq[size_t(e) * inter + row] = fp8_round(vals[warp], mx);
+        return;
+    }
+    if (lane == 0) hq[size_t(e) * inter + row] = vals[warp];
+    const int per = act / 32, group = blockIdx.x / per;  // hq[blockIdx * 32 ..] is this block's, a group's start at group * act
+    if (!last_block(counts + group, per)) return;
+    float* gq = hq + size_t(group) * act;
+    const bool mine = threadIdx.x < act;
+    const float v = mine ? ((const volatile float*)gq)[threadIdx.x] : 0.0f;
+    const float mx = block_reduce(fabsf(v), true);
+    if (mine) gq[threadIdx.x] = fp8_round(v, mx);
 }
 
 // The second half, a block per 32 output rows and a warp per row: y[row] (fp32), or zero with STORE_F32, plus each
 // expert's <w2[row], hq[expert]> rounded to bf16, added in the batch's order. The block holds the expert's hq in
 // shared memory while its rows read it.
 template <bool FP4>
-__global__ void expert_out_k(Batch b, const float* hq, float* y, int dim, int inter, Mode mode) {
+__global__ void expert_out_k(Batch b, const float* hq, float* y, int dim, int inter, Mode mode, int ws) {
     extern __shared__ float xs[];  // an expert's hq: every row of the block reads all of it
     const int row = blockIdx.x * 32 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    const size_t at = size_t(row) * (FP4 ? inter / 2 : inter), scale_at = size_t(FP4 ? row : row >> 5) * (inter >> 5);
+    const size_t at = size_t(row) * (FP4 ? inter / 2 : inter);
+    const size_t scale_at = FP4 ? size_t(row) * (inter >> 5) : size_t(row >> ws) * (inter >> ws);
     float sum = lane == 0 && mode == ADD ? y[row] : 0.0f;
     for (int e = 0; e < b.n; ++e) {
         __syncthreads();  // every row is through with the expert before
         for (int i = threadIdx.x; i < inter; i += blockDim.x) xs[i] = hq[size_t(e) * inter + i];
         __syncthreads();
-        sum += from_bf16(to_bf16(row_dot<FP4>(b.m[e].w2 + at, b.m[e].s2 + scale_at, xs, inter, lane)));
+        sum += from_bf16(to_bf16(row_dot<FP4>(b.m[e].w2 + at, b.m[e].s2 + scale_at, xs, inter, lane, ws)));
     }
     if (lane == 0) y[row] = sum;
 }
@@ -749,18 +817,25 @@ struct Rows {
 
 template <bool FP4>
 int launch_experts(const Batch& b, int dim, int inter, float limit, const float* xq, float* y, Mode mode) {
-    if (dim > SCRATCH || b.n * inter > SCRATCH || inter % 32 || dim % 32 || max(dim, inter) > 8192) return -1;
+    if (dim > SCRATCH || b.n * inter > SCRATCH || inter % model.act || dim % 32 || max(dim, inter) > 8192) return -1;
     ensure_scratch();
-    expert_hidden_k<FP4><<<b.n * (inter / 32), 1024, dim * sizeof(float)>>>(b, xq, scratch.xq, dim, inter, limit);
-    expert_out_k<FP4><<<dim / 32, 1024, inter * sizeof(float)>>>(b, scratch.xq, y, dim, inter, mode);
+    expert_hidden_k<FP4><<<b.n * (inter / 32), 1024, dim * sizeof(float)>>>(b, xq, scratch.xq, dim, inter, limit, model.act, model.ws,
+                                                                           done_counts());
+    expert_out_k<FP4><<<dim / 32, 1024, inter * sizeof(float)>>>(b, scratch.xq, y, dim, inter, mode, model.ws);
     return cudaGetLastError();
 }
 
 }  // namespace
 
-// xq[k] (fp32) = the reference's fp8 fake-quant of x[k] (bf16). k is a multiple of 32.
+// The model whose tensors the calls below get (see Model), before any of them.
+API void sclm_gpu_set_model(int act, int weight_block, int kv_block, int kv_rope, int head_norm, int quant_o) {
+    model.act = act, model.kv_block = kv_block, model.kv_rope = kv_rope, model.head_norm = head_norm, model.quant_o = quant_o;
+    for (model.ws = 0; 1 << model.ws < weight_block; ++model.ws) {}
+}
+
+// xq[k] (fp32) = the reference's fp8 fake-quant of x[k] (bf16). k is a multiple of the model's activation block.
 API int sclm_gpu_act_quant(const uint16_t* x, float* xq, int k) {
-    act_quant_k<float><<<k / 32, 32>>>(x, xq);
+    act_quant_k<float><<<k / model.act, model.act>>>(x, xq);
     return cudaGetLastError();
 }
 
@@ -769,9 +844,9 @@ API int sclm_gpu_act_quant(const uint16_t* x, float* xq, int k) {
 API int sclm_gpu_fp8_linear(const uint8_t* w, const uint8_t* scale, int n, int k, int groups, const uint16_t* x, uint16_t* y) {
     if (groups * k > SCRATCH) return -1;
     ensure_scratch();
-    act_quant_k<float><<<groups * k / 32, 32>>>(x, scratch.xq);
+    act_quant_k<float><<<groups * k / model.act, model.act>>>(x, scratch.xq);
     const Rows rows(n, k);
-    fp8_gemv_k<<<rows.blocks, rows.threads>>>(w, scale, scratch.xq, y, k, n / groups, STORE, rows.per_row);
+    fp8_gemv_k<<<rows.blocks, rows.threads>>>(w, scale, scratch.xq, y, k, n / groups, STORE, rows.per_row, model.ws);
     return cudaGetLastError();
 }
 
@@ -809,11 +884,19 @@ API int sclm_gpu_attn_q(const uint8_t* wa, const uint8_t* sa, const uint16_t* no
     if (rank > NORM_MAX || rank % 32 || head_dim % 4 || rd % 2) return -1;
     ensure_scratch();
     const Rows a(rank, dim), b(heads * head_dim, rank);
-    act_quant_k<float><<<dim / 32, 32>>>(x, scratch.xq);
+    if (model.act > 32 && (rank % a.threads || a.threads % model.act)) return -1;
+    act_quant_k<float><<<dim / model.act, model.act>>>(x, scratch.xq);
     // the quantized qr takes the place of the quantized x, which the last block no longer needs
     fp8_gemv_norm_k<<<a.blocks, a.threads, rank * sizeof(float)>>>(wa, sa, scratch.xq, scratch.h, dim, a.per_row, rank, done_counts(),
-                                                                   norm_w, nullptr, qr, scratch.xq, nullptr, 0, eps);
-    fp8_gemv_rope_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, q, rank, b.per_row, freqs, head_dim, rd);
+                                                                   norm_w, nullptr, qr, scratch.xq, nullptr, 0, eps, model.ws,
+                                                                   model.act, rank);
+    if (model.head_norm) {
+        if (head_dim > 1024 || head_dim % 32) return -1;
+        fp8_gemv_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, q, rank, heads * head_dim, STORE, b.per_row, model.ws);
+        head_norm_rope_k<<<heads, head_dim>>>(q, freqs, head_dim, rd, eps);
+    } else {
+        fp8_gemv_rope_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, q, rank, b.per_row, freqs, head_dim, rd, model.ws);
+    }
     return cudaGetLastError();
 }
 
@@ -824,9 +907,12 @@ API int sclm_gpu_attn_kv(const uint8_t* w, const uint8_t* s, const uint16_t* nor
     if (head_dim > NORM_MAX || head_dim % 32 || rd % 2) return -1;
     ensure_scratch();
     const Rows rows(head_dim, dim);
-    act_quant_k<float><<<dim / 32, 32>>>(x, scratch.xq);
+    const int quantized = model.kv_rope ? head_dim : head_dim - rd;
+    if (quantized % model.kv_block || (model.kv_block > 32 && (head_dim % rows.threads || rows.threads % model.kv_block))) return -1;
+    act_quant_k<float><<<dim / model.act, model.act>>>(x, scratch.xq);
     fp8_gemv_norm_k<<<rows.blocks, rows.threads, head_dim * sizeof(float)>>>(w, s, scratch.xq, scratch.h, dim, rows.per_row, head_dim,
-                                                                             done_counts(), norm_w, freqs, nullptr, nullptr, kv, rd, eps);
+                                                                             done_counts(), norm_w, freqs, nullptr, nullptr, kv, rd, eps,
+                                                                             model.ws, model.kv_block, quantized);
     return cudaGetLastError();
 }
 
@@ -871,8 +957,8 @@ API int sclm_gpu_index_pick(const uint8_t* wb, const uint8_t* sb, const uint16_t
     if (heads > 32 || d % 32 || heads * d > SCRATCH || rank % 32 || rank > SCRATCH || rd % 2 || count > SCRATCH) return -1;
     ensure_scratch();
     const Rows b(heads * d, rank);
-    act_quant_k<float><<<rank / 32, 32>>>(qr, scratch.xq);
-    fp8_gemv_rope_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, scratch.h, rank, b.per_row, freqs, d, rd);
+    act_quant_k<float><<<rank / model.act, model.act>>>(qr, scratch.xq);
+    fp8_gemv_rope_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, scratch.h, rank, b.per_row, freqs, d, rd, model.ws);
     fp4_quant_k<<<heads * d / 32, 32>>>(scratch.h);
     dots_k<uint16_t><<<heads, 128>>>(wp, x, scratch.dots, dim);
     index_score_k<<<count, heads * 32>>>(scratch.h, keys, scratch.dots, scale, scratch.xq, d);  // the quantized qr is used up
@@ -895,13 +981,18 @@ API int sclm_gpu_sparse_attn(const uint16_t* q, const uint16_t* window, const ui
 API int sclm_gpu_attn_out(const uint16_t* o, const float* freqs, const uint8_t* wa, const uint8_t* sa, const uint8_t* wb,
                           const uint8_t* sb, uint16_t* out, int heads, int head_dim, int rd, int groups, int n_a, int dim) {
     const int width = heads * head_dim;
-    if (width + n_a > SCRATCH || n_a % 32 || (head_dim - rd) % 2 || head_dim % 32) return -1;
+    if (width + n_a > SCRATCH || n_a % model.act || (head_dim - rd) % 2 || head_dim % 32 || (!model.quant_o && width % 256)) return -1;
     ensure_scratch();
     const Rows a(n_a, width / groups), b(dim, n_a);
-    unrope_quant_k<<<width / 32, 32>>>(o, freqs, scratch.xq, head_dim, rd);
+    if (a.threads < model.act) return -1;
+    if (model.quant_o)
+        unrope_quant_k<<<width / model.act, model.act>>>(o, freqs, scratch.xq, head_dim, rd, true);
+    else
+        unrope_quant_k<<<width / 256, 256>>>(o, freqs, scratch.xq, head_dim, rd, false);
     float* xq = scratch.xq + width;  // wo_a's output, quantized
-    fp8_gemv_quant_k<<<a.blocks, a.threads>>>(wa, sa, scratch.xq, scratch.h, width / groups, n_a / groups, a.per_row, done_counts(), xq);
-    fp8_gemv_k<<<b.blocks, b.threads>>>(wb, sb, xq, out, n_a, dim, STORE, b.per_row);
+    fp8_gemv_quant_k<<<a.blocks, a.threads>>>(wa, sa, scratch.xq, scratch.h, width / groups, n_a / groups, a.per_row, done_counts(), xq,
+                                              model.ws, model.act);
+    fp8_gemv_k<<<b.blocks, b.threads>>>(wb, sb, xq, out, n_a, dim, STORE, b.per_row, model.ws);
     return cudaGetLastError();
 }
 
@@ -979,7 +1070,7 @@ API int sclm_gpu_moe_begin(const uint16_t* weight, const float* bias, const uint
         cudaEventRecord(moe_copied[1], 0);
     }
     cudaMemsetAsync(routed, 0, dim * sizeof(float), 0);
-    act_quant_k<float><<<dim / 32, 32>>>(x, xq);
+    act_quant_k<float><<<dim / model.act, model.act>>>(x, xq);
     status = sclm_gpu_fp8_expert(w1, s1, w2, s2, w3, s3, dim, inter, limit, xq, shared, 1);
     if (status) return status;
     return cudaEventSynchronize(moe_copied[0]);

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import torch
 
+from . import ACT_BLOCK, MODEL
+
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclm_gpu.dll")
 active = False  # the host turns this on around a forward whose single-token steps should use the kernels
 _lib = None
@@ -16,6 +18,10 @@ def lib():
     global _lib
     if _lib is None:
         _lib = C.CDLL(os.path.abspath(DLL))  # finds the CUDA runtime torch has already loaded
+        # the model's activation block, the block of an FP8 weight's scales, the window KV's block and whether its
+        # rotated values are rounded, the query's head norm, the rounding in front of wo_a (engine/gpu.cu, Model)
+        _lib.sclm_gpu_set_model.argtypes = [C.c_int] * 6
+        _lib.sclm_gpu_set_model(*((ACT_BLOCK, 128, 64, 0, 1, 0) if MODEL == "v4" else (ACT_BLOCK, 32, 32, 1, 0, 1)))
         _lib.sclm_gpu_act_quant.argtypes = [C.c_void_p, C.c_void_p, C.c_int]
         _lib.sclm_gpu_fp8_linear.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_void_p]
         _lib.sclm_gpu_fp4_experts.argtypes = [C.c_void_p, C.c_uint64, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int,
@@ -68,8 +74,8 @@ def bind(name: str, *args):
 
 
 def act_quant(x: torch.Tensor) -> torch.Tensor:
-    """The reference's fp8 fake-quant (blocks of 32, power-of-two scales) of a bf16 vector, as fp32."""
-    assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.numel() % 32 == 0
+    """The reference's fp8 fake-quant (the model's blocks, power-of-two scales) of a bf16 vector, as fp32."""
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.numel() % ACT_BLOCK == 0
     xq = torch.empty(x.numel(), dtype=torch.float32, device=x.device)
     _check(lib().sclm_gpu_act_quant(x.data_ptr(), xq.data_ptr(), x.numel()))
     return xq
