@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from scripts.chat import ContextFull, Session, looping, pick
+from types import SimpleNamespace
+
+from rich.console import Console
+
+from scripts.chat import ContextFull, Session, command, looping, pick
 
 SPECIAL = {"<bos>": 0, "<eos>": 1, "<think>": 2, "</think>": 3, "<user>": 4, "<assistant>": 5, "<system>": 6}
 NAMES = {i: s for s, i in SPECIAL.items()}
@@ -130,15 +134,6 @@ def test_pick_takes_the_likeliest_token_or_samples_within_top_p():
     assert {pick(logits, 1.0, 0.9) for _ in range(200)} == {1, 2}
 
 
-def test_recent_tokens_are_made_less_likely_by_the_penalty():
-    logits = torch.tensor([[0.0, 3.0, 2.9, -1.0]])
-    assert pick(logits, 0.0, 1.0, [1], 1.1) == 2  # 3.0 / 1.1 is below 2.9
-    assert pick(logits, 0.0, 1.0, [1], 1.0) == 1 and pick(logits, 0.0, 1.0, [], 1.1) == 1
-    assert pick(logits, 0.0, 1.0, [1, 2, 3], 1.1) == 1  # all three: the order of the positive ones stays
-    assert pick(torch.tensor([[-1.0, -1.05, -5.0]]), 0.0, 1.0, [0], 1.1) == 1  # a negative logit is multiplied
-    assert logits[0, 1] == 3.0  # the caller's logits are left as they were
-
-
 def test_a_loop_is_recognized_and_ends_the_reply():
     piece = text_ids("Rust has x? ")
     assert looping(text_ids("so: ") + piece * 8) and looping([7] * 96) and looping([7, 8] * 48)
@@ -153,3 +148,24 @@ def test_a_loop_is_recognized_and_ends_the_reply():
     dec.script, dec.said = text_ids("ok") + [1], 0
     pieces, stats = run(session, "y")
     assert not stats["looped"] and "".join(t for _, t in pieces) == "ok"
+
+
+def test_a_setting_is_a_command_of_its_own():
+    session, cache = Session(Tok(), Decoder([1]), 200), SimpleNamespace(wait_share=0.0, topk=0)
+    opts = {"temperature": 1.0, "top_p": 0.95, "num_predict": 2048, "verbose": True, "showthink": False}
+    console = Console(force_terminal=False, width=200, record=True)
+    for line in ("/nothink", "/effort low", "/temperature 0.5", "/topk 5", "/wait-share 0.25", "/showthink", "/quiet",
+                 "/system be brief", "/num_predict 64", "/show"):
+        assert command(line, session, cache, opts, console)
+    assert (session.think, session.effort, session.system) == (False, "low", "be brief")
+    assert (opts["temperature"], opts["num_predict"], opts["showthink"], opts["verbose"]) == (0.5, 64, True, False)
+    assert (cache.topk, cache.wait_share) == (5, 0.25)
+    shown = console.export_text()  # what /show printed
+    assert "temperature 0.5" in shown and "topk 5" in shown
+    for line in ("/set think", "/set topk 4", "/set"):  # the older form means the same
+        assert command(line, session, cache, opts, console)
+    assert session.think and cache.topk == 4
+    for line in ("/effort huge", "/temperature hot", "/nonsense"):  # refused, and nothing changes
+        assert command(line, session, cache, opts, console)
+    assert session.effort == "low" and opts["temperature"] == 0.5
+    assert not command("/bye", session, cache, opts, console)
