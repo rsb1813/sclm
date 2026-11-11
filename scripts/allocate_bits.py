@@ -5,7 +5,8 @@ import os
 
 import numpy as np
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+from sclm import DATA
+
 # expert-output NMSE per option, layer 10 RTN+Had (scripts/gain_probe.py); 4 = keep the original FP4 weights (exact)
 D_OUT = {0: 1.0, 2: 0.213, 3: 0.061, 4: 0.0}
 COST = {0: 0.0, 2: 2.25, 3: 3.25, 4: 4.25}  # bpw incl. the fp16 step per 64 weights (FP4: e8m0 scale per 32)

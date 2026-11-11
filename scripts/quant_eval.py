@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+from sclm import CKPT, DATA
 from sclm import quant
 from sclm.checkpoint import Checkpoint
 from sclm.codes import load_layer, save_layer
@@ -19,7 +20,6 @@ from sclm.upstream import model as m
 
 import kernel  # noqa: E402  (on sys.path via sclm.upstream)
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 DEV = "cuda"
 TOPK = 64  # reference distribution kept as its top-64 tokens per position
 CHUNK = 256
@@ -450,7 +450,7 @@ def hedge_routing_(block, layer: int, sigma: float, hedged: torch.Tensor, p_min:
 @torch.inference_mode()
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--config", choices=list(CONFIGS), required=True)
     ap.add_argument("--freeze-routing", action="store_true", help="force the reference model's expert choices")
     ap.add_argument("--record-routing", action="store_true", help="with --config none: save the expert choices")

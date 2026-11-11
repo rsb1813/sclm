@@ -6,6 +6,7 @@ import time
 import torch
 from transformers import AutoTokenizer
 
+from sclm import CKPT
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import LayerwiseRunner, load_args
 
@@ -40,7 +41,7 @@ TEXTS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    parser.add_argument("--ckpt", default=CKPT)
     parser.add_argument("--file", help="score this text file instead of the built-in samples")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument(

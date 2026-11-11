@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
+from sclm import CKPT
 from sclm import quant
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import LayerwiseRunner, load_args
@@ -75,7 +76,7 @@ def make_method(name: str, layer: int):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--layer", type=int, default=10)
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)

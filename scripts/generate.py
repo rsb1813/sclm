@@ -8,11 +8,11 @@ import torch
 from transformers import AutoTokenizer
 
 from scripts import status
+from sclm import CKPT, DATA
 from sclm import core, host
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import VRAM_MARGIN, load_args
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 GIB = 2**30
 
 
@@ -31,11 +31,12 @@ def load_runtime(cli, background: int | None = None) -> tuple:
     ck = Checkpoint(cli.ckpt)
     args = load_args(max_batch_size=1, max_seq_len=cli.max_seq_len, **host.TEXT_ONLY)
     t0 = time.perf_counter()
-    net = host.build_net(args, tok)
+    net = host.build_net(args) if host.V4 else host.build_net(args, tok)
     host.load_checkpoint_(net, ck)
     out["resident_gib"] = torch.cuda.memory_allocated() / GIB
-    # the code files go into RAM whole: stop here rather than push the machine into paging
-    need = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
+    # the code files go into RAM whole: stop here rather than push the machine into paging. No codes (--codes none):
+    # every routed expert is an original one, the lossless model
+    need = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB if cli.codes else 0.0
     used, total_ram = status.ram()
     out.update(codes_gib=need, ram_margin_gib=total_ram - used - need)
     print(f"RAM: {total_ram - used:.1f} GiB available, the codes take {need:.1f} GiB", flush=True)
@@ -64,7 +65,7 @@ def load_runtime(cli, background: int | None = None) -> tuple:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100")
     ap.add_argument("--slots", type=int, default=370, help="original experts the VRAM cache keeps")
     ap.add_argument("--lam", type=float, default=0.1, help="cache score decay per token")

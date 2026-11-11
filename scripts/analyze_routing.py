@@ -5,7 +5,8 @@ from collections import OrderedDict
 
 import numpy as np
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+from sclm import DATA
+
 N_EXPERTS = 384
 # GPU expert-cache capacities to evaluate, in experts out of 40 * 384 = 15360
 CAPACITIES = (500, 930, 1600, 2500, 4000)

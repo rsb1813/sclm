@@ -6,7 +6,8 @@ from collections import OrderedDict
 
 import numpy as np
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+from sclm import DATA
+
 N_LAYERS, EXPERT_PARAMS = 40, 3 * 2304 * 5120
 SSD_BYTES_S = 7.4e9  # sequential read, design.md 1
 ORIG_BYTES = EXPERT_PARAMS * 4.25 / 8  # FP4 + e8m0 scale per 32, read straight from the original checkpoint

@@ -10,10 +10,10 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+from sclm import CKPT, DATA
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import LayerwiseRunner, load_args
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 DEVICE = "cuda"
 RECALL_K = (6, 12, 24)
 
@@ -73,7 +73,7 @@ class Collector:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    parser.add_argument("--ckpt", default=CKPT)
     parser.add_argument("--batch", type=int, default=2, help="sequences per forward call (VRAM bound)")
     cli = parser.parse_args()
 

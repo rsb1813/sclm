@@ -4,8 +4,8 @@
 import os
 import sys
 
-MODEL = os.environ.get("SCLM_MODEL", "v41")
-assert MODEL in ("v41", "v4"), MODEL
+from . import MODEL
+
 _HERE = os.path.dirname(__file__)
 _REF = os.path.join(_HERE, "reference")
 if _REF not in sys.path:

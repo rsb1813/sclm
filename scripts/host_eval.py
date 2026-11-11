@@ -10,17 +10,17 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+from sclm import CKPT, DATA
 from sclm import core, host
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import VRAM_MARGIN, load_args
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 CHUNK = 256  # positions per entry of eval_ref.pt
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100")
     ap.add_argument("--slots", type=int, default=320)
     ap.add_argument("--lam", type=float, default=0.1)

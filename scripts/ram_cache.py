@@ -7,9 +7,9 @@ from collections import OrderedDict
 
 import numpy as np
 
+from sclm import DATA
 from sclm import core
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 EXPERT_GB = 18.8e6 / 1e9  # an expert's bytes in a pinned buffer
 
 

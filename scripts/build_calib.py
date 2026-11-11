@@ -9,8 +9,8 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-CKPT = r"C:\models\DeepSeek-V4.1-Flash"
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+from sclm import CKPT, DATA
+
 SEQ_LEN = 2048
 DOC_MAX = 1024  # cap tokens per document so one long document cannot fill a category
 

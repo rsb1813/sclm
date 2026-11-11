@@ -8,7 +8,8 @@ from collections import OrderedDict, deque
 
 import numpy as np
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+from sclm import DATA
+
 
 
 def ssd_keys(idx: np.ndarray, on_ssd: np.ndarray) -> tuple[list, list]:

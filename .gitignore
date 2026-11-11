@@ -6,6 +6,9 @@ __pycache__/
 .pytest_cache/
 data/*
 !data/*.json
+!data/v4/
+data/v4/*
+!data/v4/*.json
 
 # never commit weights or tensors, wherever they land
 *.safetensors

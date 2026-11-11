@@ -7,6 +7,7 @@ import time
 import torch
 import torch.nn.functional as F
 
+from sclm import CKPT
 from sclm import quant
 from sclm.checkpoint import Checkpoint
 from scripts.quant_probe import DATA, DEV, SWIGLU_LIMIT, act_q, expert_out, fp4_weight, fp8_weight
@@ -119,7 +120,7 @@ def quantize(w: torch.Tensor, h: torch.Tensor | None, bits: int, rot: quant.Bloc
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--layer", type=int, default=10)
     ap.add_argument("--configs", default=",".join(CONFIGS))
     ap.add_argument("--fit-every", type=int, default=1, help="keep every m-th Hessian chunk (calibration size study)")

@@ -6,6 +6,7 @@ import os
 import numpy as np
 import torch
 
+from sclm import CKPT
 from sclm.checkpoint import Checkpoint
 from scripts.quant_probe import DATA, DEV, expert_out, fp4_weight, fp8_weight, outlier_free_nmse
 
@@ -27,7 +28,7 @@ def top_basis(sym: torch.Tensor, r: int) -> torch.Tensor:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--layer", type=int, default=10)
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)

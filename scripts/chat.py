@@ -13,6 +13,8 @@ from rich.console import Console
 
 from scripts.generate import load_runtime
 
+from sclm import CKPT
+
 HELP = """[bold]명령[/]
   /?, /help              이 도움말
   /bye, /exit            끝내기 (Ctrl+D도 같음)
@@ -249,7 +251,7 @@ def reply(line: str, session: Session, opts: dict, console: Console) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100",
                     help=r"the CPU tier's codes (C:\models\sclm-codes\tier20p02 with --wait-share 0.25: twice as fast, "
                     "but its replies lose the thread)")

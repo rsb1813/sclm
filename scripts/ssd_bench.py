@@ -9,11 +9,11 @@ import numpy as np
 import torch
 
 from scripts import cache_policy
+from sclm import CKPT, DATA
 from sclm import core
 from sclm.checkpoint import Checkpoint
 from sclm.ssd import ExpertReader
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 
 
 def verify(ck: Checkpoint, rd: ExpertReader, experts: list) -> None:
@@ -81,7 +81,7 @@ def replay(rd, idx, on_ssd, slots, lam, windows, pool, mode):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--alloc", default="tier20v100")
     ap.add_argument("--slots", type=int, default=370)
     ap.add_argument("--lam", type=float, default=0.1)

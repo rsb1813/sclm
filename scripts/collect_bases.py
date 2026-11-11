@@ -7,10 +7,10 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
+from sclm import CKPT, DATA
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import LayerwiseRunner, load_args
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 KEEP = 1024  # eigenvectors kept per basis
 
 
@@ -55,7 +55,7 @@ class CovCollector:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--seqs", type=int, default=16)
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)

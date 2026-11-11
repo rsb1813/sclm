@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+from sclm import CKPT, DATA
 from sclm import quant
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import LayerwiseRunner, load_args
@@ -16,7 +17,6 @@ from sclm.upstream import model as m
 
 import kernel  # noqa: E402  (on sys.path via sclm.upstream)
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 DEV = "cuda"
 SWIGLU_LIMIT = 10.0
 
@@ -111,7 +111,7 @@ def build_quantizer(kind: str, p: dict, mats, rot: quant.BlockHadamard | None):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
+    ap.add_argument("--ckpt", default=CKPT)
     ap.add_argument("--layer", type=int, default=10)
     ap.add_argument("--configs", default=",".join(CONFIGS))
     cli = ap.parse_args()
