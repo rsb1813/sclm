@@ -104,21 +104,31 @@ __global__ void rope_k(uint16_t* x, const float* freqs, int heads, int head_dim,
 // kernel.sparse_attn for one query token, block h for head h: kv is both key and value, position idx[t] being
 // window[idx] below `win` and compressed[idx - win] from there on, -1 an empty slot. A learned sink logit joins the
 // softmax's denominator; the probabilities go through bf16 before weighting the values, as upstream.
+// Every read takes four adjacent bf16 values (d is a multiple of 4), and neighbouring lanes read neighbouring
+// words: a thread walking a vector of its own made each read of a warp 32 scattered ones (0.6 us a position).
+__device__ __forceinline__ float bf16_at(uint64_t w, int i) { return from_bf16(uint16_t(w >> (16 * i))); }
+
 __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const uint16_t* compressed, const int* idx,
                               const float* sink, uint16_t* out, int count, int d, int win, float scale) {
     __shared__ float p[1024];
+    __shared__ float part[4096];  // the output's partial sums: [share of the positions][d]
     const uint16_t* qh = q + size_t(blockIdx.x) * d;
+    const int lane = threadIdx.x & 31;
     float mx = -INFINITY;
-    for (int t = threadIdx.x; t < count; t += blockDim.x) {
+    for (int t = threadIdx.x >> 5; t < count; t += blockDim.x >> 5) {  // a warp scores one position at a time
         const int at = idx[t];
         float sc = -INFINITY;
         if (at >= 0) {
             const uint16_t* kv = at < win ? window + size_t(at) * d : compressed + size_t(at - win) * d;
             sc = 0;
-            for (int i = 0; i < d; ++i) sc += from_bf16(qh[i]) * from_bf16(kv[i]);
+            for (int i = 4 * lane; i < d; i += 128) {
+                const uint64_t a = *(const uint64_t*)(qh + i), b = *(const uint64_t*)(kv + i);
+                for (int k = 0; k < 4; ++k) sc += bf16_at(a, k) * bf16_at(b, k);
+            }
+            for (int o = 16; o; o >>= 1) sc += __shfl_xor_sync(0xffffffff, sc, o);
             sc *= scale;
         }
-        p[t] = sc;
+        if (lane == 0) p[t] = sc;
         mx = fmaxf(mx, sc);
     }
     mx = fmaxf(block_reduce(mx, true), -1e30f);  // upstream's running maximum starts at -1e30: an empty row gives zeros
@@ -129,13 +139,23 @@ __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const u
         p[t] = from_bf16(to_bf16(e));
     }
     const float denom = block_reduce(sum, false) + expf(sink[blockIdx.x] - mx);
-    for (int i = threadIdx.x; i < d; i += blockDim.x) {
-        float o = 0;
-        for (int t = 0; t < count; ++t) {
+    // a thread weights four adjacent values of every parts-th position; the shares are added up afterwards
+    const int groups = d / 4, parts = blockDim.x / groups, g = threadIdx.x % groups, share = threadIdx.x / groups;
+    if (share < parts) {
+        float o[4] = {0, 0, 0, 0};
+        for (int t = share; t < count; t += parts) {
             const int at = idx[t];
             if (at < 0) continue;
-            o += p[t] * from_bf16((at < win ? window + size_t(at) * d : compressed + size_t(at - win) * d)[i]);
+            const uint16_t* kv = at < win ? window + size_t(at) * d : compressed + size_t(at - win) * d;
+            const uint64_t w = *(const uint64_t*)(kv + 4 * g);
+            for (int k = 0; k < 4; ++k) o[k] += p[t] * bf16_at(w, k);
         }
+        for (int k = 0; k < 4; ++k) part[share * d + 4 * g + k] = o[k];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float o = 0;
+        for (int k = 0; k < parts; ++k) o += part[k * d + i];
         out[size_t(blockIdx.x) * d + i] = to_bf16(o / denom);
     }
 }
@@ -250,37 +270,34 @@ __global__ void hc_dots_k(const uint16_t* h, const float* fn, float* dots, int n
         const float v = from_bf16(h[c]);
         acc += (row < rows ? fn[size_t(row) * n + c] : v) * v;
     }
-    acc = block_sum(acc);
+    acc = block_reduce(acc, false);
     if (threadIdx.x == 0) dots[row] = acc;
 }
 
-// Second half (kernel.hc_split_sinkhorn on mixes = dots * rsqrt(mean square + norm_eps)), one thread:
-// out = pre[hc], post[hc], comb[hc][hc] with comb made doubly stochastic by `iters` Sinkhorn rounds.
+// Second half (kernel.hc_split_sinkhorn on mixes = dots * rsqrt(mean square + norm_eps)), one warp:
+// out = pre[hc], post[hc], comb[hc][hc] with comb made doubly stochastic by `iters` Sinkhorn rounds. A lane holds
+// one entry of comb (hc * hc <= 32); a single thread took 30 us over the divisions.
 __global__ void hc_split_k(const float* dots, const float* scale, const float* base, float* out, int n, int hc,
                            float norm_eps, float eps, int iters) {
+    const unsigned all = 0xffffffff;
+    const int lane = threadIdx.x, j = min(lane / hc, hc - 1), c = lane % hc;  // lanes past hc * hc repeat the last row
     const float r = rsqrtf(dots[(2 + hc) * hc] / float(n) + norm_eps);
-    float comb[8][8];
-    for (int i = 0; i < hc; ++i) {
-        out[i] = 1.0f / (1.0f + expf(-(dots[i] * r * scale[0] + base[i]))) + eps;
-        out[hc + i] = 2.0f / (1.0f + expf(-(dots[hc + i] * r * scale[1] + base[hc + i])));
+    if (lane < hc) {
+        out[lane] = 1.0f / (1.0f + expf(-(dots[lane] * r * scale[0] + base[lane]))) + eps;
+        out[hc + lane] = 2.0f / (1.0f + expf(-(dots[hc + lane] * r * scale[1] + base[hc + lane])));
     }
-    for (int j = 0; j < hc; ++j) {  // softmax over each row, then columns, then alternate
-        float mx = -INFINITY, sum = 0;
-        for (int c = 0; c < hc; ++c) {
-            comb[j][c] = dots[2 * hc + j * hc + c] * r * scale[2] + base[2 * hc + j * hc + c];
-            mx = fmaxf(mx, comb[j][c]);
-        }
-        for (int c = 0; c < hc; ++c) sum += comb[j][c] = expf(comb[j][c] - mx);
-        for (int c = 0; c < hc; ++c) comb[j][c] = comb[j][c] / sum + eps;
+    // softmax over each row, then columns, then alternate; every sum runs over its row or column in order
+    float v = dots[2 * hc + j * hc + c] * r * scale[2] + base[2 * hc + j * hc + c], mx = -INFINITY, sum = 0;
+    for (int k = 0; k < hc; ++k) mx = fmaxf(mx, __shfl_sync(all, v, j * hc + k));
+    v = expf(v - mx);
+    for (int k = 0; k < hc; ++k) sum += __shfl_sync(all, v, j * hc + k);
+    v = v / sum + eps;
+    for (int it = 0; it < 2 * iters - 1; ++it) {  // even rounds: columns (sum over rows); odd rounds: rows
+        sum = 0;
+        for (int k = 0; k < hc; ++k) sum += __shfl_sync(all, v, it & 1 ? j * hc + k : k * hc + c);
+        v /= sum + eps;
     }
-    for (int it = 0; it < 2 * iters - 1; ++it)
-        for (int a = 0; a < hc; ++a) {  // even rounds: columns (sum over rows); odd rounds: rows
-            float sum = 0;
-            for (int b = 0; b < hc; ++b) sum += it & 1 ? comb[a][b] : comb[b][a];
-            for (int b = 0; b < hc; ++b) (it & 1 ? comb[a][b] : comb[b][a]) /= sum + eps;
-        }
-    for (int j = 0; j < hc; ++j)
-        for (int c = 0; c < hc; ++c) out[2 * hc + j * hc + c] = comb[j][c];
+    if (lane < hc * hc) out[2 * hc + lane] = v;
 }
 
 // Block.hc_pre then RMSNorm: y = bf16(sum over the hc copies of pre[c] * h[c]), out = bf16(w * y * rsqrt(mean(y^2) + eps)).
@@ -409,8 +426,8 @@ API int sclm_gpu_attn_kv(const uint8_t* w, const uint8_t* s, const uint16_t* nor
 // out[heads * d] (bf16) = kernel.sparse_attn of one token's q over the `count` positions idx names (see sparse_attn_k).
 API int sclm_gpu_sparse_attn(const uint16_t* q, const uint16_t* window, const uint16_t* compressed, const int* idx,
                              const float* sink, uint16_t* out, int heads, int d, int count, int win, float scale) {
-    if (count > 1024) return -1;
-    sparse_attn_k<<<heads, 256>>>(q, window, compressed, idx, sink, out, count, d, win, scale);
+    if (count > 1024 || d % 4 || d > 4096) return -1;
+    sparse_attn_k<<<heads, 1024>>>(q, window, compressed, idx, sink, out, count, d, win, scale);
     return cudaGetLastError();
 }
 
@@ -434,11 +451,11 @@ API int sclm_gpu_attn_out(uint16_t* o, const float* freqs, const uint8_t* wa, co
 // fn is [(2 + hc) * hc][hc * dim], scale [3], base [(2 + hc) * hc], all fp32.
 API int sclm_gpu_hc_mixes(const uint16_t* h, const float* fn, const float* scale, const float* base, float* mixes, int dim,
                           int hc, float norm_eps, float eps, int iters) {
-    if (hc > 8) return -1;
+    if (hc > 5) return -1;  // hc_split_k keeps comb in one warp
     ensure_scratch();
     const int rows = (2 + hc) * hc;
-    hc_dots_k<<<rows + 1, 256>>>(h, fn, scratch.dots, hc * dim, rows);
-    hc_split_k<<<1, 1>>>(scratch.dots, scale, base, mixes, hc * dim, hc, norm_eps, eps, iters);
+    hc_dots_k<<<rows + 1, 1024>>>(h, fn, scratch.dots, hc * dim, rows);
+    hc_split_k<<<1, 32>>>(scratch.dots, scale, base, mixes, hc * dim, hc, norm_eps, eps, iters);
     return cudaGetLastError();
 }
 
