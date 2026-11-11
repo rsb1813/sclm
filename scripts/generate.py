@@ -16,6 +16,43 @@ DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 GIB = 2**30
 
 
+def load_runtime(cli, background: int | None = None) -> tuple:
+    """(tokenizer, expert cache, decoder, facts about the load) of the tiered model for the options in cli (ckpt,
+    codes, slots, lam, threads, max_seq_len, min_ram_margin, wait_share, ram_share, topk, guess). background:
+    staging buffers for unwaited reads (default: what the options given need)."""
+    torch.set_default_dtype(torch.bfloat16)
+    # Windows pages over-subscribed VRAM out to system RAM instead of failing: cap the process so it fails instead
+    free, total = torch.cuda.mem_get_info()
+    torch.cuda.set_per_process_memory_fraction((free - VRAM_MARGIN) / total)
+    out = {"slots": cli.slots, "lam": cli.lam, "threads": cli.threads, "codes": cli.codes,
+           "vram_free_at_start_gib": free / GIB, "ram_used_at_start_gib": status.ram()[0]}
+
+    tok = AutoTokenizer.from_pretrained(cli.ckpt)
+    ck = Checkpoint(cli.ckpt)
+    args = load_args(max_batch_size=1, max_seq_len=cli.max_seq_len, **host.TEXT_ONLY)
+    t0 = time.perf_counter()
+    net = host.build_net(args, tok)
+    host.load_checkpoint_(net, ck)
+    out["resident_gib"] = torch.cuda.memory_allocated() / GIB
+    # the code files go into RAM whole: stop here rather than push the machine into paging
+    need = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
+    used, total_ram = status.ram()
+    out.update(codes_gib=need, ram_margin_gib=total_ram - used - need)
+    print(f"RAM: {total_ram - used:.1f} GiB available, the codes take {need:.1f} GiB", flush=True)
+    if out["ram_margin_gib"] < cli.min_ram_margin:
+        raise SystemExit(f"only {out['ram_margin_gib']:.1f} GiB of RAM would be left (--min-ram-margin {cli.min_ram_margin})")
+    if background is None:
+        background = (12 if cli.wait_share else 0) + (16 if cli.guess else 0)
+    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam, background=background)
+    cache.topk, cache.wait_share, cache.ram_share, cache.guess = cli.topk, cli.wait_share, cli.ram_share, cli.guess
+    out.update(load_s=time.perf_counter() - t0, allocated_gib=torch.cuda.memory_allocated() / GIB,
+               ram_used_loaded_gib=status.ram()[0])
+    print(f"loaded in {out['load_s']:.0f}s: resident {out['resident_gib']:.2f} GiB, with the cache "
+          f"{out['allocated_gib']:.2f} GiB of VRAM; system RAM in use {out['ram_used_loaded_gib']:.1f} GiB", flush=True)
+    core.set_threads(cli.threads)
+    return tok, cache, host.Host(net, cache), out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
@@ -39,36 +76,7 @@ def main() -> None:
     ap.add_argument("--name", default="stage3")
     cli = ap.parse_args()
 
-    torch.set_default_dtype(torch.bfloat16)
-    # Windows pages over-subscribed VRAM out to system RAM instead of failing: cap the process so it fails instead
-    free, total = torch.cuda.mem_get_info()
-    torch.cuda.set_per_process_memory_fraction((free - VRAM_MARGIN) / total)
-    out = {"slots": cli.slots, "lam": cli.lam, "threads": cli.threads, "codes": cli.codes,
-           "vram_free_at_start_gib": free / GIB, "ram_used_at_start_gib": status.ram()[0]}
-
-    tok = AutoTokenizer.from_pretrained(cli.ckpt)
-    ck = Checkpoint(cli.ckpt)
-    args = load_args(max_batch_size=1, max_seq_len=cli.max_seq_len, **host.TEXT_ONLY)
-    t0 = time.perf_counter()
-    net = host.build_net(args, tok)
-    host.load_checkpoint_(net, ck)
-    out["resident_gib"] = torch.cuda.memory_allocated() / GIB
-    # the code files go into RAM whole: stop here rather than push the machine into paging
-    need = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
-    used, total_ram = status.ram()
-    out.update(codes_gib=need, ram_margin_gib=total_ram - used - need)
-    print(f"RAM: {total_ram - used:.1f} GiB available, the codes take {need:.1f} GiB", flush=True)
-    if out["ram_margin_gib"] < cli.min_ram_margin:
-        raise SystemExit(f"only {out['ram_margin_gib']:.1f} GiB of RAM would be left (--min-ram-margin {cli.min_ram_margin})")
-    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam,
-                               background=(12 if cli.wait_share else 0) + (16 if cli.guess else 0))
-    cache.topk, cache.wait_share, cache.ram_share, cache.guess = cli.topk, cli.wait_share, cli.ram_share, cli.guess
-    out.update(load_s=time.perf_counter() - t0, allocated_gib=torch.cuda.memory_allocated() / GIB,
-               ram_used_loaded_gib=status.ram()[0])
-    print(f"loaded in {out['load_s']:.0f}s: resident {out['resident_gib']:.2f} GiB, with the cache "
-          f"{out['allocated_gib']:.2f} GiB of VRAM; system RAM in use {out['ram_used_loaded_gib']:.1f} GiB", flush=True)
-    core.set_threads(cli.threads)
-    decoder = host.Host(net, cache)
+    tok, cache, decoder, out = load_runtime(cli)
 
     text = cli.prompt if cli.raw else tok.apply_chat_template([{"role": "user", "content": cli.prompt}],
                                                               add_generation_prompt=True, tokenize=False)
