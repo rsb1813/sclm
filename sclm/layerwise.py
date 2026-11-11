@@ -2,14 +2,16 @@
 import gc
 import json
 import os
+from types import SimpleNamespace
 from typing import Callable
 
 import torch
 import torch.nn.functional as F
 
 from .checkpoint import Checkpoint, MappedEngramEmbedding
-from .upstream import CONFIG_PATH, engram, model as m
+from .upstream import CONFIG_PATH, MODEL, engram, model as m
 
+V4 = MODEL == "v4"  # DeepSeek-V4-Flash-0731: no engram, no state handed from layer to layer, a hyper-connection head
 QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e8m0fnu, torch.float4_e2m1fn_x2)
 # cross-layer attention state upstream hands down the stack through its global `shared_attn`
 SHARED_ATTN_FIELDS = ("compress_kv", "index_k", "topk_idxs", "candidates")
@@ -54,6 +56,9 @@ class LayerwiseRunner:
         # upstream sets these globals in Transformer.__init__, which is never built here
         m.world_size, m.rank = 1, 0
         m.default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        if V4:
+            m.scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
+            m.scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
         self.ckpt, self.args, self.device = ckpt, args, device
         if device.startswith("cuda"):
             # Windows (WDDM) pages over-subscribed VRAM out to system RAM instead of failing, so PyTorch's caching
@@ -62,12 +67,19 @@ class LayerwiseRunner:
             index = torch.cuda.current_device() if index is None else index
             free, total = torch.cuda.mem_get_info(index)
             torch.cuda.set_per_process_memory_fraction((free - VRAM_MARGIN) / total, index)
-        self.layout = engram.EngramLayout.from_args(args)
-        with torch.device(device):
-            self.hash = engram.NgramHashState(args, self.layout, tokenizer)
+        self.layout = self.hash = None
+        if not V4:
+            self.layout = engram.EngramLayout.from_args(args)
+            with torch.device(device):
+                self.hash = engram.NgramHashState(args, self.layout, tokenizer)
 
     def build_block(self, layer_id: int) -> "m.Block":
         prefix = f"layers.{layer_id}."
+        if V4:
+            with torch.device(self.device):
+                block = m.Block(layer_id, self.args)
+            load_params_(block, self.ckpt.module_state(prefix), prefix)
+            return block
         upstream_table = m.ParallelEngramEmbedding
         m.ParallelEngramEmbedding = _NoTable
         try:
@@ -115,7 +127,7 @@ class LayerwiseRunner:
     def _hidden_batches(self, batches, n_layers, before_block, before_batch, checkpoint, every) -> list[torch.Tensor]:
         args = self.args
         n_layers = args.n_layers if n_layers is None else n_layers
-        hashes = [self.hash(ids.to(self.device), 0) for ids in batches]
+        hashes = [None if V4 else self.hash(ids.to(self.device), 0) for ids in batches]
         if checkpoint and os.path.exists(checkpoint):
             start, hs, mixes, shared = torch.load(checkpoint, weights_only=True)
         else:
@@ -123,7 +135,7 @@ class LayerwiseRunner:
             start, hs, mixes, shared = 0, [], [], []
             for ids in batches:
                 h = F.embedding(ids.to(self.device), embed).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
-                mixes.append(m.make_identity_pre_mix(h, args.hc_mult))
+                mixes.append(None if V4 else m.make_identity_pre_mix(h, args.hc_mult))
                 hs.append(h.cpu())
                 shared.append({})
             del embed
@@ -137,6 +149,9 @@ class LayerwiseRunner:
                 if before_batch is not None:
                     before_batch(i, j)
                 h = hs[j].to(self.device)
+                if V4:  # every block keeps its own attention state, and the token ids pick the hash layers' experts
+                    hs[j] = block(h, 0, batches[j].to(self.device)).cpu()
+                    continue
                 if block.engram is not None:
                     h = block.engram(h, hashes[j][:, :, block.engram.layer_hash_index, :], None)
                 h, mixes[j] = block(h, 0, mixes[j], None)
@@ -150,6 +165,10 @@ class LayerwiseRunner:
             if checkpoint and (i + 1) % every == 0 and i + 1 < n_layers:
                 torch.save((i + 1, hs, mixes, shared), checkpoint + ".tmp")
                 os.replace(checkpoint + ".tmp", checkpoint)
+        if V4:
+            head = SimpleNamespace(norm_eps=args.norm_eps, hc_eps=args.hc_eps)  # what upstream's hc_head reads of its block
+            fn, scale, base = (self.ckpt.get(f"hc_head_{k}").to(self.device) for k in ("fn", "scale", "base"))
+            return [m.Block.hc_head(head, h.to(self.device), fn, scale, base).cpu() for h in hs]
         return [m.Block.hc_pre(None, h.to(self.device), mix).cpu() for h, mix in zip(hs, mixes)]
 
     @torch.inference_mode()
