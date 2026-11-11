@@ -1,0 +1,75 @@
+{
+ "name": "q175",
+ "codes": "C:\\models\\sclm-codes\\v4-q175",
+ "tokens": 1361,
+ "thinking_tokens": 751,
+ "looped": false,
+ "all": {
+  "kl": 0.014954482205212116,
+  "top1_agree": 0.9750183820724487,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.2872582674026489
+ },
+ "thinking": {
+  "kl": 0.019522305577993393,
+  "top1_agree": 0.9667110443115234,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.3946942687034607
+ },
+ "answer": {
+  "kl": 0.009330816566944122,
+  "top1_agree": 0.9852458834648132,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.15498867630958557
+ },
+ "largest_gaps": [
+  {
+   "at": 61,
+   "token": " number",
+   "runtime_p": 0.675,
+   "original_p": 0.0229
+  },
+  {
+   "at": 332,
+   "token": " u",
+   "runtime_p": 0.831,
+   "original_p": 0.2701
+  },
+  {
+   "at": 1268,
+   "token": ",",
+   "runtime_p": 0.608,
+   "original_p": 0.0634
+  },
+  {
+   "at": 1123,
+   "token": " match",
+   "runtime_p": 0.624,
+   "original_p": 0.2192
+  },
+  {
+   "at": 812,
+   "token": "하는",
+   "runtime_p": 0.634,
+   "original_p": 0.2704
+  },
+  {
+   "at": 758,
+   "token": " **",
+   "runtime_p": 0.497,
+   "original_p": 0.175
+  },
+  {
+   "at": 298,
+   "token": "32",
+   "runtime_p": 0.882,
+   "original_p": 0.5779
+  },
+  {
+   "at": 751,
+   "token": "아",
+   "runtime_p": 0.376,
+   "original_p": 0.0854
+  }
+ ]
+}
