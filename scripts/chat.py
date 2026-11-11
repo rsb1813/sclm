@@ -11,8 +11,7 @@ import time
 import torch
 from rich.console import Console
 
-from scripts import status
-from scripts.generate import GIB, load_runtime
+from scripts.generate import load_runtime
 
 HELP = """[bold]명령[/]
   /?, /help              이 도움말
@@ -283,10 +282,6 @@ def main() -> None:
                     "18.8 MB each of pinned memory (default: what fits, up to 1200, leaving 3 GiB free)")
     cli = ap.parse_args()
     cli.ram_share = 0.0
-    if cli.ram_cache < 0:
-        used, total = status.ram()
-        codes = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
-        cli.ram_cache = max(0, min(1200, int((total - used - codes - 3.0) * GIB / 18.8e6)))
     console = Console()
     console.print("[grey62]모델을 올리는 중입니다 (약 20초)…[/]")
     import transformers
