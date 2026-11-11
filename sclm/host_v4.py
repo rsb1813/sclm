@@ -37,9 +37,10 @@ class V4Attention(m.Attention):
         q_norm, kv_norm = self.q_norm.weight.to(torch.bfloat16), self.kv_norm.weight.to(torch.bfloat16)
 
         def pool(comp, rows):  # the token, its number in the group, the group's rotation, the group's row of `rows`
-            return gpu.bind("pool", comp.wkv.weight, comp.wgate.weight, comp.ape, comp.norm.weight.to(torch.bfloat16), later,
-                            comp.kv_state, comp.score_state, comp.compress_ratio, comp.overlap, later, later, later, dim,
-                            comp.head_dim, rd, comp.norm.eps, comp.rotate), rows.data_ptr(), comp.head_dim * 2
+            launch = gpu.bind("pool", comp.wkv.weight, comp.wgate.weight, comp.ape, comp.norm.weight.to(torch.bfloat16), later,
+                              comp.kv_state, comp.score_state, comp.compress_ratio, comp.overlap, later, later, later, dim,
+                              comp.head_dim, rd, comp.norm.eps, comp.rotate, comp.wkv.weight.dtype == torch.bfloat16)
+            return launch, rows.data_ptr(), comp.head_dim * 2
 
         ratio = self.compress_ratio
         index = self.indexer if ratio else None

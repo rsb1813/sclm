@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sclm import ACT_BLOCK, gpu, upstream
+from sclm import ACT_BLOCK, gpu, host, upstream
 from sclm.checkpoint import widen_fp8
 from test_gpu import close
 from test_v4_model_small import SMALL, build
@@ -209,8 +209,9 @@ def test_hyper_connection_steps_match_upstream_block():
     close(gpu.hc_post(x, h, post.flatten().contiguous(), comb.flatten().contiguous()), m.Block.hc_post(None, x, h, post, comb))
 
 
+@pytest.mark.parametrize("stored", [False, True])  # the projections as upstream's fp32 copies, or bf16 as the checkpoint stores them
 @pytest.mark.parametrize("which", ["ratio 4", "ratio 16", "index"])
-def test_pool_matches_upstream_compressor(small_net, which):
+def test_pool_matches_upstream_compressor(small_net, which, stored):
     args, ours_net, theirs_net = small_net
     layer = 3 if which == "ratio 16" else 2
     pick = (lambda net: net.layers[layer].attn.indexer.compressor) if which == "index" else (lambda net: net.layers[layer].attn.compressor)
@@ -223,6 +224,11 @@ def test_pool_matches_upstream_compressor(small_net, which):
         for comp in (ours, theirs):
             comp.ape.copy_(0.5 * torch.randn(comp.ape.shape, generator=torch.Generator(device=DEV).manual_seed(12), device=DEV, dtype=torch.float32))
             comp.kv_cache, comp.freqs_cis = torch.zeros(1, 16, d, dtype=torch.bfloat16, device=DEV), freqs
+    if stored:
+        with torch.no_grad():
+            for lin in (theirs.wkv, theirs.wgate):
+                lin.weight.copy_(lin.weight.to(torch.bfloat16))
+        ours.wkv, ours.wgate = host.Bf16Proj(theirs.wkv.weight), host.Bf16Proj(theirs.wgate.weight)
     norm_w = ours.norm.weight.to(torch.bfloat16)
     groups = 0
     for pos in range(1, 3 * ratio + 2):

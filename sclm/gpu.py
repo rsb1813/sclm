@@ -35,7 +35,7 @@ def lib():
         _lib.sclm_gpu_moe_begin.argtypes = ([C.c_void_p] * 5 + [C.c_int] * 3 + [C.c_float] * 2 + [C.c_int] + [C.c_void_p] * 5 +
                                             [C.c_int] * 2 + [C.c_float] * 2 + [C.c_void_p] * 6 + [C.c_int, C.c_float] +
                                             [C.c_void_p] * 4)
-        _lib.sclm_gpu_pool.argtypes = [C.c_void_p] * 7 + [C.c_int] * 3 + [C.c_void_p] * 2 + [C.c_int] * 3 + [C.c_float, C.c_int]
+        _lib.sclm_gpu_pool.argtypes = [C.c_void_p] * 7 + [C.c_int] * 3 + [C.c_void_p] * 2 + [C.c_int] * 3 + [C.c_float, C.c_int, C.c_int]
         _lib.sclm_gpu_moe_guess.argtypes = []
         _lib.sclm_gpu_moe_end.argtypes = [C.c_void_p] * 5 + [C.c_int]
         _lib.sclm_gpu_copy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
@@ -192,14 +192,15 @@ def pool(compressor, x: torch.Tensor, pos: int, freqs_cis: torch.Tensor, norm_we
     token, and when the token completes a group of compress_ratio, out (bf16 [head_dim], the group's row of the cache
     the compressor fills) gets the group's latent: normed (norm_weight: the norm's weight as bf16), rotated, and
     rounded as upstream rounds it (FP8 on the unrotated values, or the index's Hadamard-rotated FP4 keys for a
-    compressor made with rotate). freqs_cis: the attention's rotations."""
+    compressor made with rotate). freqs_cis: the attention's rotations. The projections are upstream's fp32 ones or
+    the host's bf16 ones (host.Bf16Proj)."""
     ratio, d, rd = compressor.compress_ratio, compressor.head_dim, compressor.rope_head_dim
     assert x.dtype == out.dtype == norm_weight.dtype == torch.bfloat16 and x.is_contiguous() and out.numel() == d
     _check(lib().sclm_gpu_pool(
         compressor.wkv.weight.data_ptr(), compressor.wgate.weight.data_ptr(), compressor.ape.data_ptr(), norm_weight.data_ptr(),
         x.data_ptr(), compressor.kv_state.data_ptr(), compressor.score_state.data_ptr(), ratio, compressor.overlap, pos % ratio,
         freqs_cis.data_ptr() + (pos + 1 - ratio) * rd * 4, out.data_ptr(), x.numel(), d, rd, compressor.norm.eps,
-        compressor.rotate))
+        compressor.rotate, compressor.wkv.weight.dtype == torch.bfloat16))
 
 
 def index_pick(indexer, qr: torch.Tensor, x: torch.Tensor, freqs: int, keys: torch.Tensor, count: int, out: torch.Tensor,

@@ -539,8 +539,9 @@ __global__ void dots_k(const W* w, const uint16_t* x, float* out, int k) {
     if (threadIdx.x == 0) out[blockIdx.x] = acc;
 }
 
-// out[row] = <w[row], x> + add[row] (add may be null) for an fp32 weight with rows of k values and x in bf16.
-__global__ void dots_add_k(const float* w, const uint16_t* x, float* out, int k, const float* add) {
+// out[row] = <w[row], x> + add[row] (add may be null) for a bf16 or fp32 weight with rows of k values and x in bf16.
+template <class W>
+__global__ void dots_add_k(const W* w, const uint16_t* x, float* out, int k, const float* add) {
     const float acc = dense_dot(w + size_t(blockIdx.x) * k, x, k);
     if (threadIdx.x == 0) out[blockIdx.x] = add ? acc + add[blockIdx.x] : acc;
 }
@@ -1058,16 +1059,23 @@ API int sclm_gpu_compress(const void* wkv, const float* wgate, const uint16_t* n
 // When the token completes its group (slot == ratio - 1): out[d] (bf16) = the group's pooled latent, normed
 // (norm_w, bf16), rotated by freqs (the rotation of the group's first position) and rounded: FP8 over blocks of 64 on
 // the values that are not rotated, or with hadamard the index's rotated FP4 keys; and with overlap this group's rows
-// take the place of the group before.
-API int sclm_gpu_pool(const float* wkv, const float* wgate, const float* ape, const uint16_t* norm_w, const uint16_t* x,
+// take the place of the group before. bf16_w: wkv and wgate are bf16, as the checkpoint stores them (the same values
+// in half the memory).
+API int sclm_gpu_pool(const void* wkv, const void* wgate, const float* ape, const uint16_t* norm_w, const uint16_t* x,
                       float* kv_state, float* score_state, int ratio, int overlap, int slot, const float* freqs, uint16_t* out,
-                      int dim, int d, int rd, float eps, int hadamard) {
+                      int dim, int d, int rd, float eps, int hadamard, int bf16_w) {
     const int width = overlap ? 2 * d : d;
     const size_t row = size_t(overlap ? ratio + slot : slot) * width;
     if (d > 1024 || d % 32 || rd % 2 || (hadamard ? d & (d - 1) : (d - rd) % 64)) return -1;
     ensure_scratch();
-    dots_add_k<<<width, 128>>>(wkv, x, kv_state + row, dim, nullptr);
-    dots_add_k<<<width, 128>>>(wgate, x, score_state + row, dim, ape + size_t(slot) * width);
+    const float* add = ape + size_t(slot) * width;
+    if (bf16_w) {
+        dots_add_k<uint16_t><<<width, 128>>>((const uint16_t*)wkv, x, kv_state + row, dim, nullptr);
+        dots_add_k<uint16_t><<<width, 128>>>((const uint16_t*)wgate, x, score_state + row, dim, add);
+    } else {
+        dots_add_k<float><<<width, 128>>>((const float*)wkv, x, kv_state + row, dim, nullptr);
+        dots_add_k<float><<<width, 128>>>((const float*)wgate, x, score_state + row, dim, add);
+    }
     if (slot != ratio - 1) return cudaGetLastError();
     pool_k<<<1, d>>>(kv_state, score_state, ratio, overlap != 0, norm_w, scratch.h, d, eps);
     rope_round_k<<<1, d>>>(scratch.h, freqs, out, d, rd, 64, hadamard != 0, float(1.0 / sqrt(double(d))));

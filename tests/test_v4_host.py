@@ -34,8 +34,13 @@ def models(tmp_path):
         g = torch.Generator(device=DEV).manual_seed(4)
         with torch.no_grad():
             ref.head.weight.copy_(ref.head.weight.to(torch.bfloat16))  # the released head is bf16
+            for comp in ref.modules():  # and so are the compressors' projections, which the host keeps in bf16
+                if isinstance(comp, m.Compressor):
+                    for lin in (comp.wkv, comp.wgate):
+                        lin.weight.copy_(lin.weight.to(torch.bfloat16))
             placed = (".ffn.experts.", "embed.", "head.")
             load_params_(net, {name: p for name, p in ref.named_parameters() if not any(s in name for s in placed)}, "")
+            host.keep_bf16_(net)
             for theirs, ours in zip(ref.layers, net.layers):  # wo_a: fp8 with block scales, as the checkpoint stores it
                 weight, scale = rand_fp8(g, *theirs.attn.wo_a.weight.shape)
                 theirs.attn.wo_a.weight.copy_(widen_fp8(weight, scale))

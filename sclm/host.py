@@ -88,6 +88,26 @@ class Fp8Weight(nn.Module):
         return widen_fp8(self.fp8, self.scale)
 
 
+class Bf16Proj(nn.Module):
+    """A projection of V4-Flash-0731's Compressor (wkv, wgate) as the checkpoint stores it, bf16. upstream keeps an
+    fp32 copy of the same values (twice the memory, 0.6 GiB over the model); here upstream's fp32 path widens it at
+    each use, and the engine's pool kernel reads it as it is."""
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight.to(torch.bfloat16), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight.to(x.dtype))
+
+
+def keep_bf16_(net: nn.Module) -> None:
+    """Every Compressor's projections go back to bf16 (Bf16Proj)."""
+    for comp in net.modules():
+        if isinstance(comp, m.Compressor):
+            comp.wkv, comp.wgate = Bf16Proj(comp.wkv.weight), Bf16Proj(comp.wgate.weight)
+
+
 _upstream_linear = m.linear
 
 
@@ -295,13 +315,15 @@ def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.T
 
 def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda") -> None:
     """Fills build_net's model from the released checkpoint. The engram tables stay in the checkpoint files, the
-    embedding table in RAM, the head in bf16 and attn.wo_a in fp8."""
+    embedding table in RAM, the head in bf16, attn.wo_a in fp8 and V4-Flash-0731's compressor projections in bf16."""
     net.embed = HostEmbedding(ckpt.get("embed.weight"))
     if V4:
         for i, block in enumerate(net.layers):
             prefix = f"layers.{i}."
             block.attn.wo_a = Fp8Weight(*(ckpt.get(f"{prefix}attn.wo_a.{part}").to(device) for part in ("weight", "scale")))
             load_params_(block, ckpt.module_state(prefix, skip=(".ffn.experts.", ".attn.wo_a.")), prefix)
+            keep_bf16_(block)
+        torch.cuda.empty_cache()  # the fp32 copies' memory goes back to the device: the expert cache is sized by what is free
         with torch.no_grad():
             for part in ("fn", "base", "scale"):  # the head's hyper-connection
                 getattr(net, "hc_head_" + part).copy_(ckpt.get("hc_head_" + part))
