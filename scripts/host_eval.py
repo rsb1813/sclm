@@ -41,6 +41,8 @@ def main() -> None:
                     "into the CPU's cache while the device computes the attention before them (0: none)")
     ap.add_argument("--ram-cache", type=int, default=0, help="experts kept in RAM after they leave the VRAM cache, "
                     "18.8 MB each of pinned memory (scripts/ram_cache.py)")
+    ap.add_argument("--no-kernels", action="store_true", help="decode with upstream's PyTorch code instead of the engine's "
+                    "GPU kernels (slow; to tell the kernels' part of a difference from the rest)")
     ap.add_argument("--name", required=True)
     cli = ap.parse_args()
 
@@ -58,7 +60,7 @@ def main() -> None:
     cache.touch = cli.touch
     cache.keep_in_ram(cli.ram_cache)
     core.set_threads(cli.threads)
-    decoder = host.Host(net, cache)
+    decoder = host.Host(net, cache, kernels=False if cli.no_kernels else None)
 
     tokens = torch.from_numpy(np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))["tokens"]).long()[3::6][:8]
     ref = torch.load(os.path.join(DATA, "eval_ref.pt"), weights_only=True)

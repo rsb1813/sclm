@@ -384,6 +384,13 @@ class Host:
         """Next-token logits [batch, vocab] (fp32) after input_ids, which continue the sequence at start_pos."""
         if start_pos == 0:  # a new sequence: the cache's clock goes on, its experts are still there
             self.origin = self.end
+            if V4:
+                # A compressor with overlapping windows keeps the group before the current one, and a prefill shorter
+                # than a group leaves that part as it is: the last sequence's would join the first group's pooling.
+                for module in self.net.modules():
+                    if isinstance(module, m.Compressor):
+                        module.kv_state.zero_()
+                        module.score_state.fill_(float("-inf"))
         self.cache.token = self.origin + start_pos
         self.end = self.cache.token + input_ids.size(-1)
         gpu.active, m.linear = self.kernels, kernel_linear if self.kernels else _upstream_linear
