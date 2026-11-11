@@ -23,7 +23,8 @@ HELP = """[bold]명령[/]
   /set temperature <수>  0이면 가장 확률 높은 토큰만 (기본 0)
   /set top_p <수>        temperature가 0보다 클 때 쓰는 누적 확률 (기본 0.95)
   /set num_predict <수>  답 하나의 최대 토큰 수 (기본 2048)
-  /set wait-share <수>   속도 옵션: 0이면 정확, 0.15면 가벼운 SSD expert를 기다리지 않음
+  /set wait-share <수>   속도 옵션: 0이면 정확, 0.25면 가벼운 SSD expert를 기다리지 않음 (기본 0.25)
+  /set topk <수>         속도 옵션: 토큰마다 계산할 expert 수. 0이면 여섯 개 모두, 5면 조금 더 빠르고 4부터는 품질이 눈에 띄게 떨어짐
   /set verbose, /set quiet   답 뒤에 속도를 보일지
 [bold]입력[/]
   \"\"\"로 시작하면 여러 줄을 쓸 수 있고, \"\"\"로 끝냅니다. 답이 나오는 중에 Ctrl+C를 누르면 멈춥니다."""
@@ -131,7 +132,7 @@ def command(line: str, session: Session, cache, opts: dict, console: Console) ->
     elif name == "/show":
         console.print(f"[grey62]문맥 {session.pos} / {session.max_seq_len} 토큰 · 생각 {'켬' if session.think else '끔'} · "
                       f"effort {session.effort} · temperature {opts['temperature']:g} · top_p {opts['top_p']:g} · "
-                      f"num_predict {opts['num_predict']} · wait-share {cache.wait_share:g}\n"
+                      f"num_predict {opts['num_predict']} · wait-share {cache.wait_share:g} · topk {cache.topk}\n"
                       f"시스템 프롬프트: {session.system or '(없음)'}[/]")
     elif name == "/set":
         key, _, value = rest.strip().partition(" ")
@@ -152,6 +153,8 @@ def command(line: str, session: Session, cache, opts: dict, console: Console) ->
                 opts[key] = int(value)
             elif key == "wait-share":
                 cache.wait_share = float(value)
+            elif key == "topk":
+                cache.topk = int(value)
             elif key in ("verbose", "quiet"):
                 opts["verbose"] = key == "verbose"
             else:
@@ -219,13 +222,15 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=8, help="CPU threads of the RAM tier")
     ap.add_argument("--max-seq-len", type=int, default=4096, help="tokens a conversation can hold")
     ap.add_argument("--min-ram-margin", type=float, default=0.5, help="GiB of RAM that must stay free after loading")
-    ap.add_argument("--wait-share", type=float, default=0.0, help="lossy speed option at the start (/set wait-share changes it)")
+    ap.add_argument("--wait-share", type=float, default=0.25, help="lossy speed option at the start (/set wait-share "
+                    "changes it; 0: exact). 0.25 leaves the evaluation's KL where it is and is a quarter faster")
+    ap.add_argument("--topk", type=int, default=0, help="lossy: routed experts computed per token (0: all six; /set topk)")
     ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
                     "the SSD a layer early (0: none)")
     ap.add_argument("--ram-cache", type=int, default=-1, help="experts kept in RAM after they leave the VRAM cache, "
                     "18.8 MB each of pinned memory (default: what fits, up to 1200, leaving 3 GiB free)")
     cli = ap.parse_args()
-    cli.ram_share, cli.topk = 0.0, 0
+    cli.ram_share = 0.0
     if cli.ram_cache < 0:
         used, total = status.ram()
         codes = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
