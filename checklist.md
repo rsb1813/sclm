@@ -11,9 +11,9 @@
 ## V4-Flash-0731 전환
 순서의 원칙: 양자화보다 먼저 모든 expert를 원본으로 쓰는 무손실 런타임을 세워, 포팅 버그와 양자화 손실을 가른다.
 - [ ] 원본 다운로드 완료 확인 (HF API의 파일 수 74개와 크기 166.9GB로 대조)
-- [ ] 확인 ① 실제 예산: safetensors 헤더로 상시 경로 VRAM(층별 압축기·인덱서 포함), expert 크기와 총량, VRAM 슬롯 수, 토큰당 읽기량. 추정(expert 147GB, 약 1.8bpw, 15~22 tok/s)과 크게 다르면 포팅 전에 사용자에게 알림
-- [ ] 확인 ② transformers의 `DeepseekV4ForCausalLM`이 이 체크포인트를 읽는지 (한 층의 키 이름과 dtype, FP8 활성 양자화를 흉내 내는지). 기준은 공식 `inference/`이고 transformers는 허용 오차 대조용
-- [ ] 확인 ③ 토크나이저와 채팅 인코딩: `tokenizer.json`이 V4.1과 같은지(같아야 calib·eval 토큰 재사용), `encoding_dsv4.py`와 테스트 벡터로 `chat.py`의 토큰열(특히 다중 턴과 생각을 문맥에 남기는 방식) 대조, 샘플링 기본값은 `generation_config.json`
+- [x] 확인 ① 실제 예산 (헤더를 원격으로 읽음): expert 하나 13.37MB × 11,008개 = 147.2GB, RAM 65GB에 전부 부호면 평균 1.88bpw. 상시 경로 VRAM 약 7.2GiB(어텐션 4.6GB, 공유 expert 1.1GB, 압축기 0.5GB, 인덱서 0.3GB, head 1.06GB), VRAM 슬롯 약 540개. 토큰당 routed 원본 3.45GB(258회). 추정과 일치
+- [x] 확인 ② transformers 5.22.2에 `DeepseekV4ForCausalLM`, 이 체크포인트용 이름 대응표(`conversion_mapping.py`)와 FP8 처리기가 있음. FP8 활성 양자화 흉내 여부는 층 단위 대조에서 확인. 기준은 공식 `inference/`
+- [x] 확인 ③ 토크나이저: vocab·merges·정규화가 V4.1과 같고 공통 특수 토큰의 id도 같음(다른 것은 특수 토큰 9개: V4.1의 `<｜System｜>` 128799가 여기서는 DSpark 잡음 토큰). 일반 글의 토큰 id가 같으므로 calib·eval 토큰 재사용 가능. 채팅 인코딩은 다름: `reasoning_effort` 기본 "low"(접두 없음), high·max는 글머리 접두, 이전 턴의 생각은 지우는 것이 기본(`drop_thinking`). `generation_config.json`은 temperature 1.0, top_p 1.0. 채팅을 옮길 때 `encoding_dsv4.py`의 테스트 벡터로 대조할 것 [남음]
 - [ ] 레퍼런스: 공식 `inference/model.py`를 수정 없이 두고 `kernel.py`만 순수 PyTorch로 (V4.1 것에서 옮김), 층 단위 실행기를 모델 선택이 되게, 체크포인트 이름 대응(`convert.py`)
 - [ ] 레퍼런스 검증: 실제 가중치 perplexity, transformers 구현과 층 단위 대조
 - [ ] 무손실 런타임: 모든 expert를 원본(SSD·RAM 수준·VRAM 슬롯)으로 두는 호스트. 새 블록 구조에 맞춤 (앞 3층 해시 라우팅, 층별 압축 어텐션 비율 4·128과 겹치는 창, 층마다의 hyper-connection). 레퍼런스와 logit 대조
