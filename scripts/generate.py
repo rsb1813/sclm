@@ -47,9 +47,10 @@ def load_runtime(cli, background: int | None = None) -> tuple:
     cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam, background=background)
     cache.topk, cache.wait_share, cache.ram_share, cache.guess = cli.topk, cli.wait_share, cli.ram_share, cli.guess
     cache.touch = cli.touch
-    if cli.ram_cache < 0:  # what fits, leaving 3 GiB free: measured now that the codes and the model are in RAM
-        # (an estimate made before loading was 2 GiB and more too high, and tier20v100's 63 GiB of codes left no room)
-        cli.ram_cache = out["ram_cache"] = max(0, min(1200, int((total_ram - status.ram()[0] - 3.0) * GIB / cache.store.size(1))))
+    if cli.ram_cache < 0:  # what fits, leaving 8 GiB free: measured now that the codes and the model are in RAM
+        # (an estimate made before loading was 2 GiB and more too high, and tier20v100's 63 GiB of codes left no room).
+        # Leaving 3 GiB put the machine at 90.8 of 93.6 GiB with V4-Flash-0731's q175 codes, and it ran short of memory.
+        cli.ram_cache = out["ram_cache"] = max(0, min(1200, int((total_ram - status.ram()[0] - 8.0) * GIB / cache.store.size(1))))
     pinned = cli.ram_cache * cache.store.size(1) / GIB  # it cannot be paged out
     if pinned and total_ram - status.ram()[0] - pinned < cli.min_ram_margin:
         raise SystemExit(f"--ram-cache {cli.ram_cache} takes {pinned:.1f} GiB and would leave less than "

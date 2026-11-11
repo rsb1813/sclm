@@ -298,7 +298,7 @@ def main() -> None:
     ap.add_argument("--touch", type=int, default=8, help="guessed experts of the next layer whose CPU-tier codes are read "
                     "into the CPU's cache while the device computes the attention before them (0: none)")
     ap.add_argument("--ram-cache", type=int, default=-1, help="experts kept in RAM after they leave the VRAM cache, "
-                    "pinned memory, 18.8 MB each (V4-Flash-0731: 13.4 MB) (default: what fits, up to 1200, leaving 3 GiB free)")
+                    "pinned memory, 18.8 MB each (V4-Flash-0731: 13.4 MB) (default: what fits, up to 1200, leaving 8 GiB free)")
     cli = ap.parse_args()
     cli.ram_share = 0.0
     console = Console()
