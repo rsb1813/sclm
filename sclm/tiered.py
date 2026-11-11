@@ -71,16 +71,28 @@ class TieredMoE(nn.Module):
         ram = [k for k, e in enumerate(ids) if e in self.ram.experts and gates[k] >= cache.ram_share * total]
         ssd = [k for k, e in enumerate(ids) if e not in self.ram.experts]
         wait = [gates[k] >= cache.wait_share * total for k in ssd] if cache.wait_share else None
+        x_host = host[2 * topk:2 * topk + self.dim]
+        # The CPU tier starts as soon as its routing weights are final, on the other threads, and the host joins it
+        # after queueing the device's work: what the host does before the CPU tier starts delays the layer (50 us of
+        # it a layer, 1.9 ms a token). Only the lossy wait_share makes the weights depend on what the cache answers.
+        final = wait is None
+        if final:
+            kept = sum(gates[k] for k in ram + ssd)
+            if kept < total and kept > 0:  # what is computed keeps the routing weight of all six
+                gates = [g * (total / kept) for g in gates]
+            self.ram.start([ids[k] for k in ram], [gates[k] for k in ram], x_host)
         slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token, wait)
+        if not final:  # lossy: the token goes on without the light experts that are not in the cache yet
+            ssd, slots = [k for k, s in zip(ssd, slots) if s is not None], [s for s in slots if s is not None]
+            kept = sum(gates[k] for k in ram + ssd)
+            if kept < total and kept > 0:
+                gates = [g * (total / kept) for g in gates]
+            self.ram.start([ids[k] for k in ram], [gates[k] for k in ram], x_host)
+        picks = None
         if guess:
             gpu.moe_guess()  # as a rule it has arrived while the reads above were started
             picks = host[2 * topk + self.dim:2 * topk + self.dim + guess].astype(np.int64).tolist()
             cache.read_ahead(later.layer_id, [e for e in picks[:cache.guess] if e not in later.ram.experts])
-        if wait:  # lossy: the token goes on without the light experts that are not in the cache yet
-            ssd, slots = [k for k, s in zip(ssd, slots) if s is not None], [s for s in slots if s is not None]
-        kept = sum(gates[k] for k in ram + ssd)
-        if kept < total and kept > 0:  # what is computed keeps the routing weight of all six
-            gates = [g * (total / kept) for g in gates]
         reading = {slot for slot, *_ in pending}
         held = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot not in reading]
         read = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot in reading]
@@ -88,13 +100,15 @@ class TieredMoE(nn.Module):
             if not cache.fresh.isdisjoint(slot for slot, _ in held):  # read ahead and copied in just now
                 cache.barrier()
             gpu.fp4_experts(cache.store, *zip(*held), self.dim, self.inter, self.limit, xq, y)
-        self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:2 * topk + self.dim],
-                         cache.ram_out.numpy())
-        if guess and cache.touch:  # the CPU's threads and the memory idle until the next layer's routing is known
-            named = [e for e in picks[:cache.touch] if e in later.ram.experts]
-            if named:
-                later.ram.touch(named)
+        self.ram.wait(cache.ram_out.numpy())
         t2 = perf_counter()
+        # The codes of the next layer's guessed CPU-tier experts are read into the CPU's cache from here on: the
+        # threads and the memory idle until that layer's routing is known. Reads from the SSD take milliseconds, so
+        # the read-ahead starts before them; otherwise the device's last kernels are queued first.
+        named = [e for e in picks[:cache.touch] if e in later.ram.experts] if picks and cache.touch else None
+        waited = any(ticket is not None for *_, ticket in pending)
+        if named and waited:
+            later.ram.touch(named)
         cache.finish(pending)
         t3 = perf_counter()
         cache.barrier()  # also when nothing reads the copied slots now: the next layer counts on the copies being done
@@ -103,6 +117,8 @@ class TieredMoE(nn.Module):
         # the CPU tier's sum is not waited for: the device takes the buffer before the next layer's routing comes
         # back, and the CPU tier writes it again only after that
         end()
+        if named and not waited:
+            later.ram.touch(named)
         out = buf.out
         t4 = perf_counter()
         for key, value in (("device_s", t1 - t0), ("ram_s", t2 - t1), ("read_s", t3 - t2), ("launch_s", t4 - t3),

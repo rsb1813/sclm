@@ -268,6 +268,8 @@ class ExpertCache:
 
     def finish(self, pending: list) -> None:
         """Waits for the reads (each named by its ticket, the last field) and copies each expert into its slot."""
+        if not pending:
+            return
         pending = [p for p in pending if p[-1] is not None]  # (the others came from RAM: their copies are queued)
         for ticket in {ticket for *_, ticket in pending}:
             self.reader.reader.wait(ticket)
