@@ -240,3 +240,49 @@ def test_pool_matches_upstream_compressor(small_net, which):
             assert (a == b).float().mean() > (0.85 if which == "index" else 0.97), (pos, (a == b).float().mean())
             assert ((a - b).abs() <= (0.5 if which == "index" else 2**-6) * b.abs().max()).all()
     assert groups == 3
+
+
+@pytest.mark.parametrize("heads", [8, 64])
+def test_index_pick_keeps_the_positions_upstream_indexer_scores_highest(heads):
+    """Up to 32 heads a warp takes a head, above that half a warp (the released model has 64)."""
+    g = torch.Generator(device=DEV).manual_seed(11)
+    dim, rank, d, rd, topk, n, win = 256, 128, 64, 16, 32, 300, 16
+    rand = lambda *shape: torch.randn(*shape, generator=g, device=DEV, dtype=torch.float32)  # noqa: E731
+    wq_b, proj = m.Linear(rank, heads * d).to(DEV), m.Linear(dim, heads, dtype=torch.bfloat16).to(DEV)
+    with torch.no_grad():
+        weight, scale = rand_fp8(g, heads * d, rank)
+        wq_b.weight.copy_(weight)
+        wq_b.scale.copy_(scale)
+        proj.weight.copy_((rand(heads, dim) / dim**0.5).to(torch.bfloat16))
+    freqs_cis = torch.polar(torch.ones(n + 1, rd // 2, device=DEV, dtype=torch.float32),
+                            6.28 * torch.rand(n + 1, rd // 2, generator=g, device=DEV, dtype=torch.float32))
+    keys = kernel.fp4_act_quant(rand(1, n, d).to(torch.bfloat16), 32, True)
+    compressor = lambda x, pos: None  # noqa: E731  (the keys are given)
+    compressor.kv_cache = keys
+    indexer = SimpleNamespace(freqs_cis=freqs_cis, compress_ratio=1, rope_head_dim=rd, wq_b=wq_b, weights_proj=proj, n_heads=heads,
+                              n_local_heads=heads, head_dim=d, softmax_scale=d**-0.5, index_topk=topk, kv_cache=keys,
+                              compressor=compressor)
+    out = torch.zeros(topk, dtype=torch.int32, device=DEV)
+    same = 0
+    positions = list(range(topk, n, 7))  # the token at position p sees p + 1 keys
+    for pos in positions:
+        x, qr = (2 * rand(1, 1, dim)).to(torch.bfloat16), rand(1, 1, rank).to(torch.bfloat16)
+        want = m.Indexer.forward(indexer, x, qr, pos, win).flatten().sort().values  # upstream lists the best first
+        gpu.index_pick(indexer, qr.flatten(), x.flatten(), freqs_cis.data_ptr() + pos * rd * 4, keys[0], pos + 1, out, win)
+        assert torch.equal(out.sort().values, out) and out.unique().numel() == topk and win <= out.min() and out.max() <= win + pos
+        # upstream's scores, to judge a choice that differs. The heads' terms cancel, and upstream adds them as bf16
+        # values (its sum is up to a bf16 step of the largest term away from their fp32 sum, which the kernel rounds
+        # once): two positions whose scores are closer than that may change places.
+        with torch.no_grad():
+            q = wq_b(qr).unflatten(-1, (heads, d))
+            m.apply_rotary_emb(q[..., -rd:], freqs_cis[pos:pos + 1])
+            q = m.rotate_activation(q)
+            kernel.fp4_act_quant(q, 32, True)
+            weights = proj(x) * (d**-0.5 * heads**-0.5)
+            terms = torch.einsum("bshd,btd->bsht", q, keys[:, :pos + 1]).relu_() * weights.unsqueeze(-1)
+        score = terms.sum(dim=2).flatten().float()
+        ours = torch.zeros(pos + 1, dtype=torch.bool, device=DEV)
+        ours[(out - win).long()] = True
+        assert score[ours].min() >= score[~ours].max() - 2**-7 * terms.float().abs().max()
+        same += torch.equal(out, want)
+    assert same >= len(positions) - 2, same

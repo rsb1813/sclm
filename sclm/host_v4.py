@@ -19,7 +19,7 @@ class V4Attention(m.Attention):
     key/value, the compressed key/value and the index's keys when the token completes a group, the attention itself
     and the output projection (wo_a read as the checkpoint stores it, host.Fp8Weight). While every compressed
     position fits in index_topk the index scores nothing: the top-k of fewer than k positions is all of them. Past
-    that, upstream's Indexer picks the positions (in PyTorch)."""
+    that, the engine scores them and picks (sclm_gpu_index_pick)."""
 
     def __init__(self, layer_id: int, args: "m.ModelArgs"):
         super().__init__(layer_id, args)
@@ -42,6 +42,12 @@ class V4Attention(m.Attention):
                             comp.head_dim, rd, comp.norm.eps, comp.rotate), rows.data_ptr(), comp.head_dim * 2
 
         ratio = self.compress_ratio
+        index = self.indexer if ratio else None
+        if index is not None:  # the window ring, then the compressed positions the index picks
+            picked = torch.arange(win + self.index_topk, device=x.device, dtype=torch.int32)
+            pick = gpu.bind("index_pick", index.wq_b.weight, index.wq_b.scale, qr, index.weights_proj.weight, later, later,
+                            index.kv_cache[0], picked[win:], rank, index.n_local_heads, index.head_dim, rd, dim, later,
+                            self.index_topk, win, index.softmax_scale * index.n_heads ** -0.5, True), picked  # the token, freqs, the keys' count
         self.bound = (
             gpu.bind("attn_q", self.wq_a.weight, self.wq_a.scale, q_norm, self.wq_b.weight, self.wq_b.scale, later, later, qr, q,
                      dim, rank, heads, d, rd, self.eps),  # the token, freqs
@@ -51,15 +57,15 @@ class V4Attention(m.Attention):
             gpu.bind("attn_out", o, later, self.wo_a.fp8, self.wo_a.scale, self.wo_b.weight, self.wo_b.scale, out, heads, d, rd,
                      self.n_local_groups, self.wo_a.fp8.size(0), dim),  # freqs
             pool(self.compressor, cache[win:]) if ratio else None,
-            pool(self.indexer.compressor, self.indexer.kv_cache[0]) if ratio and self.indexer is not None else None,
+            pool(index.compressor, index.kv_cache[0]) if index is not None else None,
             self.freqs_cis.data_ptr(), cache.data_ptr(), attended(win, self.index_topk, x.device),
-            torch.arange(win, device=x.device, dtype=torch.int32), qr.view(1, 1, -1), out.view(1, 1, -1))
+            pick if index is not None else None, out.view(1, 1, -1))
         return self.bound
 
     def forward(self, x: torch.Tensor, start_pos: int):
         if not (gpu.active and x.size(0) * x.size(1) == 1 and start_pos):  # position 0 is upstream's prefill case
             return super().forward(x, start_pos)
-        attn_q, attn_kv, sparse_attn, attn_out, pool, index_pool, freqs, cache, rows, ring, qr, out = self.bound or self.bind(x)
+        attn_q, attn_kv, sparse_attn, attn_out, pool, index_pool, freqs, cache, rows, pick, out = self.bound or self.bind(x)
         rd, win, ratio = self.rope_head_dim, self.window_size, self.compress_ratio
         at_pos = freqs + start_pos * rd * 4  # the position's row: rd / 2 complex64
         token = x.contiguous()
@@ -72,13 +78,13 @@ class V4Attention(m.Attention):
             group = freqs + (start_pos + 1 - ratio) * rd * 4  # the rotation of the group's first position
             launch, base, row = pool
             launch(at, start_pos % ratio, group, base + start_pos // ratio * row)
-            if index_pool is not None and count <= self.index_topk:
+            if index_pool is not None:
                 launch, base, row = index_pool
                 launch(at, start_pos % ratio, group, base + start_pos // ratio * row)
-            elif index_pool is not None:
-                with torch.device(x.device):  # upstream creates index tensors on the default device
-                    picked = torch.cat([ring, self.indexer(x, qr, start_pos, win).int().view(-1)])
-                idxs, n = picked.data_ptr(), picked.numel()
+                if count > self.index_topk:
+                    launch, picked = pick
+                    launch(at, at_pos, count)
+                    idxs, n = picked.data_ptr(), picked.numel()
         sparse_attn(idxs, n)
         attn_out(at_pos)
         return out

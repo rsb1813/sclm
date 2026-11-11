@@ -45,7 +45,7 @@ def lib():
         _lib.sclm_gpu_sparse_attn.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float]
         _lib.sclm_gpu_attn_out.argtypes = [C.c_void_p] * 7 + [C.c_int] * 6
         _lib.sclm_gpu_compress.argtypes = [C.c_void_p] * 6 + [C.c_int] * 2 + [C.c_void_p] * 5 + [C.c_int] * 4 + [C.c_float]
-        _lib.sclm_gpu_index_pick.argtypes = [C.c_void_p] * 8 + [C.c_int] * 8 + [C.c_float]
+        _lib.sclm_gpu_index_pick.argtypes = [C.c_void_p] * 8 + [C.c_int] * 8 + [C.c_float, C.c_int]
     return _lib
 
 
@@ -207,14 +207,16 @@ def index_pick(indexer, qr: torch.Tensor, x: torch.Tensor, freqs: int, keys: tor
     """One decode token through an upstream Indexer once it has to choose: out (int32 [index_topk]) = the positions
     of the index_topk highest scores among the first `count` of keys (bf16 [.., index_head_dim]), in order, each plus
     offset. qr is the attention's normed low-rank query and x the token (bf16), freqs the address of the position's
-    rotation. Scores are upstream's up to their last bit; of equal ones the earlier position is kept."""
-    heads, d = indexer.n_local_heads, indexer.index_head_dim
+    rotation. Scores are upstream's up to their last bit; of equal ones the earlier position is kept.
+    V4-Flash-0731's Indexer rotates its query (rotate_activation) before rounding it."""
+    v4 = MODEL == "v4"
+    heads, d = indexer.n_local_heads, indexer.head_dim if v4 else indexer.index_head_dim
     assert qr.dtype == x.dtype == keys.dtype == torch.bfloat16 and out.dtype == torch.int32 and keys.is_contiguous()
     assert indexer.wq_b.weight.dtype == torch.float8_e4m3fn and out.numel() == indexer.index_topk < count <= keys.size(0)
     _check(lib().sclm_gpu_index_pick(
         indexer.wq_b.weight.data_ptr(), indexer.wq_b.scale.data_ptr(), qr.data_ptr(), indexer.weights_proj.weight.data_ptr(),
         x.data_ptr(), freqs, keys.data_ptr(), out.data_ptr(), qr.numel(), heads, d, indexer.rope_head_dim, x.numel(), count,
-        out.numel(), offset, indexer.softmax_scale * indexer.n_heads ** -0.5))
+        out.numel(), offset, indexer.softmax_scale * indexer.n_heads ** -0.5, v4))
 
 
 def sparse_attn(q: torch.Tensor, window: torch.Tensor, compressed: torch.Tensor, idx: torch.Tensor, sink: torch.Tensor,

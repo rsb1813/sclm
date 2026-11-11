@@ -678,17 +678,45 @@ __global__ void fp4_quant_k(uint16_t* v) {
     v[i] = to_bf16(round_e2m1(fminf(fmaxf(x / s, -6.0f), 6.0f)) * s);
 }
 
+// The index query of DeepSeek-V4-Flash-0731 after its rotary embedding, in place, a block of d threads to a head:
+// upstream's rotate_activation (the Walsh-Hadamard transform of the head's d values, a power of two, times `scale`,
+// rounded to bf16), then kernel.fp4_act_quant over groups of 32 with power-of-two scales.
+__global__ void hadamard_fp4_k(uint16_t* q, int d, float scale) {
+    __shared__ float vals[1024];
+    const int i = threadIdx.x;
+    uint16_t* head = q + size_t(blockIdx.x) * d;
+    vals[i] = from_bf16(head[i]);
+    __syncthreads();
+    for (int h = 1; h < d; h <<= 1) {  // the pair that is h apart becomes (a + b, a - b)
+        const float a = vals[i & ~h], b = vals[i | h];
+        __syncthreads();
+        vals[i] = i & h ? a - b : a + b;
+        __syncthreads();
+    }
+    const float v = from_bf16(to_bf16(vals[i] * scale));
+    __syncthreads();
+    vals[i] = v;
+    __syncthreads();
+    float mx = 0;
+    for (int k = 0; k < 32; ++k) mx = fmaxf(mx, fabsf(vals[(i & ~31) + k]));
+    const uint32_t bits = __float_as_uint(fmaxf(mx, scalbnf(6.0f, -126)) * float(1.0 / 6.0));  // 2^ceil(log2(amax / 6))
+    const float s = scalbnf(1.0f, int(bits >> 23 & 255) - 127 + ((bits & 0x7fffff) != 0));
+    head[i] = to_bf16(round_e2m1(fminf(fmaxf(v / s, -6.0f), 6.0f)) * s);
+}
+
 // upstream Indexer.forward's score of compressed position t (block t) for one token: the sum over the heads h of
 // relu(<q[h], key[t]>) * weight[h], where weight[h] = dots[h] * scale and every product and sum is rounded to bf16,
-// as upstream's bf16 tensors are. q[heads][d] and keys[..][d] are bf16; a warp takes a head.
-__global__ void index_score_k(const uint16_t* q, const uint16_t* keys, const float* dots, float scale, float* scores, int d) {
-    __shared__ float part[32];
-    const int h = threadIdx.x >> 5, lane = threadIdx.x & 31, heads = blockDim.x >> 5;
+// as upstream's bf16 tensors are. q[heads][d] and keys[..][d] are bf16; `lanes` threads take a head (32, a warp, or
+// 16 for more than 32 heads).
+__global__ void index_score_k(const uint16_t* q, const uint16_t* keys, const float* dots, float scale, float* scores, int d,
+                              int lanes) {
+    __shared__ float part[64];
+    const int h = threadIdx.x / lanes, lane = threadIdx.x & (lanes - 1), heads = blockDim.x / lanes;
     const uint16_t* qh = q + h * d;
     const uint16_t* key = keys + size_t(blockIdx.x) * d;
     float acc = 0;
-    for (int c = lane; c < d; c += 32) acc += from_bf16(qh[c]) * from_bf16(key[c]);
-    for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    for (int c = lane; c < d; c += lanes) acc += from_bf16(qh[c]) * from_bf16(key[c]);
+    for (int o = lanes >> 1; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
     if (lane == 0) {
         const float w = from_bf16(to_bf16(from_bf16(to_bf16(dots[h])) * from_bf16(to_bf16(scale))));
         part[h] = from_bf16(to_bf16(fmaxf(from_bf16(to_bf16(acc)), 0.0f) * w));
@@ -1055,18 +1083,22 @@ API int sclm_gpu_pool(const float* wkv, const float* wgate, const float* ape, co
 // (int32) = the positions of the topk highest scores among the first `count` of keys[..][d] (bf16), in order, each
 // plus `offset`. wb/sb: the indexer's fp8 wq_b [heads * d, rank]; qr[rank]: attention's normed low-rank query; wp:
 // weights_proj [heads, dim]; x[dim]: the token (all bf16); freqs: the position's rotation; scale: of the weights.
+// hadamard: the query is rotated before it is rounded to FP4 (DeepSeek-V4-Flash-0731; its keys are, see sclm_gpu_pool).
 // Equal scores (bf16 has many) go to the earlier position; upstream's choice among them is unspecified.
 API int sclm_gpu_index_pick(const uint8_t* wb, const uint8_t* sb, const uint16_t* qr, const uint16_t* wp, const uint16_t* x,
                             const float* freqs, const uint16_t* keys, int* out, int rank, int heads, int d, int rd, int dim,
-                            int count, int topk, int offset, float scale) {
-    if (heads > 32 || d % 32 || heads * d > SCRATCH || rank % 32 || rank > SCRATCH || rd % 2 || count > SCRATCH) return -1;
+                            int count, int topk, int offset, float scale, int hadamard) {
+    if (heads > 64 || d % 32 || heads * d > SCRATCH || rank % 32 || rank > SCRATCH || rd % 2 || count > SCRATCH) return -1;
+    if (hadamard && (d & (d - 1) || d > 1024)) return -1;
     ensure_scratch();
     const Rows b(heads * d, rank);
+    const int lanes = heads > 32 ? 16 : 32;
     act_quant_k<float><<<rank / model.act, model.act>>>(qr, scratch.xq);
     fp8_gemv_rope_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, scratch.h, rank, b.per_row, freqs, d, rd, model.ws);
-    fp4_quant_k<<<heads * d / 32, 32>>>(scratch.h);
+    if (hadamard) hadamard_fp4_k<<<heads, d>>>(scratch.h, d, float(1.0 / sqrt(double(d))));
+    else fp4_quant_k<<<heads * d / 32, 32>>>(scratch.h);
     dots_k<uint16_t><<<heads, 128>>>(wp, x, scratch.dots, dim);
-    index_score_k<<<count, heads * 32>>>(scratch.h, keys, scratch.dots, scale, scratch.xq, d);  // the quantized qr is used up
+    index_score_k<<<count, heads * lanes>>>(scratch.h, keys, scratch.dots, scale, scratch.xq, d, lanes);  // the quantized qr is used up
     topk_mark_k<<<(count + 255) / 256, 256>>>(scratch.xq, scratch.picks, count, topk);
     topk_list_k<<<1, 1024>>>(scratch.picks, out, count, offset);
     return cudaGetLastError();
