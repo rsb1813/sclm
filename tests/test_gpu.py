@@ -262,3 +262,43 @@ def test_gate_matches_upstream_gate():
         assert pack[:6].int().tolist() == indices.flatten().tolist()
         assert torch.allclose(pack[6:12], weights.flatten(), rtol=1e-5)
         assert torch.equal(pack[12:], x.flatten().float())
+
+
+def test_index_pick_keeps_the_positions_upstream_indexer_scores_highest():
+    g = torch.Generator(device=DEV).manual_seed(11)
+    dim, rank, heads, d, rd, topk, n, win = 256, 128, 8, 64, 16, 32, 300, 16
+    rand = lambda *shape: torch.randn(*shape, generator=g, device=DEV, dtype=torch.float32)  # noqa: E731
+    m.default_dtype = torch.float8_e4m3fn
+    wq_b, proj = m.Linear(rank, heads * d).to(DEV), m.Linear(dim, heads, dtype=torch.bfloat16).to(DEV)
+    with torch.no_grad():
+        weight, scale = rand_fp8(g, heads * d, rank)
+        wq_b.weight.copy_(weight)
+        wq_b.scale.copy_(scale)
+        proj.weight.copy_((rand(heads, dim) / dim**0.5).to(torch.bfloat16))
+    freqs_cis = torch.polar(torch.ones(n + 1, rd // 2, device=DEV, dtype=torch.float32),
+                            6.28 * torch.rand(n + 1, rd // 2, generator=g, device=DEV, dtype=torch.float32))
+    indexer = SimpleNamespace(
+        freqs_cis=freqs_cis, owns_k=False, compress_ratio=1, rope_head_dim=rd, wq_b=wq_b, weights_proj=proj, n_heads=heads,
+        n_local_heads=heads, index_head_dim=d, softmax_scale=d**-0.5, index_topk=topk, is_candidate_source=False,
+        uses_candidates=False)
+    keys = kernel.fp4_act_quant(rand(1, n, d).to(torch.bfloat16), 32, True)
+    m.shared_attn.index_k = keys
+    out = torch.zeros(topk, dtype=torch.int32, device=DEV)
+    same = 0
+    positions = list(range(topk, n, 7))  # the token at position p sees p + 1 keys
+    for pos in positions:
+        x, qr = (2 * rand(1, 1, dim)).to(torch.bfloat16), rand(1, 1, rank).to(torch.bfloat16)
+        want = m.Indexer.forward(indexer, x, qr, None, pos, win).flatten()
+        gpu.index_pick(indexer, qr.flatten(), x.flatten(), freqs_cis.data_ptr() + pos * rd * 4, keys[0], pos + 1, out, win)
+        assert torch.equal(out.sort().values, out) and out.unique().numel() == topk and win <= out.min() and out.max() <= win + pos
+        # upstream's scores, to judge a choice that differs: bf16 scores tie, and the choice among equals is free
+        q = wq_b(qr).unflatten(-1, (heads, d))
+        m.apply_rotary_emb(q[..., -rd:], freqs_cis[pos:pos + 1])
+        kernel.fp4_act_quant(q, 32, True)
+        weights = proj(x) * (d**-0.5 * heads**-0.5)
+        score = (torch.einsum("bshd,btd->bsht", q, keys[:, :pos + 1]).relu_() * weights.unsqueeze(-1)).sum(dim=2).flatten().float()
+        ours = torch.zeros(pos + 1, dtype=torch.bool, device=DEV)
+        ours[(out - win).long()] = True
+        assert score[ours].min() >= score[~ours].max()
+        same += torch.equal(out, want)
+    assert same >= len(positions) // 2, same

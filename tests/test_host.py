@@ -82,6 +82,8 @@ def test_host_decodes_as_upstream_with_the_same_experts(tmp_path, monkeypatch, d
         cache.reader.submit = lambda layer, e, buf: reads.append((layer, e)) or submit(layer, e, buf)
         decoder = host.Host(net, cache, device=dev)
         assert decoder.kernels == (dev == "cuda" and os.path.exists(gpu.DLL))
+        picks, index_pick = [], gpu.index_pick
+        monkeypatch.setattr(gpu, "index_pick", lambda *a: picks.append(a[5]) or index_pick(*a))  # a[5]: positions to choose among
 
         streams = {"ref": [], "host": []}  # every block's output, to see where the two runs stop being identical
         for name, model in (("ref", ref), ("host", net)):
@@ -108,6 +110,7 @@ def test_host_decodes_as_upstream_with_the_same_experts(tmp_path, monkeypatch, d
             # the same tokens as a new sequence: the first one left nothing behind in the decode buffers and the caches
             assert all(torch.equal(decoder.logits(x[:, start:end], start), got) for (start, end), got in zip(steps, first))
         assert strict == 25 if dev == "cpu" else strict >= 2, strict
+        assert (max(picks, default=0) > args.index_topk) == decoder.kernels  # the engine's index chose within the test
         assert len(set(reads)) < len(reads)  # experts came back after being evicted
         assert len({layer for layer, _ in reads}) == args.n_layers
     finally:

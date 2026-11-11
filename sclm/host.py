@@ -79,16 +79,28 @@ def attended(win: int, topk: int, device: torch.device) -> torch.Tensor:
     return torch.cat([ring, more], dim=1).contiguous()
 
 
+@lru_cache(4)
+def picked(win: int, topk: int, device: torch.device) -> torch.Tensor:
+    """int32 [win + topk]: what a decode token attends to once the index chooses: the whole window ring, then the
+    compressed positions the last index source chose (gpu.index_pick), which the layers after it share as upstream's
+    do."""
+    return torch.arange(win + topk, device=device, dtype=torch.int32)
+
+
 class HostAttention(m.Attention):
     """upstream Attention; decoding one token with the kernels on, the engine computes the query, the token's
-    key/value, the attention itself and the output projection (wo_a read as stored, see Fp8Weight). While every
-    compressed position still fits in index_topk it also makes the compressed KV and its index keys, and nothing is
-    scored: the top-k of fewer than k positions is all of them. Past that, the compressed KV and its index are
-    upstream's code."""
+    key/value, the attention itself and the output projection (wo_a read as stored, see Fp8Weight), the compressed
+    KV with its index keys, and the index's choice. While every compressed position still fits in index_topk nothing
+    is scored: the top-k of fewer than k positions is all of them. Upstream's code is left with the positions past
+    pick_limit, where its candidate blocks start to exclude some."""
 
     def __init__(self, layer_id: int, args: "m.ModelArgs"):
         super().__init__(layer_id, args)
         self.index_topk = args.index_topk
+        # the most compressed positions the kernel chooses among: every candidate block is still kept
+        self.pick_limit = args.candidate_topk_blocks * args.candidate_block_size if args.candidate_source_layer >= 0 else 1 << 16
+        if args.index_n_heads > 32 or args.index_head_dim % 32 or args.dtype != "fp8" or args.index_topk < args.window_size:
+            self.pick_limit = 0
         self.bound = None
 
     def bind(self, x: torch.Tensor) -> tuple:
@@ -122,7 +134,7 @@ class HostAttention(m.Attention):
         attn_q(at, freqs)
         attn_kv(at, freqs, window + start_pos % win * self.head_dim * 2)  # bf16 [win, head_dim]
         count = (start_pos + 1) // ratio if ratio else 0
-        if count <= self.index_topk:
+        if count <= max(self.index_topk, self.pick_limit):
             if self.is_kv_source:
                 gpu.compress(self.compressor, self.indexer, token.view(-1), start_pos, self.freqs_cis,
                              self.compress_kv_cache[0], rd)
@@ -130,8 +142,14 @@ class HostAttention(m.Attention):
                 if self.indexer is not None and self.indexer.owns_k:
                     m.shared_attn.index_k = self.indexer.k_cache
             compressed = m.shared_attn.compress_kv if ratio else self.window_kv_cache
-            # the start of the position's row of `attended`
-            sparse_attn(compressed.data_ptr(), rows.data_ptr() + min(start_pos, win - 1) * rows.size(1) * 4, win + count)
+            if count <= self.index_topk:  # the start of the position's row of `attended`
+                sparse_attn(compressed.data_ptr(), rows.data_ptr() + min(start_pos, win - 1) * rows.size(1) * 4, win + count)
+            else:
+                idxs = picked(win, self.index_topk, x.device)
+                if self.is_index_source:
+                    gpu.index_pick(self.indexer, qr.view(-1), token.view(-1), freqs, m.shared_attn.index_k[0], count,
+                                   idxs[win:], win)
+                sparse_attn(compressed.data_ptr(), idxs.data_ptr(), idxs.numel())
         else:
             with torch.device(x.device):  # upstream creates index tensors on the default device
                 compressed, compress_idxs = self._compress_kv(x, qr, start_pos, win)

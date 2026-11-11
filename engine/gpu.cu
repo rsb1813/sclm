@@ -513,6 +513,67 @@ __global__ void norm_rope_fp4_k(const In* in, const uint16_t* norm_w, const floa
     out[i] = to_bf16(round_e2m1(fminf(fmaxf(v / s, -6.0f), 6.0f)) * s);
 }
 
+// kernel.fp4_act_quant in place on bf16 values with power-of-two scales, a warp to each group of 32.
+__global__ void fp4_quant_k(uint16_t* v) {
+    const int i = blockIdx.x * 32 + threadIdx.x;
+    const float x = from_bf16(v[i]);
+    float mx = fabsf(x);
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    const uint32_t bits = __float_as_uint(fmaxf(mx, scalbnf(6.0f, -126)) * float(1.0 / 6.0));  // 2^ceil(log2(amax / 6))
+    const float s = scalbnf(1.0f, int(bits >> 23 & 255) - 127 + ((bits & 0x7fffff) != 0));
+    v[i] = to_bf16(round_e2m1(fminf(fmaxf(x / s, -6.0f), 6.0f)) * s);
+}
+
+// upstream Indexer.forward's score of compressed position t (block t) for one token: the sum over the heads h of
+// relu(<q[h], key[t]>) * weight[h], where weight[h] = dots[h] * scale and every product and sum is rounded to bf16,
+// as upstream's bf16 tensors are. q[heads][d] and keys[..][d] are bf16; a warp takes a head.
+__global__ void index_score_k(const uint16_t* q, const uint16_t* keys, const float* dots, float scale, float* scores, int d) {
+    __shared__ float part[32];
+    const int h = threadIdx.x >> 5, lane = threadIdx.x & 31, heads = blockDim.x >> 5;
+    const uint16_t* qh = q + h * d;
+    const uint16_t* key = keys + size_t(blockIdx.x) * d;
+    float acc = 0;
+    for (int c = lane; c < d; c += 32) acc += from_bf16(qh[c]) * from_bf16(key[c]);
+    for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    if (lane == 0) {
+        const float w = from_bf16(to_bf16(from_bf16(to_bf16(dots[h])) * from_bf16(to_bf16(scale))));
+        part[h] = from_bf16(to_bf16(fmaxf(from_bf16(to_bf16(acc)), 0.0f) * w));
+    }
+    __syncthreads();
+    if (threadIdx.x) return;
+    float s = 0;
+    for (int i = 0; i < heads; ++i) s += part[i];
+    scores[blockIdx.x] = from_bf16(to_bf16(s));
+}
+
+// pick[i] = whether scores[i] is one of the k largest of the n scores (of equal ones, the earlier). A thread takes
+// a score.
+__global__ void topk_mark_k(const float* scores, int* pick, int n, int k) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float s = scores[i];
+    int above = 0;
+    for (int j = 0; j < n; ++j) {
+        const float o = scores[j];
+        above += o > s || (o == s && j < i);
+    }
+    pick[i] = above < k;
+}
+
+// out = the positions that pick[n] marks, in order, each plus `offset`. One block; a thread takes a run of positions.
+__global__ void topk_list_k(const int* pick, int* out, int n, int offset) {
+    __shared__ int marked[1024];
+    const int run = (n + blockDim.x - 1) / blockDim.x, lo = threadIdx.x * run, hi = min(n, lo + run);
+    int mine = 0;
+    for (int i = lo; i < hi; ++i) mine += pick[i];
+    marked[threadIdx.x] = mine;
+    __syncthreads();
+    int at = 0;
+    for (unsigned t = 0; t < threadIdx.x; ++t) at += marked[t];
+    for (int i = lo; i < hi; ++i)
+        if (pick[i]) out[at++] = i + offset;
+}
+
 // upstream Gate.forward for one token x[k] (bf16) with the "sqrtsoftplus" score. Block e computes expert e's score
 // <w[e], x> and copies its share of the first `copy` values of x; the block that finishes last makes the choice:
 // a score becomes sqrt(softplus(score / temp)), the topk largest of score + bias are picked (best first, the lower
@@ -655,6 +716,7 @@ struct Scratch {
     float* xq = nullptr;  // a quantized activation
     float* dots = nullptr;
     uint16_t* h = nullptr;  // an intermediate vector
+    int* picks = nullptr;  // marks of topk_mark_k
 } scratch;
 
 void ensure_scratch() {
@@ -662,6 +724,7 @@ void ensure_scratch() {
     cudaMalloc(&scratch.xq, SCRATCH * sizeof(float));
     cudaMalloc(&scratch.dots, 4096 * sizeof(float));
     cudaMalloc(&scratch.h, SCRATCH * sizeof(uint16_t));
+    cudaMalloc(&scratch.picks, SCRATCH * sizeof(int));
 }
 
 int threads_for(int k, int per_thread) { return k / per_thread >= 512 ? 64 : 32; }
@@ -782,6 +845,27 @@ API int sclm_gpu_compress(const void* wkv, const float* wgate, const uint16_t* n
         norm_rope_fp4_k<float><<<1, kd>>>(scratch.dots, k_norm_w, freqs, k_out, kd, rd, 32, false, eps);
     }
     norm_rope_fp4_k<uint16_t><<<1, d>>>(scratch.h, nullptr, freqs, kv_out, d, rd, 16, true, eps);
+    return cudaGetLastError();
+}
+
+// One decode token of upstream Indexer.forward once there are more compressed positions than it keeps: out[topk]
+// (int32) = the positions of the topk highest scores among the first `count` of keys[..][d] (bf16), in order, each
+// plus `offset`. wb/sb: the indexer's fp8 wq_b [heads * d, rank]; qr[rank]: attention's normed low-rank query; wp:
+// weights_proj [heads, dim]; x[dim]: the token (all bf16); freqs: the position's rotation; scale: of the weights.
+// Equal scores (bf16 has many) go to the earlier position; upstream's choice among them is unspecified.
+API int sclm_gpu_index_pick(const uint8_t* wb, const uint8_t* sb, const uint16_t* qr, const uint16_t* wp, const uint16_t* x,
+                            const float* freqs, const uint16_t* keys, int* out, int rank, int heads, int d, int rd, int dim,
+                            int count, int topk, int offset, float scale) {
+    if (heads > 32 || d % 32 || heads * d > SCRATCH || rank % 32 || rank > SCRATCH || rd % 2 || count > SCRATCH) return -1;
+    ensure_scratch();
+    const Rows b(heads * d, rank);
+    act_quant_k<float><<<rank / 32, 32>>>(qr, scratch.xq);
+    fp8_gemv_rope_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, scratch.h, rank, b.per_row, freqs, d, rd);
+    fp4_quant_k<<<heads * d / 32, 32>>>(scratch.h);
+    dots_k<uint16_t><<<heads, 128>>>(wp, x, scratch.dots, dim);
+    index_score_k<<<count, heads * 32>>>(scratch.h, keys, scratch.dots, scale, scratch.xq, d);  // the quantized qr is used up
+    topk_mark_k<<<(count + 255) / 256, 256>>>(scratch.xq, scratch.picks, count, topk);
+    topk_list_k<<<1, 1024>>>(scratch.picks, out, count, offset);
     return cudaGetLastError();
 }
 
