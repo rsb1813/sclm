@@ -107,3 +107,27 @@ def test_kernel_decode_follows_upstream(models, synced):
         assert sorted(cos)[len(cos) // 2] > 0.9999 and min(cos) > 0.97
     else:
         assert blocks[0] > 0.9999 and min(cos) > 0.9 and sorted(cos)[len(cos) // 2] > 0.99
+
+
+@pytest.mark.parametrize("kernels", [False, True])
+@pytest.mark.parametrize("prefix", [10, 38])
+def test_restore_takes_the_sequence_back(models, kernels, prefix):
+    """Tokens fed after a snapshot() leave no trace once restore() has taken the sequence back: what follows gives the
+    logits of a sequence that never held them. The snapshot is made inside a group of 4 and of 16, before (10) and
+    after (38) the index starts choosing; the dropped tokens wrap the window ring (16), complete groups of both
+    ratios and leave compressed positions and index keys behind, past the snapshot's."""
+    args, _, net, cache = models
+    decoder = host.Host(net, cache, device=DEV, kernels=kernels)
+    dropped, more = 45, 40
+    x = torch.randint(0, args.vocab_size, (1, prefix + dropped + more), generator=torch.Generator().manual_seed(5))
+
+    def feed(tokens, pos):  # a token at a time, as the chat feeds
+        return [decoder.logits(tokens[:, i:i + 1], pos + i).float().clone() for i in range(tokens.size(1))]
+
+    feed(x[:, :prefix], 0)
+    kept = decoder.snapshot()
+    feed(x[:, prefix:prefix + dropped], prefix)
+    decoder.restore(kept, dropped)
+    got = feed(x[:, prefix + dropped:], prefix)
+    want = feed(torch.cat([x[:, :prefix], x[:, prefix + dropped:]], dim=1), 0)[prefix:]
+    assert len(got) == len(want) == more and all(torch.equal(a, b) for a, b in zip(got, want))

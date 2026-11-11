@@ -1,5 +1,5 @@
-# The chat's token sequence for DeepSeek-V4-Flash-0731 against upstream's encoding module: what a conversation feeds
-# the decoder, turn after turn, is what encode_messages writes for the whole conversation with the thinking kept.
+# The chat's token sequence for DeepSeek-V4-Flash-0731 against upstream's encoding module: what the decoder holds after
+# a conversation is what encode_messages writes for it by default, with the earlier replies' thinking dropped.
 # Run with SCLM_MODEL=v4 (needs the checkpoint's tokenizer).
 import os
 
@@ -17,11 +17,20 @@ class Decoder:
 
     def __init__(self, vocab: int, eos: int, tags: tuple):
         self.fed, self.reply, self.vocab, self.eos, self.tags, self.on = [], [], vocab, eos, tags, False
+        self.skip = 0  # thinking tags to pass before the generation prompt's (the one that stands for dropped thinking)
+
+    def snapshot(self):
+        return len(self.fed)
+
+    def restore(self, kept, back):
+        assert kept == len(self.fed) - back
+        del self.fed[kept:]
 
     def logits(self, ids, pos):
         assert pos == len(self.fed)
         self.fed += ids.flatten().tolist()
-        self.on = self.on or self.fed[-1] in self.tags
+        if not self.on and self.fed[-1] in self.tags:
+            self.on, self.skip = self.skip == 0, max(0, self.skip - 1)
         out = torch.full((1, self.vocab), -1e9)
         if self.on and not self.reply:
             self.on = False
@@ -46,11 +55,14 @@ def test_the_chat_feeds_what_upstream_encodes(think, effort, system):
              ("고마워, 테스트도 추가해 줘.", "A unit test with assert_eq.", "#[test] fn t() { assert_eq!(q(1.6), 2); }"),
              ("끝.", "Nothing more to do.", "네.")]
     messages = [{"role": "system", "content": system}] if system else []
-    for question, reasoning, answer in turns:
+    assert session.drop
+    for n, (question, reasoning, answer) in enumerate(turns):
         decoder.reply = (enc(reasoning) + [session.think_end] if think else []) + enc(answer)
+        decoder.skip = 1 if think and n else 0
         session.ask(question, 500, 0.0, 1.0, lambda kind, text: None)
         messages += [{"role": "user", "content": question},
                      {"role": "assistant", "content": answer, **({"reasoning_content": reasoning} if think else {})}]
-    want = enc(encode_messages(messages, "thinking" if think else "chat", drop_thinking=False, reasoning_effort=effort))
+    want = enc(encode_messages(messages, "thinking" if think else "chat", reasoning_effort=effort))
+    assert not think or want.count(session.think_start) == 1  # only the last reply keeps its thinking
     assert want[0] == tok.bos_token_id and want.count(tok.bos_token_id) == 1
     assert decoder.fed == want[:-1]  # the last end-of-turn token is fed with the next turn

@@ -67,18 +67,22 @@ def looping(tokens: list, repeats: int = 6, span: int = 96) -> bool:
 
 
 class Session:
-    """One conversation as a single token sequence in the decoder: a turn is appended to it and nothing is fed
-    twice. The model's thinking therefore stays in the context (the template's drop_thinking=false form)."""
+    """One conversation as a single token sequence in the decoder: a turn is appended to it. V4.1: nothing is fed
+    twice, so the model's thinking stays in the context (the template's drop_thinking=false form). V4-Flash-0731:
+    an earlier reply's thinking leaves the context, as upstream's encoding does by default: before the next turn the
+    decoder is taken back to where the thinking began and the answer is fed again without it."""
 
     def __init__(self, tok, decoder, max_seq_len: int):
         self.tok, self.decoder, self.max_seq_len = tok, decoder, max_seq_len
         self.eos = tok.eos_token_id
         self.think_start, self.think_end = tok.convert_tokens_to_ids("<think>"), tok.convert_tokens_to_ids("</think>")
         self.system, self.think, self.effort = "", True, "low" if V4 else "high"  # V4-Flash-0731's own default is low
+        self.drop = V4 and hasattr(decoder, "snapshot")
         self.clear()
 
     def clear(self) -> None:
         self.pos, self.logits = 0, None  # tokens fed so far, and the logits after the last of them
+        self.redo = None  # (position where the last reply's thinking began, the decoder's state there, the answer's tokens)
 
     def turn_ids(self, message: str) -> list:
         """The tokens a user message adds: the whole prompt at the start, later the end of the assistant's turn and
@@ -111,11 +115,19 @@ class Session:
         """Feeds the user's message and generates the reply, handing each piece of text to on_text(kind, text) with
         kind "think" or "answer" (an empty text marks the change from one to the other). stop() is asked between
         tokens, and a reply that runs into a loop (looping) ends there. Returns the counts and times of the turn."""
-        ids = self.turn_ids(message)
-        if self.pos + len(ids) + 1 >= self.max_seq_len:
+        ids, redo = self.turn_ids(message), self.redo
+        if redo is not None:  # the last reply without its thinking: "</think>" in its place, then the answer
+            ids = [self.think_end] + redo[2] + ids
+        if (redo[0] if redo else self.pos) + len(ids) + 1 >= self.max_seq_len:
             raise ContextFull
         t0 = time.perf_counter()
-        for token in ids:
+        if redo is not None:
+            self.decoder.restore(redo[1], self.pos - redo[0])
+            self.pos, self.redo = redo[0], None
+        mark = None
+        for i, token in enumerate(ids):
+            if self.drop and i == len(ids) - 1 and token == self.think_start:
+                mark = (self.pos, self.decoder.snapshot())  # the thinking begins after this point
             self._feed(token)
         t1 = time.perf_counter()
         kind, new, part, sent, said, looped = "think" if ids[-1] == self.think_start else "answer", 0, [], "", [], False
@@ -138,6 +150,8 @@ class Session:
             if not text.endswith("\ufffd"):  # else a character is still missing bytes
                 on_text(kind, text[len(sent):])
                 sent = text
+        if mark is not None:  # a reply cut off in its thinking leaves an empty answer
+            self.redo = (*mark, said[said.index(self.think_end) + 1:] if self.think_end in said else [])
         return {"prompt_tokens": len(ids), "prompt_s": t1 - t0, "tokens": new, "seconds": time.perf_counter() - t1,
                 "looped": looped}
 

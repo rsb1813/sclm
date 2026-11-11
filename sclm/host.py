@@ -379,6 +379,27 @@ class Host:
             h, pre_mix = layer(h, start_pos, pre_mix, None)
         return net.head(net.norm(layer.hc_pre(h, pre_mix)))
 
+    def snapshot(self) -> list:
+        """The attention state of the sequence at this point (V4-Flash-0731): every layer's window ring and its
+        compressors' groups. restore() takes the sequence back to it."""
+        assert V4
+        kept = []
+        for layer in self.net.layers:
+            attn = layer.attn
+            state = [attn.kv_cache[:, :attn.window_size]]
+            state += [t for mod in attn.modules() if isinstance(mod, m.Compressor) for t in (mod.kv_state, mod.score_state)]
+            kept += [(t, t.clone()) for t in state]
+        return kept
+
+    def restore(self, kept: list, back: int) -> None:
+        """Takes the sequence back to a snapshot() made `back` tokens ago: the next token continues from that
+        position. The compressed positions written since are overwritten as the sequence passes them again; the
+        expert cache's clock keeps running."""
+        with torch.no_grad():
+            for t, saved in kept:
+                t.copy_(saved)
+        self.origin += back
+
     @torch.inference_mode()
     def logits(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         """Next-token logits [batch, vocab] (fp32) after input_ids, which continue the sequence at start_pos."""
