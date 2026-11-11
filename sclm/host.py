@@ -8,8 +8,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from types import SimpleNamespace
-
 from sclm import core, gpu, ssd
 from sclm.checkpoint import Checkpoint, widen_fp8
 from sclm.layerwise import V4, load_params_
@@ -243,6 +241,21 @@ class HostBlock(m.Block):
         return out, pre
 
 
+class _NoCodes:
+    """Stands in for a layer's coded experts (core.Layer) when it has none: every routed expert is an original one."""
+
+    experts = {}
+
+    def start(self, experts: list, gates: list, x) -> None:
+        pass
+
+    def wait(self, out) -> None:
+        out[:] = 0  # the CPU tier's sum
+
+    def touch(self, experts: list) -> None:
+        pass
+
+
 class _Absent(nn.Module):
     """Stands in, while the model is built, for a module whose weights are placed afterwards."""
 
@@ -253,13 +266,14 @@ class _Absent(nn.Module):
 def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.Transformer":
     """upstream's Transformer for `args` (with TEXT_ONLY applied) without what is placed afterwards or stays off the
     device: the routed experts (each block's ffn is a TieredMoE), the engram tables, the embedding and the head.
-    Parameters are uninitialized. V4-Flash-0731 is built from upstream's own blocks (the engine's kernels are not
-    ported to it yet): its decode runs upstream's PyTorch code."""
+    Parameters are uninitialized. V4-Flash-0731 has its own block (sclm/host_v4.py)."""
     if V4:
+        from sclm.host_v4 import V4Block
+
         assert not args.dspark_block_size
-        names = ("MoE", "ParallelEmbedding", "ParallelHead")
+        names = ("Block", "MoE", "ParallelEmbedding", "ParallelHead")
         upstream = [getattr(m, n) for n in names]
-        m.MoE, m.ParallelEmbedding, m.ParallelHead = TieredMoE, _Absent, _Absent
+        m.Block, m.MoE, m.ParallelEmbedding, m.ParallelHead = V4Block, TieredMoE, _Absent, _Absent
         try:
             with torch.device(device):
                 return m.Transformer(args)
@@ -281,13 +295,13 @@ def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.T
 
 def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda") -> None:
     """Fills build_net's model from the released checkpoint. The engram tables stay in the checkpoint files, the
-    embedding table in RAM, the head in bf16 and attn.wo_a in fp8 (V4-Flash-0731: wo_a in bf16, as upstream's code
-    reads it)."""
+    embedding table in RAM, the head in bf16 and attn.wo_a in fp8."""
     net.embed = HostEmbedding(ckpt.get("embed.weight"))
     if V4:
         for i, block in enumerate(net.layers):
             prefix = f"layers.{i}."
-            load_params_(block, ckpt.module_state(prefix, skip=(".ffn.experts.",)), prefix)
+            block.attn.wo_a = Fp8Weight(*(ckpt.get(f"{prefix}attn.wo_a.{part}").to(device) for part in ("weight", "scale")))
+            load_params_(block, ckpt.module_state(prefix, skip=(".ffn.experts.", ".attn.wo_a.")), prefix)
         with torch.no_grad():
             for part in ("fn", "base", "scale"):  # the head's hyper-connection
                 getattr(net, "hc_head_" + part).copy_(ckpt.get("hc_head_" + part))
@@ -316,7 +330,7 @@ def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, c
                             background=background)
     for i, block in enumerate(net.layers):
         if codes_dir is None:
-            block.ffn.ram = SimpleNamespace(experts={})  # no expert of the layer is coded
+            block.ffn.ram = _NoCodes()
         else:
             path = os.path.join(codes_dir, f"layer_{i:02d}.safetensors")
             block.ffn.ram = core.Layer(path, args.dim, args.moe_inter_dim, args.swiglu_limit)
@@ -334,7 +348,7 @@ class Host:
         self.net, self.cache, self.device = net, cache, device
         self.origin = self.end = 0  # the cache's clock at the start of this sequence and after its last token
         on_gpu = torch.device(device).type == "cuda"
-        self.kernels = on_gpu and os.path.exists(gpu.DLL) and not V4 if kernels is None else kernels
+        self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
         self.first_mix = None  # upstream's identity pre-mix of the first block, made once
         # the n-gram hash on the host for decode(). It is given every token of the sequence; net.engram_hash sees
         # the ones upstream's forward runs.
@@ -344,6 +358,12 @@ class Host:
         """upstream Transformer.forward for one text token (on the CPU) down to its logits: nothing is sampled
         from them."""
         net = self.net
+        if V4:  # no engram; every block mixes its own stream, and the token id picks the first layers' experts
+            token = int(input_ids)
+            h = net.embed(input_ids).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1)
+            for layer in net.layers:
+                h = layer(h, start_pos, token)
+            return net.head(net.norm(layer.hc_head(h, net.hc_head_fn, net.hc_head_scale, net.hc_head_base)))
         rows = self.hash.rows(int(input_ids), start_pos) if self.hash is not None else None
         if rows is not None:
             for layer in net.layers:  # the rows are read while the layers before run

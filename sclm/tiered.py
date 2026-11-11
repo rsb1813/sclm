@@ -22,7 +22,14 @@ class TieredMoE(nn.Module):
         self.layer_id, self.dim, self.inter, self.limit = layer_id, args.dim, args.moe_inter_dim, args.swiglu_limit
         self.gate = m.Gate(layer_id, args)
         self.shared_experts = m.Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
-        self.ram = self.cache = self.after = self.stream = self.bound = None
+        self.ram = self.cache = self.after = self.stream = self.bound = self.table = None
+
+    def picks(self, token: int) -> list:
+        """The experts of `token` in a layer that routes by the token id (V4-Flash-0731's first layers): the gate's
+        table, copied to the host once."""
+        if self.table is None:
+            self.table = self.gate.tid2eid.cpu().numpy()
+        return self.table[token].tolist()
 
     def bind(self, buf, guess: int) -> tuple:
         """gpu.moe_begin and gpu.moe_end with this layer's arguments bound (gpu.bind). Their wrappers took 15 to 20 us
@@ -46,21 +53,24 @@ class TieredMoE(nn.Module):
         self.bound = (begin, end, buf, guess)
         return self.bound
 
-    def decode(self, x: torch.Tensor, fixed: int | None = None) -> torch.Tensor:
+    def decode(self, x: torch.Tensor, token: int | None = None) -> torch.Tensor:
         """forward for one token (bf16 [dim]) on the engine's GPU kernels. The host waits for the device once, to
         learn the routing and take x for the CPU tier; while the CPU computes its tier, the device computes the shared
         expert (queued before that wait, but not waited for) and the routed experts it already holds.
-        fixed: the address of the token's experts (int32 [topk]) in a layer that routes by the token id."""
+        token: the token's id (V4-Flash-0731, whose first layers route by it)."""
         cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
         ahead = max(cache.guess, cache.touch)
-        guess = ahead if self.after else 0
+        later = self.after[0] if self.after and ahead else None
+        exact = later is not None and getattr(later.gate, "hash", False)  # the next layer's experts are the token's: no guess
+        guess = ahead if later is not None and not exact else 0
+        # this layer's experts, if the token id names them: the token's row of the gate's table on the device
+        fixed = self.gate.tid2eid.data_ptr() + token * topk * 4 if getattr(self.gate, "hash", False) else None
         buf = gpu.moe_buffers(topk, self.dim, ahead, x.device)
         # with guess: what the next layer's gate makes of this layer's input, best first: of the first cache.guess, the
         # SSD experts are read a layer early; of the first cache.touch, the CPU-tier experts' codes are read into the
         # CPU's cache
         bound = self.bound
         begin, end, _, _ = bound if bound is not None and bound[2] is buf and bound[3] == guess else self.bind(buf, guess)
-        later = self.after[0] if guess else None
         begin(x.data_ptr(), fixed)
         # the routing was copied after every slot upload queued so far, and after every kernel that read a slot: from
         # here to the next layer's routing, the slot copies run beside the kernels (gpu.copy)
@@ -95,6 +105,9 @@ class TieredMoE(nn.Module):
         if guess:
             gpu.moe_guess()  # as a rule it has arrived while the reads above were started
             picks = host[2 * topk + self.dim:2 * topk + self.dim + guess].astype(np.int64).tolist()
+        elif exact:
+            picks = later.picks(token)
+        if picks:
             cache.read_ahead(later.layer_id, [e for e in picks[:cache.guess] if e not in later.ram.experts])
         reading = {slot for slot, *_ in pending}
         held = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot not in reading]
@@ -135,10 +148,7 @@ class TieredMoE(nn.Module):
         for text), or the token ids with V4-Flash-0731, whose first layers route by them."""
         shape = x.size()
         if gpu.active and x.numel() == self.dim and self.gate.score_func == "sqrtsoftplus" and not isinstance(image_mask, torch.Tensor):
-            fixed = None  # a decode token: the host gives V4-Flash-0731's token id as a number
-            if getattr(self.gate, "hash", False):  # this layer's experts are the token's row of the table
-                fixed = self.gate.tid2eid.data_ptr() + image_mask * self.gate.topk * 4
-            return self.decode(x.reshape(-1), fixed).view(shape)
+            return self.decode(x.reshape(-1), image_mask).view(shape)  # a decode token: V4-Flash-0731's token id comes as a number
         x = x.view(-1, self.dim)
         self.cache.beside = False  # several tokens: a slot copy has to wait for the kernels of the token before
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
