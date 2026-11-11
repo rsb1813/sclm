@@ -76,6 +76,15 @@ __device__ float block_reduce(float v, bool take_max) {
     return part[32];
 }
 
+// One value of kernel.act_quant(x, 32, "ue8m0", inplace), mx being the largest magnitude of its block of 32.
+__device__ __forceinline__ float fp8_round(float v, float mx) {
+    const uint32_t bits = __float_as_uint(fmaxf(mx, 1e-4f) * float(1.0 / 448.0));
+    const int se = int(bits >> 23 & 255) - 127 + ((bits & 0x7fffff) != 0);  // the scale is 2^ceil(log2(amax / 448))
+    const float t = scalbnf(v, -se);
+    const int q = max(ilogbf(t), -6) - 3;  // E4M3 keeps 4 significant bits down to 2^-6 and steps of 2^-9 below
+    return scalbnf(rintf(scalbnf(t, -q)), q + se);
+}
+
 // kernel.act_quant(x, 32, "ue8m0", inplace): a block of 32 is scaled by a power of two so that its largest magnitude
 // is at most 448, and rounded to E4M3. One CUDA block of 32 threads per quantization block. Out is fp32, or bf16
 // (which holds every such value exactly); xq may be x.
@@ -85,11 +94,7 @@ __global__ void act_quant_k(const uint16_t* x, Out* xq) {
     const float v = from_bf16(x[i]);
     float mx = fabsf(v);
     for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
-    const uint32_t bits = __float_as_uint(fmaxf(mx, 1e-4f) * float(1.0 / 448.0));
-    const int se = int(bits >> 23 & 255) - 127 + ((bits & 0x7fffff) != 0);  // the scale is 2^ceil(log2(amax / 448))
-    const float t = scalbnf(v, -se);
-    const int q = max(ilogbf(t), -6) - 3;  // E4M3 keeps 4 significant bits down to 2^-6 and steps of 2^-9 below
-    const float r = scalbnf(rintf(scalbnf(t, -q)), q + se);
+    const float r = fp8_round(v, mx);
     if (sizeof(Out) == 2)
         xq[i] = Out(to_bf16(r));
     else
@@ -204,20 +209,78 @@ __global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* 
     if (threadIdx.x == 0) put(y, row, acc, mode);
 }
 
-// The same for packed FP4: w[row] is k / 2 bytes (the even column in the low nibble), scale[row][k / 32] in E8M0.
-__global__ void fp4_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, Mode mode) {
-    const int row = blockIdx.x;
-    const uint8_t* wr = w + size_t(row) * (k >> 1);
-    const uint8_t* sr = scale + size_t(row) * (k >> 5);
-    float acc = 0;
-    for (int c = threadIdx.x * 8; c < k; c += blockDim.x * 8) {
-        const uint32_t b = *(const uint32_t*)(wr + (c >> 1));
-        float s = 0;
-        for (int i = 0; i < 8; ++i) s += e2m1x2(b >> (4 * i)) * xq[c + i];
-        acc += 0.5f * e8m0(sr[c >> 5]) * s;
+// What the expert kernels need of one SwiGLU expert: its weights with their scales, and its routing weight.
+struct Mats {
+    const uint8_t *w1, *s1, *w2, *s2, *w3, *s3;
+    float weight;
+};
+struct Batch {
+    Mats m[8];
+    int n;
+};
+
+// One warp's <w[row], x> for a stored row of k weights: packed FP4 (k / 2 bytes, the even column in the low nibble,
+// an E8M0 scale per 32 columns) or FP8 (as fp8_gemv_k reads it); sr is the row's scales. Lane 0 gets the sum. The
+// additions run in fp8_gemv_k's order, which gives a long row 64 threads: a lane then does the work of two in turn.
+template <bool FP4>
+__device__ __forceinline__ float row_dot(const uint8_t* wr, const uint8_t* sr, const float* x, int k, int lane) {
+    const int per = FP4 ? 8 : 4, warps = k / per >= 512 ? 2 : 1;
+    float total = 0;
+    for (int w = 0; w < warps; ++w) {
+        float acc = 0;
+        for (int c = (w * 32 + lane) * per; c < k; c += warps * 32 * per) {
+            if (FP4) {
+                const uint32_t b = *(const uint32_t*)(wr + (c >> 1));
+                float s = 0;
+                for (int i = 0; i < 8; ++i) s += e2m1x2(b >> (4 * i)) * x[c + i];
+                acc += 0.5f * e8m0(sr[c >> 5]) * s;
+            } else {
+                const uint32_t b = *(const uint32_t*)(wr + c);
+                acc += e8m0(sr[c >> 5]) * (e4m3(b & 255) * x[c] + e4m3(b >> 8 & 255) * x[c + 1] + e4m3(b >> 16 & 255) * x[c + 2] +
+                                           e4m3(b >> 24) * x[c + 3]);
+            }
+        }
+        for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+        total += acc;
     }
-    acc = block_sum(acc);
-    if (threadIdx.x == 0) put(y, row, acc, mode);
+    return total;
+}
+
+// The first half of the reference Expert for a batch of experts on the quantized layer input xq. A block computes
+// 32 rows of the hidden vector of expert blockIdx / (inter / 32), a warp per row: the row of w1 and of w3 (each
+// rounded to bf16 as the reference's GEMM output is), h = weight * silu(min(gate, limit)) * clamp(up, -limit, limit)
+// rounded to bf16, and the block's 32 values quantized as kernel.act_quant does before w2 -> hq[expert][inter].
+template <bool FP4>
+__global__ void expert_hidden_k(Batch b, const float* xq, float* hq, int dim, int inter, float limit) {
+    __shared__ float vals[32];
+    const int blocks = inter / 32, e = blockIdx.x / blocks, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = (blockIdx.x % blocks) * 32 + warp;
+    const Mats& m = b.m[e];
+    const size_t at = size_t(row) * (FP4 ? dim / 2 : dim), scale_at = size_t(FP4 ? row : row >> 5) * (dim >> 5);
+    const float gate = row_dot<FP4>(m.w1 + at, m.s1 + scale_at, xq, dim, lane);
+    const float up = row_dot<FP4>(m.w3 + at, m.s3 + scale_at, xq, dim, lane);
+    if (lane == 0) {
+        float g = from_bf16(to_bf16(gate)), u = from_bf16(to_bf16(up));
+        if (limit > 0) g = fminf(g, limit), u = fminf(fmaxf(u, -limit), limit);
+        vals[warp] = from_bf16(to_bf16(m.weight * (g / (1.0f + expf(-g)) * u)));
+    }
+    __syncthreads();
+    if (lane) return;
+    float mx = 0;
+    for (int i = 0; i < 32; ++i) mx = fmaxf(mx, fabsf(vals[i]));
+    hq[size_t(e) * inter + row] = fp8_round(vals[warp], mx);
+}
+
+// The second half, one warp per output row: y[row] (fp32), or zero with STORE_F32, plus each expert's
+// <w2[row], hq[expert]> rounded to bf16, added in the batch's order.
+template <bool FP4>
+__global__ void expert_out_k(Batch b, const float* hq, float* y, int dim, int inter, Mode mode) {
+    const int row = blockIdx.x, lane = threadIdx.x;
+    const size_t at = size_t(row) * (FP4 ? inter / 2 : inter), scale_at = size_t(FP4 ? row : row >> 5) * (inter >> 5);
+    float sum = lane == 0 && mode == ADD ? y[row] : 0.0f;
+    for (int e = 0; e < b.n; ++e)
+        sum += from_bf16(to_bf16(row_dot<FP4>(b.m[e].w2 + at, b.m[e].s2 + scale_at, hq + size_t(e) * inter, inter, lane)));
+    if (lane == 0) y[row] = sum;
 }
 
 // out[row] = <w[row], x> for a bf16 or fp32 weight with rows of k values and x in bf16; block `row` computes one.
@@ -323,15 +386,6 @@ __global__ void moe_finish_k(const float* routed, const float* shared, uint16_t*
     if (i < n) out[i] = to_bf16(routed[i] + shared[i]);
 }
 
-// The reference Expert's middle: h = weight * silu(min(gate, limit)) * clamp(up, -limit, limit), rounded to bf16.
-__global__ void swiglu_k(const uint16_t* gate, const uint16_t* up, uint16_t* h, int n, float limit, float weight) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = from_bf16(gate[i]), u = from_bf16(up[i]);
-    if (limit > 0) g = fminf(g, limit), u = fminf(fmaxf(u, -limit), limit);
-    h[i] = to_bf16(weight * (g / (1.0f + expf(-g)) * u));
-}
-
 // Hyper-connection mixes, first half (Block.hc_mixes): block i < rows computes <fn[i], h> over the n values of the
 // flattened stream h (bf16), block `rows` its sum of squares. The additions keep one order (a thread adds every
 // 256th value in turn; the mixes magnify a changed last bit), but four reads are under way at a time.
@@ -412,19 +466,26 @@ __global__ void hc_post_k(const uint16_t* x, const uint16_t* residual, const flo
 struct Scratch {
     float* xq = nullptr;  // a quantized activation
     float* dots = nullptr;
-    uint16_t *gate = nullptr, *up = nullptr, *h = nullptr;  // an expert's branches and hidden vector; h also other intermediates
+    uint16_t* h = nullptr;  // an intermediate vector
 } scratch;
 
 void ensure_scratch() {
     if (scratch.xq) return;
     cudaMalloc(&scratch.xq, SCRATCH * sizeof(float));
     cudaMalloc(&scratch.dots, 4096 * sizeof(float));
-    cudaMalloc(&scratch.gate, SCRATCH * sizeof(uint16_t));
-    cudaMalloc(&scratch.up, SCRATCH * sizeof(uint16_t));
     cudaMalloc(&scratch.h, SCRATCH * sizeof(uint16_t));
 }
 
 int threads_for(int k, int per_thread) { return k / per_thread >= 512 ? 64 : 32; }
+
+template <bool FP4>
+int launch_experts(const Batch& b, int dim, int inter, float limit, const float* xq, float* y, Mode mode) {
+    if (dim > SCRATCH || b.n * inter > SCRATCH || inter % 32) return -1;
+    ensure_scratch();
+    expert_hidden_k<FP4><<<b.n * (inter / 32), 1024>>>(b, xq, scratch.xq, dim, inter, limit);
+    expert_out_k<FP4><<<dim, 32>>>(b, scratch.xq, y, dim, inter, mode);
+    return cudaGetLastError();
+}
 
 }  // namespace
 
@@ -444,33 +505,29 @@ API int sclm_gpu_fp8_linear(const uint8_t* w, const uint8_t* scale, int n, int k
     return cudaGetLastError();
 }
 
-// y[dim] (fp32) += weight-scaled output of the routed expert whose checkpoint bytes are at `slot` (scales of w1, w2,
-// w3, then their packed FP4 weights), on the layer input already quantized as xq[dim] (sclm_gpu_act_quant).
-API int sclm_gpu_fp4_expert(const uint8_t* slot, int dim, int inter, float limit, const float* xq, float weight, float* y) {
-    if (dim > SCRATCH || inter > SCRATCH) return -1;
-    ensure_scratch();
-    const uint8_t *s1 = slot, *s2 = s1 + size_t(inter) * (dim / 32), *s3 = s2 + size_t(dim) * (inter / 32);
-    const uint8_t *w1 = s3 + size_t(inter) * (dim / 32), *w2 = w1 + size_t(inter) * (dim / 2), *w3 = w2 + size_t(dim) * (inter / 2);
-    fp4_gemv_k<<<inter, threads_for(dim, 8)>>>(w1, s1, xq, scratch.gate, dim, STORE);
-    fp4_gemv_k<<<inter, threads_for(dim, 8)>>>(w3, s3, xq, scratch.up, dim, STORE);
-    swiglu_k<<<(inter + 255) / 256, 256>>>(scratch.gate, scratch.up, scratch.h, inter, limit, weight);
-    act_quant_k<float><<<inter / 32, 32>>>(scratch.h, scratch.xq);
-    fp4_gemv_k<<<dim, threads_for(inter, 8)>>>(w2, s2, scratch.xq, y, inter, ADD);
-    return cudaGetLastError();
+// y[dim] (fp32) += the sum over n routed experts (1 to 8, added in order) of weights[i] * expert slots[i]. An
+// expert's checkpoint bytes lie at store + slots[i] * stride: the scales of w1, w2, w3, then their packed FP4
+// weights. xq[dim] is the layer input already quantized (sclm_gpu_act_quant).
+API int sclm_gpu_fp4_experts(const uint8_t* store, uint64_t stride, const int* slots, const float* weights, int n, int dim,
+                             int inter, float limit, const float* xq, float* y) {
+    if (n < 1 || n > 8) return -1;
+    Batch b;
+    b.n = n;
+    for (int i = 0; i < n; ++i) {
+        const uint8_t *s1 = store + slots[i] * stride, *s2 = s1 + size_t(inter) * (dim / 32), *s3 = s2 + size_t(dim) * (inter / 32);
+        const uint8_t *w1 = s3 + size_t(inter) * (dim / 32), *w2 = w1 + size_t(inter) * (dim / 2), *w3 = w2 + size_t(dim) * (inter / 2);
+        b.m[i] = {w1, s1, w2, s2, w3, s3, weights[i]};
+    }
+    return launch_experts<true>(b, dim, inter, limit, xq, y, ADD);
 }
 
 // y[dim] (fp32) += the upstream Expert with fp8 weights and block scales (the shared expert) on the layer input
 // quantized as xq[dim]; store: y is overwritten instead. w1 and w3 are [inter, dim], w2 is [dim, inter].
 API int sclm_gpu_fp8_expert(const uint8_t* w1, const uint8_t* s1, const uint8_t* w2, const uint8_t* s2, const uint8_t* w3,
                             const uint8_t* s3, int dim, int inter, float limit, const float* xq, float* y, int store) {
-    if (dim > SCRATCH || inter > SCRATCH) return -1;
-    ensure_scratch();
-    fp8_gemv_k<<<inter, threads_for(dim, 4)>>>(w1, s1, xq, scratch.gate, dim, inter, STORE);
-    fp8_gemv_k<<<inter, threads_for(dim, 4)>>>(w3, s3, xq, scratch.up, dim, inter, STORE);
-    swiglu_k<<<(inter + 255) / 256, 256>>>(scratch.gate, scratch.up, scratch.h, inter, limit, 1.0f);
-    act_quant_k<float><<<inter / 32, 32>>>(scratch.h, scratch.xq);
-    fp8_gemv_k<<<dim, threads_for(inter, 4)>>>(w2, s2, scratch.xq, y, inter, dim, store ? STORE_F32 : ADD);
-    return cudaGetLastError();
+    Batch b;
+    b.n = 1, b.m[0] = {w1, s1, w2, s2, w3, s3, 1.0f};
+    return launch_experts<false>(b, dim, inter, limit, xq, y, store ? STORE_F32 : ADD);
 }
 
 // The query side of upstream Attention.forward for one token: qr[rank] = RMSNorm(wq_a x), then

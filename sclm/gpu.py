@@ -16,7 +16,8 @@ def lib():
         _lib = C.CDLL(os.path.abspath(DLL))  # finds the CUDA runtime torch has already loaded
         _lib.sclm_gpu_act_quant.argtypes = [C.c_void_p, C.c_void_p, C.c_int]
         _lib.sclm_gpu_fp8_linear.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_void_p]
-        _lib.sclm_gpu_fp4_expert.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_float, C.c_void_p, C.c_float, C.c_void_p]
+        _lib.sclm_gpu_fp4_experts.argtypes = [C.c_void_p, C.c_uint64, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int,
+                                              C.c_float, C.c_void_p, C.c_void_p]
         _lib.sclm_gpu_hc_mixes.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int, C.c_float, C.c_float, C.c_int]
         _lib.sclm_gpu_hc_pre_norm.argtypes = [C.c_void_p] * 4 + [C.c_int, C.c_int, C.c_float]
         _lib.sclm_gpu_hc_post.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int]
@@ -54,11 +55,14 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, group
     return y
 
 
-def fp4_expert(slot: torch.Tensor, dim: int, inter: int, limit: float, xq: torch.Tensor, weight: float, y: torch.Tensor) -> None:
-    """y (fp32 [dim]) += weight * the routed expert held in `slot` (its checkpoint bytes: three scales, then three
-    packed-FP4 weights) applied to the layer input quantized as xq (act_quant)."""
-    assert slot.is_contiguous() and xq.dtype == y.dtype == torch.float32 and xq.numel() == y.numel() == dim
-    _check(lib().sclm_gpu_fp4_expert(slot.data_ptr(), dim, inter, limit, xq.data_ptr(), weight, y.data_ptr()))
+def fp4_experts(store: torch.Tensor, slots, weights, dim: int, inter: int, limit: float, xq: torch.Tensor, y: torch.Tensor) -> None:
+    """y (fp32 [dim]) += the sum, in the order given, of weights[i] * the routed expert in row slots[i] of `store`
+    (uint8 [rows, bytes], a row being an expert's checkpoint bytes: three scales, then three packed-FP4 weights)
+    applied to the layer input quantized as xq (act_quant). One to eight experts."""
+    n = len(slots)
+    assert store.dim() == 2 and store.is_contiguous() and xq.dtype == y.dtype == torch.float32 and xq.numel() == y.numel() == dim
+    _check(lib().sclm_gpu_fp4_experts(store.data_ptr(), store.size(1), (C.c_int * n)(*slots), (C.c_float * n)(*weights), n, dim,
+                                      inter, limit, xq.data_ptr(), y.data_ptr()))
 
 
 def hc_mixes(h: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, hc: int, norm_eps: float,

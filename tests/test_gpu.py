@@ -85,7 +85,10 @@ def test_fp4_expert_matches_upstream_expert():
     y = torch.zeros(dim, dtype=torch.float32, device=DEV)
     xq = gpu.act_quant(x)
     for gate in (0.3, 0.11):  # two calls add up
-        gpu.fp4_expert(slot, dim, inter, limit, xq, gate, y)
+        gpu.fp4_experts(slot.view(1, -1), [0], [gate], dim, inter, limit, xq, y)
+    batch = torch.zeros(dim, dtype=torch.float32, device=DEV)
+    gpu.fp4_experts(slot.view(1, -1), [0, 0], [0.3, 0.11], dim, inter, limit, xq, batch)
+    assert torch.equal(batch, y)  # a batch adds its experts in order, as separate calls do
     want = sum(m.Expert.forward(expert, x, torch.tensor([[gate]], dtype=torch.float32, device=DEV)).float() for gate in (0.3, 0.11))
     a, b = y, want.flatten()
     assert ((a - b).abs() <= b.abs() * 2**-6 + 1e-30).all() and (a == b).float().mean() > 0.9

@@ -57,17 +57,17 @@ class TieredMoE(nn.Module):
         gpu.fp8_expert(self.shared_experts, self.limit, xq, shared, store=True)
         y = torch.zeros(self.dim, dtype=torch.float32, device=x.device)
         reading = {slot for slot, *_ in pending}
-        for k, slot in zip(ssd, slots):
-            if slot not in reading:
-                gpu.fp4_expert(cache.store[slot], self.dim, self.inter, self.limit, xq, gates[k], y)
+        held = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot not in reading]
+        read = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot in reading]
+        if held:
+            gpu.fp4_experts(cache.store, *zip(*held), self.dim, self.inter, self.limit, xq, y)
         self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:2 * topk + self.dim],
                          cache.ram_out.numpy())
         t2 = perf_counter()
         cache.finish(pending)
         t3 = perf_counter()
-        for k, slot in zip(ssd, slots):
-            if slot in reading:
-                gpu.fp4_expert(cache.store[slot], self.dim, self.inter, self.limit, xq, gates[k], y)
+        if read:
+            gpu.fp4_experts(cache.store, *zip(*read), self.dim, self.inter, self.limit, xq, y)
         # not waited for: the device takes the buffer before the next layer's routing comes back, and the CPU tier
         # writes it again only after that
         y += cache.ram_out.to(x.device, non_blocking=True)
@@ -103,8 +103,8 @@ class TieredMoE(nn.Module):
             t3 = perf_counter()
             if gpu.active:  # straight from the slots' FP4 bytes
                 xq = gpu.act_quant(x[r])
-                for k, slot in zip(ssd, slots):
-                    gpu.fp4_expert(self.cache.store[slot], self.dim, self.inter, self.limit, xq, gates[r][k], y[r])
+                if ssd:
+                    gpu.fp4_experts(self.cache.store, slots, [gates[r][k] for k in ssd], self.dim, self.inter, self.limit, xq, y[r])
             else:
                 for k, slot in zip(ssd, slots):
                     y[r] += m.Expert.forward(self.cache.experts[slot], x[r:r + 1], weights[r, k].view(1, 1))[0]
