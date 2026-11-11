@@ -169,7 +169,7 @@ def test_cache_takes_experts_that_left_their_slots_from_ram(tmp_path):
         for e in range(6) for w, (out, k) in SHAPES.items() for part, per_byte in (("scale", m.fp4_block_size), ("weight", 2))})
     reader = ssd.ExpertReader(Checkpoint(str(tmp_path)), chunk=64 * 1024)
     cache = ssd.ExpertCache(reader, 1, 6, tc.DIM, tc.INTER, tc.LIMIT, slots=2, lam=0.1, device="cpu", scratch=TOPK, background=2)
-    cache.keep_in_ram(3)
+    cache.keep_in_ram(4)
 
     def holds(slot: int, e: int) -> bool:
         want = [data[f"layers.0.ffn.experts.{e}.{w}.{part}"].ravel() for part in ("scale", "weight") for w in SHAPES]
@@ -184,10 +184,12 @@ def test_cache_takes_experts_that_left_their_slots_from_ram(tmp_path):
 
     assert use([0, 1], 0)[1] == 2 and use([2, 3], 100)[1] == 2  # 0 and 1 leave their slots
     assert use([0, 1], 200)[1] == 0 and cache.stats["ram_cache_hits"] == 2  # and come back unread, for 2 and 3
+    assert list(cache.ram_cache) == [2, 0, 3, 1]  # 0 and 1 stay in RAM as well: leaving again will copy nothing
     cache.read_ahead(0, [2, 3])  # in RAM: not read
-    assert cache.stats["ahead"] == 0 and sorted(cache.ram_cache) == [2, 3]
+    assert cache.stats["ahead"] == 0
     use([0, 1], 200)
-    slots, reads = use([2], 200)  # scores below 0 and 1 now: computed from a scratch slot, and stays in RAM
-    assert slots[0] >= 2 and reads == 0 and list(cache.ram_cache) == [3, 2]
-    assert use([4, 5], 300)[1] == 2 and list(cache.ram_cache) == [2, 0, 1]  # room for three: 3 has left RAM too
-    assert use([3], 400)[1] == 1 and cache.stats["ram_cache_hits"] == 3  # and is read again
+    slots, reads = use([2], 200)  # scores below 0 and 1 now: computed from a scratch slot, and the newest in RAM
+    assert slots[0] >= 2 and reads == 0 and list(cache.ram_cache) == [0, 3, 1, 2]
+    assert use([4, 5], 300)[1] == 2 and list(cache.ram_cache) == [0, 3, 1, 2]  # 0 and 1 left, already in RAM
+    assert use([2, 3], 400)[1] == 0 and list(cache.ram_cache) == [4, 2, 5, 3]  # 4 and 5 leave: the oldest make room
+    assert use([0], 500)[1] == 1 and cache.stats["ram_cache_hits"] == 5  # and 0 is read again

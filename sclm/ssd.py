@@ -78,7 +78,7 @@ class ExpertCache:
         self.wait_share = 0.0
         self.ram_share = 0.0  # > 0: a CPU-tier expert with less than this share of the routing weight is left out
         self.guess = 0  # > 0: a layer's gate guesses this many experts of the next layer, which are read ahead
-        self.ram_cache = {}  # key -> host buffer holding an expert that left its slot (keep_in_ram), oldest first
+        self.ram_cache = {}  # key -> host buffer holding the expert's bytes (keep_in_ram), the oldest first
         self.ram_free = []  # the host buffers of keep_in_ram that hold nothing
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
@@ -109,9 +109,11 @@ class ExpertCache:
 
     def keep_in_ram(self, n: int) -> None:
         """Adds a second level of n experts in host memory (pinned, an expert's bytes each): an expert that leaves
-        its slot is copied there by the device, and while it is among the last n to have left, request() takes it
-        from there instead of reading it from the SSD. The host never touches these buffers: the device fills and
-        reads them in the order the copies were queued, so nothing has to be waited for."""
+        its slot is copied there by the device, and while it is among the n the level holds, request() takes it
+        from there instead of reading it from the SSD. It stays in the level when it is copied back to a slot (as
+        the newest), so only an expert that came from the SSD is copied when it leaves. The host never touches these
+        buffers: the device fills and reads them in the order the copies were queued, so nothing has to be waited
+        for."""
         row = self.store.size(1)
         while n > 0:  # torch rounds a pinned allocation up to a power of two: blocks that fill one, of at most 1 GiB
             size = 1 << 30
@@ -188,9 +190,9 @@ class ExpertCache:
                 buf = self.ram_cache.pop(key)
                 if kept:
                     self._give(slot, key)
-                    self.ram_free.append(buf)  # whatever goes into it next is queued after the copy below
-                else:
-                    self.ram_cache[key] = buf  # computed from a scratch slot: it stays, as the newest
+                # it stays, as the newest: when it leaves its slot again, nothing has to be copied (a copy back to
+                # the host shares the memory's bandwidth with the CPU tier)
+                self.ram_cache[key] = buf
                 self.store[slot].copy_(buf, non_blocking=True)
                 # listed with the experts being read (no ticket: finish() has nothing to do for it), so that the
                 # token adds its experts in the order it would without the RAM level, and its result is the same
