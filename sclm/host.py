@@ -289,8 +289,7 @@ class Host:
         if hashes is not None:
             for layer in net.layers:  # the rows are read while the layers before run
                 if layer.engram is not None:
-                    layer.engram.embed.start(hashes[:, :, layer.engram.layer_hash_index, :])
-            hashes = hashes.to(self.device)
+                    layer.engram.embed.start(hashes[:, :, layer.engram.layer_hash_index, :], self.device)
         h = net.embed(input_ids).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1)
         if self.first_mix is None:
             self.first_mix = m.make_identity_pre_mix(h, net.hc_mult)
