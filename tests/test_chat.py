@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from scripts.chat import ContextFull, Session, pick
+from scripts.chat import ContextFull, Session, looping, pick
 
 SPECIAL = {"<bos>": 0, "<eos>": 1, "<think>": 2, "</think>": 3, "<user>": 4, "<assistant>": 5, "<system>": 6}
 NAMES = {i: s for s, i in SPECIAL.items()}
@@ -128,3 +128,28 @@ def test_pick_takes_the_likeliest_token_or_samples_within_top_p():
     assert pick(logits, 0.0, 1.0) == 1
     assert {pick(logits, 1.0, 0.1) for _ in range(20)} == {1}  # top_p below the first probability keeps only it
     assert {pick(logits, 1.0, 0.9) for _ in range(200)} == {1, 2}
+
+
+def test_recent_tokens_are_made_less_likely_by_the_penalty():
+    logits = torch.tensor([[0.0, 3.0, 2.9, -1.0]])
+    assert pick(logits, 0.0, 1.0, [1], 1.1) == 2  # 3.0 / 1.1 is below 2.9
+    assert pick(logits, 0.0, 1.0, [1], 1.0) == 1 and pick(logits, 0.0, 1.0, [], 1.1) == 1
+    assert pick(logits, 0.0, 1.0, [1, 2, 3], 1.1) == 1  # all three: the order of the positive ones stays
+    assert pick(torch.tensor([[-1.0, -1.05, -5.0]]), 0.0, 1.0, [0], 1.1) == 1  # a negative logit is multiplied
+    assert logits[0, 1] == 3.0  # the caller's logits are left as they were
+
+
+def test_a_loop_is_recognized_and_ends_the_reply():
+    piece = text_ids("Rust has x? ")
+    assert looping(text_ids("so: ") + piece * 8) and looping([7] * 96) and looping([7, 8] * 48)
+    assert not looping(text_ids("so: ") + piece * 7)  # 84 tokens of it: not yet
+    assert not looping(list(range(40)) * 5)  # a piece longer than 32 tokens is not taken for a loop
+    assert not looping([7] * 95 + [8]) and not looping([])
+
+    dec = Decoder([3] + piece * 50 + [1])
+    session = Session(Tok(), dec, 2000)
+    pieces, stats = run(session, "x", max_new=1000)
+    assert stats["looped"] and stats["tokens"] == 1 + 8 * len(piece)  # the end of thinking, then eight times the piece
+    dec.script, dec.said = text_ids("ok") + [1], 0
+    pieces, stats = run(session, "y")
+    assert not stats["looped"] and "".join(t for _, t in pieces) == "ok"

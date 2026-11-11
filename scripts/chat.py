@@ -1,7 +1,9 @@
 # An ollama-style terminal chat with the tiered model: the conversation lives in the decoder's state, a reply is
 # streamed token by token, and slash commands change the settings.
 import argparse
+import contextlib
 import ctypes
+import io
 import os
 import signal
 import time
@@ -16,12 +18,14 @@ HELP = """[bold]명령[/]
   /?, /help              이 도움말
   /bye, /exit            끝내기 (Ctrl+D도 같음)
   /clear                 대화를 지우고 새 문맥에서 시작
-  /show                  지금 설정과 문맥 사용량
+  /show, /set            지금 설정과 문맥 사용량
   /set system <글>       시스템 프롬프트 (새 문맥부터 적용)
   /set think, /set nothink   생각 과정을 쓸지 (다음 답부터)
   /set effort <low|medium|high|max>   생각의 깊이 (새 문맥부터 적용)
-  /set temperature <수>  0이면 가장 확률 높은 토큰만 (기본 0)
+  /set showthink, /set hidethink   생각 과정을 펼쳐 보일지, 한 줄로 접을지 (기본: 접음)
+  /set temperature <수>  0이면 가장 확률 높은 토큰만 (같은 말을 반복하기 쉬움). 기본 0.7, 모델 공식값은 1.0
   /set top_p <수>        temperature가 0보다 클 때 쓰는 누적 확률 (기본 0.95)
+  /set repeat_penalty <수>   최근 64토큰에 나온 토큰을 덜 고르게 하는 정도. 1이면 끔 (기본 1.1)
   /set num_predict <수>  답 하나의 최대 토큰 수 (기본 2048)
   /set wait-share <수>   속도 옵션: 0이면 정확, 0.25면 가벼운 SSD expert를 기다리지 않음 (기본 0.25)
   /set topk <수>         속도 옵션: 토큰마다 계산할 expert 수. 0이면 여섯 개 모두, 5면 조금 더 빠르고 4부터는 품질이 눈에 띄게 떨어짐
@@ -34,9 +38,14 @@ class ContextFull(Exception):
     """The turn does not fit in what is left of the sequence."""
 
 
-def pick(logits: torch.Tensor, temperature: float, top_p: float) -> int:
+def pick(logits: torch.Tensor, temperature: float, top_p: float, recent=(), penalty: float = 1.0) -> int:
     """The next token from logits [1, vocab]: the most likely one at temperature 0, else a sample from the smallest
-    set of most likely tokens whose probability reaches top_p."""
+    set of most likely tokens whose probability reaches top_p. penalty > 1 makes the tokens in `recent` less likely
+    first: their logit is divided by it, or multiplied when negative."""
+    if penalty != 1.0 and recent:
+        logits, seen = logits.float().clone(), torch.tensor(sorted(set(recent)), device=logits.device)
+        at = logits[0, seen]
+        logits[0, seen] = torch.where(at > 0, at / penalty, at * penalty)
     if temperature <= 0:
         return int(logits.argmax(-1))
     probs = torch.softmax(logits[0].float() / temperature, dim=-1)
@@ -44,6 +53,19 @@ def pick(logits: torch.Tensor, temperature: float, top_p: float) -> int:
     kept = probs[order]
     kept[kept.cumsum(0) - kept >= top_p] = 0
     return int(order[torch.multinomial(kept, 1)])
+
+
+def looping(tokens: list, repeats: int = 6, span: int = 96) -> bool:
+    """Whether a reply has run into a loop: its last `span` tokens or more are one piece of at most 32 tokens, said
+    at least `repeats` times in a row. (A model that takes the likeliest token every time does not leave such a loop.)"""
+    for period in range(1, 33):
+        need = max(span, period * repeats)
+        if len(tokens) >= need and tokens[-1] == tokens[-1 - period] and tokens[-need + period:] == tokens[-need:-period]:
+            return True
+    return False
+
+
+REPEAT_LAST = 64  # tokens of the reply so far that the repetition penalty looks at
 
 
 class Session:
@@ -77,10 +99,11 @@ class Session:
         self.logits = self.decoder.logits(torch.tensor([[token]]), self.pos)
         self.pos += 1
 
-    def ask(self, message: str, max_new: int, temperature: float, top_p: float, on_text, stop=lambda: False) -> dict:
+    def ask(self, message: str, max_new: int, temperature: float, top_p: float, on_text, stop=lambda: False,
+            repeat_penalty: float = 1.0) -> dict:
         """Feeds the user's message and generates the reply, handing each piece of text to on_text(kind, text) with
         kind "think" or "answer" (an empty text marks the change from one to the other). stop() is asked between
-        tokens. Returns the counts and times of the turn."""
+        tokens, and a reply that runs into a loop (looping) ends there. Returns the counts and times of the turn."""
         ids = self.turn_ids(message)
         if self.pos + len(ids) + 1 >= self.max_seq_len:
             raise ContextFull
@@ -88,13 +111,17 @@ class Session:
         for token in ids:
             self._feed(token)
         t1 = time.perf_counter()
-        kind, new, part, sent = "think" if ids[-1] == self.think_start else "answer", 0, [], ""
+        kind, new, part, sent, said, looped = "think" if ids[-1] == self.think_start else "answer", 0, [], "", [], False
         while new < max_new and self.pos < self.max_seq_len and not stop():
-            token = pick(self.logits, temperature, top_p)
+            token = pick(self.logits, temperature, top_p, said[-REPEAT_LAST:], repeat_penalty)
             if token == self.eos:  # not fed: the next turn starts with it
                 break
             self._feed(token)
             new += 1
+            said.append(token)
+            if looping(said):
+                looped = True
+                break
             if token == self.think_end and kind == "think":
                 kind, part, sent = "answer", [], ""
                 on_text(kind, "")
@@ -104,7 +131,8 @@ class Session:
             if not text.endswith("\ufffd"):  # else a character is still missing bytes
                 on_text(kind, text[len(sent):])
                 sent = text
-        return {"prompt_tokens": len(ids), "prompt_s": t1 - t0, "tokens": new, "seconds": time.perf_counter() - t1}
+        return {"prompt_tokens": len(ids), "prompt_s": t1 - t0, "tokens": new, "seconds": time.perf_counter() - t1,
+                "looped": looped}
 
 
 def read_message(prompt: str) -> str:
@@ -119,9 +147,18 @@ def read_message(prompt: str) -> str:
     return "\n".join(lines)
 
 
+def settings(session: Session, cache, opts: dict) -> str:
+    """The settings in one line, as /show and the first screen print them."""
+    return (f"생각 {'켬' if session.think else '끔'}({'펼침' if opts['showthink'] else '접음'}) · effort {session.effort} · "
+            f"temperature {opts['temperature']:g} · top_p {opts['top_p']:g} · repeat_penalty {opts['repeat_penalty']:g} · "
+            f"num_predict {opts['num_predict']} · wait-share {cache.wait_share:g} · topk {cache.topk}")
+
+
 def command(line: str, session: Session, cache, opts: dict, console: Console) -> bool:
     """Runs a slash command; False ends the chat."""
     name, _, rest = line.strip().partition(" ")
+    if name == "/set" and not rest.strip():
+        name = "/show"
     if name in ("/bye", "/exit"):
         return False
     if name in ("/?", "/help"):
@@ -130,10 +167,8 @@ def command(line: str, session: Session, cache, opts: dict, console: Console) ->
         session.clear()
         console.print("[grey62]대화를 지웠습니다.[/]")
     elif name == "/show":
-        console.print(f"[grey62]문맥 {session.pos} / {session.max_seq_len} 토큰 · 생각 {'켬' if session.think else '끔'} · "
-                      f"effort {session.effort} · temperature {opts['temperature']:g} · top_p {opts['top_p']:g} · "
-                      f"num_predict {opts['num_predict']} · wait-share {cache.wait_share:g} · topk {cache.topk}\n"
-                      f"시스템 프롬프트: {session.system or '(없음)'}[/]")
+        console.print(f"[grey62]문맥 {session.pos} / {session.max_seq_len} 토큰 · {settings(session, cache, opts)}\n"
+                      f"시스템 프롬프트: {session.system or '(없음)'}[/]", highlight=False)
     elif name == "/set":
         key, _, value = rest.strip().partition(" ")
         value = value.strip()
@@ -147,7 +182,9 @@ def command(line: str, session: Session, cache, opts: dict, console: Console) ->
                 session.effort = value
                 if session.pos:
                     console.print("[grey62]/clear 뒤부터 적용됩니다.[/]")
-            elif key in ("temperature", "top_p"):
+            elif key in ("showthink", "hidethink"):
+                opts["showthink"] = key == "showthink"
+            elif key in ("temperature", "top_p", "repeat_penalty"):
                 opts[key] = float(value)
             elif key == "num_predict":
                 opts[key] = int(value)
@@ -182,15 +219,24 @@ def echo_typing(on: bool) -> None:
 
 
 def reply(line: str, session: Session, opts: dict, console: Console) -> None:
-    """Streams the reply to one message, the thinking in grey, then a line with the speed."""
-    shown, stopped = [None], [False]
+    """Streams the reply to one message, then a line with the speed. The thinking is streamed in grey, or folded
+    into one line that counts its tokens (opts["showthink"])."""
+    shown, stopped, thought = [None], [False], [0, time.perf_counter()]  # pieces of thinking so far, and since when
 
     def on_text(kind: str, text: str) -> None:
+        if kind == "think" and not opts["showthink"]:
+            shown[0], thought[0] = kind, thought[0] + 1
+            if thought[0] % 8 == 1:  # rewritten in place
+                console.print(f"생각 중… {thought[0]} 토큰", end="\r", style="grey50", highlight=False)
+            return
         if kind != shown[0]:
             if kind == "think":
                 console.print("생각 중…", style="grey50")
-            elif shown[0] == "think":
+            elif shown[0] == "think" and opts["showthink"]:
                 console.print("\n…생각 끝\n", style="grey50")
+            elif shown[0] == "think":
+                console.print(f"생각 끝 · {thought[0]} 토큰 · {time.perf_counter() - thought[1]:.0f}초      \n", style="grey50",
+                              highlight=False)
             shown[0] = kind
         console.print(text, end="", style="grey50" if kind == "think" else None, markup=False, highlight=False, soft_wrap=True)
 
@@ -198,7 +244,8 @@ def reply(line: str, session: Session, opts: dict, console: Console) -> None:
     before = signal.signal(signal.SIGINT, lambda *_: stopped.__setitem__(0, True))
     echo_typing(False)
     try:
-        stats = session.ask(line, opts["num_predict"], opts["temperature"], opts["top_p"], on_text, lambda: stopped[0])
+        stats = session.ask(line, opts["num_predict"], opts["temperature"], opts["top_p"], on_text, lambda: stopped[0],
+                            opts["repeat_penalty"])
     except ContextFull:
         console.print("[yellow]문맥이 가득 찼습니다. /clear 로 새로 시작하세요.[/]")
         return
@@ -206,6 +253,9 @@ def reply(line: str, session: Session, opts: dict, console: Console) -> None:
         echo_typing(True)
         signal.signal(signal.SIGINT, before)
     console.print("\n")
+    if stats["looped"]:
+        console.print("[yellow]같은 구절이 되풀이되어 멈췄습니다. 되풀이된 글이 문맥에 남아 있으니 /clear 로 새로 시작하는 편이 "
+                      "좋고, 자주 그러면 /set temperature 나 /set repeat_penalty 를 올려 보세요.[/]\n")
     if opts["verbose"]:
         note = " · 멈춤" if stopped[0] else " · 문맥 가득 참" if session.pos >= session.max_seq_len else ""
         console.print(f"[grey50]{stats['tokens']} 토큰 · {stats['tokens'] / max(stats['seconds'], 1e-9):.1f} tok/s · 입력 "
@@ -239,10 +289,19 @@ def main() -> None:
         cli.ram_cache = max(0, min(1200, int((total - used - codes - 3.0) * GIB / 18.8e6)))
     console = Console()
     console.print("[grey62]모델을 올리는 중입니다 (약 20초)…[/]")
-    tok, cache, decoder, info = load_runtime(cli, background=28)  # enough for read-ahead and for wait-share later
-    session, opts = Session(tok, decoder, cli.max_seq_len), {"temperature": 0.0, "top_p": 0.95, "num_predict": 2048, "verbose": True}
+    import transformers
+
+    transformers.logging.set_verbosity_error()  # the tokenizer's note about a model type it does not know
+    with contextlib.redirect_stdout(io.StringIO()):  # the loader's own progress lines
+        tok, cache, decoder, info = load_runtime(cli, background=28)  # enough for read-ahead and for wait-share later
+    # The model's card samples at temperature 1.0 and top_p 0.95. Taking the likeliest token every time (0, the
+    # default until now, for runs that can be compared) let a reply fall into a loop it never left; 0.7 is a guess
+    # between the two for a model whose distributions the coded experts have flattened a little.
+    opts = {"temperature": 0.7, "top_p": 0.95, "repeat_penalty": 1.1, "num_predict": 2048, "verbose": True, "showthink": False}
+    session = Session(tok, decoder, cli.max_seq_len)
     console.print(f"\n[bold]sclm chat[/] · {os.path.basename(cli.ckpt)} · VRAM {info['allocated_gib']:.1f}GiB, RAM 부호 "
-                  f"{info['codes_gib']:.1f}GiB, RAM 캐시 {cli.ram_cache}개 · [grey62]/? 도움말, /bye 끝내기[/]\n")
+                  f"{info['codes_gib']:.1f}GiB, RAM 캐시 {cli.ram_cache}개\n[grey62]{settings(session, cache, opts)}\n"
+                  f"/? 도움말 · /set 설정 보기 · /bye 끝내기[/]\n", highlight=False)
     while True:
         try:
             line = read_message(">>> ")
