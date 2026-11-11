@@ -4,7 +4,7 @@
 import os
 import sys
 
-from . import MODEL
+from . import ACT_BLOCK, MODEL
 
 _HERE = os.path.dirname(__file__)
 _REF = os.path.join(_HERE, "reference")
@@ -21,3 +21,4 @@ if MODEL == "v41":
     import engram  # noqa: E402
 
 CONFIG_PATH = os.path.join(_REF, "config.json")
+assert ACT_BLOCK == (model.block_size if MODEL == "v4" else model.fp8_block_size)

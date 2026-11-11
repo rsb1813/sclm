@@ -6,9 +6,9 @@ from collections import OrderedDict
 
 import numpy as np
 
-from sclm import DATA
+from sclm import DATA, DIM, INTER, N_EXPERTS, N_LAYERS
 
-N_LAYERS, EXPERT_PARAMS = 40, 3 * 2304 * 5120
+EXPERT_PARAMS = 3 * INTER * DIM
 SSD_BYTES_S = 7.4e9  # sequential read, design.md 1
 ORIG_BYTES = EXPERT_PARAMS * 4.25 / 8  # FP4 + e8m0 scale per 32, read straight from the original checkpoint
 # RAM option -> (bpw incl. the fp16 step per group, its layer-10 probe in data/gptq_L10.json: GPTQ without unbiasing,
@@ -104,10 +104,12 @@ def main() -> None:
                     "bpw); 0 leaves them free. Raise it until the plan's reads fit the CPU time wanted")
     ap.add_argument("--fallback", help="RAM option an SSD expert also keeps, used when it is not in the cache (the "
                     "speed mode: nothing waits for the SSD); such experts are named f<option> in the plan")
+    ap.add_argument("--probe", default=os.path.join(DATA, "gptq_L10.json"), help="the options' measured distortions "
+                    "(scripts/gptq_probe.py); V4.1's layer-10 file by default, also usable for another model as a prior")
     ap.add_argument("--name", required=True)
     cli = ap.parse_args()
     names = cli.options.split(",")
-    probe = json.load(open(os.path.join(DATA, "gptq_L10.json")))
+    probe = json.load(open(cli.probe))
     d = np.array([probe[RAM_OPTIONS[o][1]]["nrd_rel"] ** 2 for o in names])  # nrd_rel is an RMS ratio
     c = np.array([RAM_OPTIONS[o][0] for o in names])
     ssd_reads = SSD_BYTES_S / (cli.tok_s * N_LAYERS * ORIG_BYTES)  # SSD expert reads per layer per token
@@ -117,13 +119,14 @@ def main() -> None:
     calib = seq % 6 != 3  # quant_eval's eval sequences are tokens[3::6][:8]
     idx_all = r["indices"].astype(np.int64)
     idx, g = idx_all[calib], r["weights"][calib].astype(np.float64)
-    n_tok, n_exp = idx.shape[0], 384
+    n_tok, n_exp = idx.shape[0], N_EXPERTS
     w, f = np.zeros((idx.shape[1], n_exp)), np.zeros((idx.shape[1], n_exp))
     for layer in range(idx.shape[1]):
         np.add.at(w[layer], idx[:, layer].ravel(), (g[:, layer] ** 2).ravel() / n_tok)
         np.add.at(f[layer], idx[:, layer].ravel(), 1.0 / n_tok)
-    sens = layer_sensitivity(idx.shape[1])
+    sens = np.ones(idx.shape[1])  # without the per-layer measurements every layer counts the same
     if cli.layer_weights:
+        sens = layer_sensitivity(idx.shape[1])
         w *= sens[:, None]
 
     ssd_name = "f" + cli.fallback[1:] if cli.fallback else "orig"
@@ -192,7 +195,7 @@ def main() -> None:
     for split, v in sim.items():
         print(f"  {split} replay: {v['calls_per_token']:.2f} SSD calls/token, {v['reads_per_token']:.2f} reads/token, "
               f"SSD-bound {v['ssd_bound_tok_s']:.1f} tok/s")
-    for layer in (0, 20, 39):
+    for layer in (0, N_LAYERS // 2, N_LAYERS - 1):
         print(f"  layer {layer}: {report[layer]}")
 
 

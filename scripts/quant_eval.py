@@ -16,7 +16,7 @@ from sclm import quant
 from sclm.checkpoint import Checkpoint
 from sclm.codes import load_layer, save_layer
 from sclm.layerwise import LayerwiseRunner, load_args, load_params_
-from sclm.upstream import model as m
+from sclm.upstream import ACT_BLOCK, model as m
 
 import kernel  # noqa: E402  (on sys.path via sclm.upstream)
 
@@ -60,7 +60,7 @@ class DenseFP4Linear(torch.nn.Module):
         self.weight, self.scale = lin.weight, lin.scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), ACT_BLOCK, "ue8m0", torch.float8_e8m0fnu, inplace=True)
         w = (kernel.unpack_fp4(self.weight).unflatten(-1, (-1, 32)) * self.scale.float().unsqueeze(-1)).flatten(-2)
         return F.linear(xq.float(), w).to(torch.get_default_dtype())
 
@@ -81,7 +81,7 @@ def coded_experts_(layer: int, block, codes_dir: str, tables: bool) -> None:
 
 
 def act_q(x: torch.Tensor) -> torch.Tensor:
-    return kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True).float()
+    return kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), ACT_BLOCK, "ue8m0", torch.float8_e8m0fnu, inplace=True).float()
 
 
 def fp4_dense(lin) -> torch.Tensor:
@@ -180,19 +180,20 @@ class GPTQExperts:
     batch, replaces its routed experts by GPTQ codes: Hadamard basis, per-expert gate^2-weighted X^T X mixed with the
     layer covariance (beta), optional H-metric unbiasing. The calibration stream stays the uncompressed model's.
     `plan(layer)` names each expert's GPTQ_OPTIONS or VQ_OPTIONS entry, or "orig" to keep its FP4 weights.
-    `n_tok`: calibration tokens in all (their FFN inputs of the current layer wait in one CPU buffer).
+    `n_tok`: calibration tokens in all (their FFN inputs of the current layer wait in one CPU buffer). `dim`,
+    `inter`: the experts' sizes.
     The calibration batches skip the routed experts (unpacking all 384 for every batch was two thirds of a layer's
     forward time): quantize_ adds each expert's output over all of its tokens at once, and finish_ completes the
     batches' block outputs. `save_dir`: each layer's codes are written there (sclm/codes.py, vector options only)."""
 
-    def __init__(self, plan, n_cal: int, n_tok: int, unbias: bool, beta: float = 0.5, batch: int = 8,
+    def __init__(self, plan, n_cal: int, n_tok: int, unbias: bool, dim: int, inter: int, beta: float = 0.5, batch: int = 8,
                  save_dir: str | None = None):
         self.plan, self.n_cal, self.unbias, self.beta, self.batch = plan, n_cal, unbias, beta, batch
-        self.save_dir = save_dir
+        self.save_dir, self.dim, self.inter = save_dir, dim, inter
         self.block, self.cur, self.t0 = None, 0, time.time()
-        self.xq = torch.empty(n_tok, 5120, dtype=torch.bfloat16, device="cpu")
-        self.y = torch.empty(n_tok, 5120, dtype=torch.float32, device="cpu")  # the layer's FFN outputs
-        self.rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (5120, 2304)}  # quant_eval's usual seeds
+        self.xq = torch.empty(n_tok, dim, dtype=torch.bfloat16, device="cpu")
+        self.y = torch.empty(n_tok, dim, dtype=torch.float32, device="cpu")  # the layer's FFN outputs
+        self.rots = {k: quant.BlockHadamard(k, seed=17 + k) for k in (dim, inter)}  # quant_eval's usual seeds
 
     def before_block(self, i: int, block) -> None:
         self.layer, self.block = i, weakref.ref(block)  # weak: the runner frees each block itself
@@ -204,7 +205,9 @@ class GPTQExperts:
             if self.cur >= self.n_cal:
                 return ffn_forward(x, image_mask)
             n, xf = self.n, x.view(-1, ffn.dim)
-            ffn.gate(xf, None)  # on_gate keeps the inputs and the routing
+            # on_gate keeps the inputs and the routing. The second argument is V4.1's image mask (None for text) or
+            # V4-Flash-0731's token ids, by which its first layers pick the experts
+            ffn.gate(xf, None if image_mask is None else image_mask.flatten())
             self.y[n : self.n] = ffn.shared_experts(xf).float()
             pending.append(True)
             return x
@@ -222,7 +225,7 @@ class GPTQExperts:
 
     def on_gate(self, _mod, inp, out) -> None:
         if self.cur < self.n_cal:
-            x = act_q(inp[0].detach().reshape(-1, 5120))
+            x = act_q(inp[0].detach().reshape(-1, self.dim))
             self.h_layer = self.h_layer + x.t() @ x
             # fp8 values with power-of-two scales: exact in bf16. They wait on the CPU: 100K+ calibration tokens
             # would crowd the Hessians out of VRAM
@@ -325,7 +328,7 @@ class GPTQExperts:
                 return ([[quant.RTNLinear.from_codes(c, s, bits, group, rot, levels) for c, s in zip(cp, sp)]
                          for cp, sp in zip(codes.chunk(parts, 1), steps.chunk(parts, 1))], wq)
 
-        eye = torch.eye(2304, device=DEV, dtype=torch.float32)
+        eye = torch.eye(self.inter, device=DEV, dtype=torch.float32)
         for e0 in range(0, len(members), self.batch):
             es = members[e0 : e0 + self.batch]
             toks = [torch.where(idx == e) for e in es]
@@ -342,11 +345,11 @@ class GPTQExperts:
                     self.add_outputs_(w1[k], w2[k], w3[k], xr, gwc, rc[c : c + TOKEN_CHUNK])
                 h_e = tr_norm(h_e) if rows.numel() else h_layer
                 h1.append((1 - self.beta) * h_e + self.beta * h_layer)
-            h1 = rotate_h(torch.stack(h1), self.rots[5120])
+            h1 = rotate_h(torch.stack(h1), self.rots[self.dim])
             # w1 and w3 see the same inputs: one GPTQ pass over both (rows are independent given the Hessian)
             w13 = torch.cat([w1, w3], dim=1)
             del w1, w3
-            (l1, l3), q13 = gptq(w13, h1, self.rots[5120], parts=2)
+            (l1, l3), q13 = gptq(w13, h1, self.rots[self.dim], parts=2)
             q1, q3 = q13.chunk(2, 1)
             del h1, w13, q13
             h2 = []
@@ -361,7 +364,7 @@ class GPTQExperts:
                     hid = act_q(F.silu(g.clamp(max=SWIGLU_LIMIT)) * u * gw[rows[c : c + TOKEN_CHUNK], slot[c : c + TOKEN_CHUNK], None])
                     h_e = h_e + hid.t() @ hid
                 h2.append((1 - self.beta) * tr_norm(h_e) + self.beta * eye)
-            (l2,), _ = gptq(w2, rotate_h(torch.stack(h2), self.rots[2304]), self.rots[2304])
+            (l2,), _ = gptq(w2, rotate_h(torch.stack(h2), self.rots[self.inter]), self.rots[self.inter])
             del h2, w2, q1, q3
             for k, e in enumerate(es):
                 experts[e].w1, experts[e].w2, experts[e].w3 = l1[k], l2[k], l3[k]
@@ -579,7 +582,8 @@ def main() -> None:
         if cli.save_codes:
             os.makedirs(cli.save_codes, exist_ok=True)
             shutil.copy(os.path.join(DATA, f"alloc_{cfg[1]}.json"), os.path.join(cli.save_codes, "alloc.json"))
-        gq = GPTQExperts(plan, n_cal, sum(b.numel() for b in cal), cfg[2], save_dir=cli.save_codes)
+        gq = GPTQExperts(plan, n_cal, sum(b.numel() for b in cal), cfg[2], runner.args.dim, runner.args.moe_inter_dim,
+                         save_dir=cli.save_codes)
         before_block, before_batch = gq.before_block, gq.before_batch
     ckpt = None
     if cli.checkpoint_every:

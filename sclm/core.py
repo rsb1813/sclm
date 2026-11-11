@@ -7,6 +7,8 @@ import struct
 
 import numpy as np
 
+from . import ACT_BLOCK
+
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclm_core.dll")
 
 
@@ -31,6 +33,8 @@ def _dll():
     lib.sclm_touch_bytes.argtypes = [C.c_void_p]
     lib.sclm_touch_threads.argtypes = [C.c_int]
     lib.sclm_set_threads.argtypes = [C.c_int]
+    lib.sclm_set_act_block.argtypes = [C.c_int]
+    lib.sclm_set_act_block(ACT_BLOCK)
     lib.sclm_reader_new.restype = C.c_void_p
     lib.sclm_reader_new.argtypes = [C.POINTER(C.c_wchar_p), C.c_int, C.c_int]
     lib.sclm_reader_free.argtypes = [C.c_void_p]

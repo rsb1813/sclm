@@ -296,10 +296,10 @@ class RTNLinear(torch.nn.Module):
         return rtn_dequant(codes, self.step, self.bits, self.group, self.levels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from . import upstream  # noqa: F401  (puts kernel on sys.path)
+        from . import upstream  # puts kernel on sys.path
         import kernel
 
-        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), upstream.ACT_BLOCK, "ue8m0", torch.float8_e8m0fnu, inplace=True)
         xq = xq.float()
         if self.rot is not None:
             xq = self.rot.rotate(xq.reshape(-1, xq.size(-1))).reshape(xq.shape)
@@ -329,10 +329,10 @@ class VQLinear(RTNLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.tables:
             return super().forward(x)
-        from . import upstream  # noqa: F401  (puts kernel on sys.path)
+        from . import upstream  # puts kernel on sys.path
         import kernel
 
-        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+        xq = kernel.act_quant(x.to(torch.bfloat16).contiguous().clone(), upstream.ACT_BLOCK, "ue8m0", torch.float8_e8m0fnu, inplace=True)
         xr = self.rot.rotate(xq.float().reshape(-1, xq.size(-1)))
         cb, g = self.codebook.float(), self.codes.size(1)
         # per token, table[step][code] = <codebook[code], the step's inputs> as int8 on one scale; a row's product is

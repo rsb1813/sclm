@@ -167,16 +167,20 @@ void touch_end() {
 std::atomic<double> phase_seconds[7];
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-// The reference's activation fake-quant before a quantized GEMM (kernel.act_quant: blocks of 32, power-of-2 scale):
-// a block is scaled so its largest magnitude is at most 448, then rounded to FP8 E4M3.
+// Activations per scale of the reference's fake-quant: 32 in DeepSeek-V4.1-Flash, 128 in DeepSeek-V4-Flash-0731.
+int act_block = 32;
+
+// The reference's activation fake-quant before a quantized GEMM (kernel.act_quant: blocks of act_block, power-of-2
+// scale): a block is scaled so its largest magnitude is at most 448, then rounded to FP8 E4M3.
 void fp8_blocks(float* x, int n) {
     const __m512 zero = _mm512_setzero_ps();
-    for (int b = 0; b < n; b += 32) {
-        const __m512 mx = _mm512_max_ps(_mm512_abs_ps(_mm512_loadu_ps(x + b)), _mm512_abs_ps(_mm512_loadu_ps(x + b + 16)));
+    for (int b = 0; b < n; b += act_block) {
+        __m512 mx = _mm512_abs_ps(_mm512_loadu_ps(x + b));
+        for (int i = b + 16; i < b + act_block; i += 16) mx = _mm512_max_ps(mx, _mm512_abs_ps(_mm512_loadu_ps(x + i)));
         int e;
         const float m = std::frexp(std::max(_mm512_reduce_max_ps(mx), 1e-4f) * float(1.0 / 448.0), &e);
         const __m512 se = _mm512_set1_ps(float(m == 0.5f ? e - 1 : e));  // the scale is 2^ceil(log2(amax / 448))
-        for (int i = b; i < b + 32; i += 16) {
+        for (int i = b; i < b + act_block; i += 16) {
             const __m512 v = _mm512_scalef_ps(_mm512_loadu_ps(x + i), _mm512_sub_ps(zero, se));
             // E4M3 keeps 4 significant bits down to 2^-6 and steps of 2^-9 below that
             const __m512 q = _mm512_sub_ps(_mm512_max_ps(_mm512_getexp_ps(v), _mm512_set1_ps(-6.0f)), _mm512_set1_ps(3.0f));
@@ -384,6 +388,9 @@ __declspec(dllexport) void sclm_layer_free(SclmLayer* L) {
 }
 
 // Threads that share a layer call (the caller's included). Not to be called while a call runs.
+// The model's activation block (a multiple of 16 that divides the experts' widths), before any layer call.
+__declspec(dllexport) void sclm_set_act_block(int block) { act_block = block; }
+
 __declspec(dllexport) void sclm_set_threads(int threads) {
     touch_end();
     delete pool;

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sclm import codes, core, quant, upstream
+from sclm import ACT_BLOCK, codes, core, quant, upstream
 
 import kernel  # noqa: E402  (sclm.upstream puts it on the path)
 
@@ -34,7 +34,7 @@ def make_layer(path, plan=PLAN):
 
 def table_linear(mod, v):
     """VQLinear.forward with the engine's GEMV: per token, <codebook vector, input group> as int8 on one scale."""
-    vq = kernel.act_quant(v.to(torch.bfloat16).contiguous().clone(), 32, "ue8m0", torch.float8_e8m0fnu, inplace=True).float()
+    vq = kernel.act_quant(v.to(torch.bfloat16).contiguous().clone(), ACT_BLOCK, "ue8m0", torch.float8_e8m0fnu, inplace=True).float()
     vr = mod.rot.rotate(vq.reshape(-1, vq.size(-1)))[0]
     t = vr.view(-1, mod.codebook.size(1)) @ mod.codebook.float().t()  # [groups, codes]
     scale = t.abs().max() / 127
