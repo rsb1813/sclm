@@ -128,6 +128,8 @@ class TieredMoE(nn.Module):
         return out
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """image_mask: the block's second argument, which upstream's gate takes flattened: V4.1's image mask (None
+        for text), or the token ids with V4-Flash-0731, whose first layers route by them."""
         shape = x.size()
         if gpu.active and x.numel() == self.dim and self.gate.score_func == "sqrtsoftplus" and image_mask is None:
             return self.decode(x.reshape(-1)).view(shape)

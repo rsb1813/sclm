@@ -4,7 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import kernel
 from sclm import upstream
+from sclm.checkpoint import widen_fp8
 from test_model_small import init_random_
 
 pytestmark = pytest.mark.skipif(upstream.MODEL != "v4", reason="set SCLM_MODEL=v4")
@@ -21,8 +23,9 @@ def build(args):
     init_random_(net, seed=1)
     with torch.no_grad():
         for name, p in net.named_parameters():
-            if name.endswith("tid2eid"):  # the hash layers' experts of each token
-                p.copy_(torch.randint(0, args.n_routed_experts, p.shape, dtype=p.dtype, generator=torch.Generator(device=DEV).manual_seed(5)))
+            if name.endswith("tid2eid"):  # the hash layers' experts of each token, distinct as in the released tables
+                order = torch.rand(p.size(0), args.n_routed_experts, generator=torch.Generator(device=DEV).manual_seed(5), dtype=torch.float32)
+                p.copy_(order.argsort(-1)[:, :p.size(1)].to(p.dtype))
             elif name.endswith("hc_head_scale"):
                 p.fill_(1.0)
             elif name.endswith(("hc_head_base", "ape")):
@@ -30,44 +33,80 @@ def build(args):
     return net
 
 
-def agreement(split: int, n: int = 120, change: int | None = None, **over) -> float:
-    """Cosine of the last logits: all n tokens in one prefill, against `split` tokens prefilled and the rest decoded
-    (with token `change` replaced in the second run)."""
+def exact_linear(x, weight, bias=None):
+    """upstream's linear without the FP8 rounding of its input: the dequantized weight, in fp32."""
+    if weight.dtype == torch.float4_e2m1fn_x2:
+        w = (kernel.unpack_fp4(weight).unflatten(-1, (-1, 32)) * weight.scale.float().unsqueeze(-1)).flatten(-2)
+    elif weight.dtype == torch.float8_e4m3fn:
+        w = widen_fp8(weight, weight.scale).float()
+    else:
+        w = weight.float()
+    return F.linear(x.float(), w).to(torch.get_default_dtype())
+
+
+def rotate_any(x):
+    from fast_hadamard_transform import hadamard_transform
+    return hadamard_transform(x, scale=x.size(-1) ** -0.5)
+
+
+def agreement(split: int, n: int = 120, change: int | None = None, exact: bool = False, **over) -> tuple[float, float]:
+    """The last logits of all n tokens in one prefill against `split` tokens prefilled and the rest decoded (with
+    token `change` replaced in the second run): their cosine, and the largest difference over the largest logit.
+    exact: in fp32 with no rounding of activations, where the two paths differ only if their logic does."""
     args = m.ModelArgs(**{**SMALL, **over})
     for cached in (m.get_window_topk_idxs, m.get_compress_topk_idxs, m.precompute_freqs_cis):
         cached.cache_clear()
-    prev = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
+    prev, patched = torch.get_default_dtype(), (m.linear, m.act_quant, m.fp4_act_quant, m.rotate_activation)
+    torch.set_default_dtype(torch.float32 if exact else torch.bfloat16)
+    if exact:
+        m.linear, m.rotate_activation = exact_linear, rotate_any
+        m.act_quant = m.fp4_act_quant = lambda x, *a, **k: x  # upstream's own calls are the in-place ones
+
+    def make():
+        net = build(args)
+        if exact:  # the parameters upstream fixes to bf16 (wo_a, the index's weights_proj)
+            for p in net.parameters():
+                if p.dtype == torch.bfloat16:
+                    p.data = p.data.float()
+        return net
+
     try:
-        with torch.device(DEV):
+        with torch.device(DEV), torch.no_grad():
             x = torch.randint(0, args.vocab_size, (1, n), generator=torch.Generator(device=DEV).manual_seed(3))
-            full = build(args)(x)[1].float()
+            full = make()(x)[1].float()
             if change is not None:
                 x = x.clone()
                 x[0, change] = (x[0, change] + 17) % args.vocab_size
-            net = build(args)
+            net = make()
             net(x[:, :split])
             for i in range(split, n):
                 step = net(x[:, i:i + 1], i)[1].float()
-        return float(F.cosine_similarity(full.flatten(), step.flatten(), dim=0))
+        return float(F.cosine_similarity(full.flatten(), step.flatten(), dim=0)), float((full - step).abs().max() / full.abs().max())
     finally:
         torch.set_default_dtype(prev)
+        m.linear, m.act_quant, m.fp4_act_quant, m.rotate_activation = patched
 
 
-def test_decode_continues_a_prefill_within_the_window():
-    assert agreement(70, compress_ratios=(0, 0, 0, 0, 0, 0)) > 0.999
-    assert agreement(7, n=14, compress_ratios=(0, 0, 0, 0, 0, 0)) > 0.999
-    assert agreement(119) > 0.9999  # one decode step
-    assert agreement(70, change=117) < 0.95  # a changed token in the window shows
+CASES = [dict(compress_ratios=(0,) * 6), dict(compress_ratios=(0, 0, 4, 4, 4, 0), index_topk=64), dict(compress_ratios=(0, 0, 4, 4, 4, 0)),
+         dict(compress_ratios=(0, 0, 16, 16, 16, 0)), {}]
 
 
-@pytest.mark.parametrize("split", [1, 16, 34, 48, 70, 96])
-def test_decode_continues_a_prefill_with_compressed_attention(split):
-    # The compressed entries are rounded to FP8 (ratio 4 and 16) and chosen by an index over FP4 keys; one entry
-    # rounded the other way moves this random model's logits to 0.98-0.998, the same value for every split that
-    # leaves the entry to the same path. A wrong position or group would depend on the split's alignment and cost more.
-    assert agreement(split) > 0.975
-    # Ratio 4 alone: 0.998 when decoding starts at 32 or later, 0.975 when it starts within the first 16 tokens. The
-    # attended positions are the same sets in both paths; the first value that differs has not been traced yet
-    # (checklist: to be closed with the layer-by-layer comparison against the transformers implementation).
-    assert agreement(split, compress_ratios=(0, 0, 4, 4, 4, 0), index_topk=64) > (0.995 if split >= 32 else 0.97)
+@pytest.mark.parametrize("split", [1, 16, 34, 70])
+def test_decode_continues_a_prefill_exactly_without_rounding(split):
+    # window alone; ratio 4 with the index keeping every entry and keeping 8; ratio 16; all of them (SMALL)
+    for over in CASES:
+        cosine, diff = agreement(split, exact=True, **over)
+        assert cosine > 0.999999 and diff < 1e-3, (over, cosine, diff)
+
+
+def test_a_changed_token_shows_in_the_exact_comparison():
+    for change in (5, 60, 117):  # beyond the window (compressed), and inside it
+        assert agreement(34, exact=True, change=change)[0] < 0.999
+
+
+@pytest.mark.parametrize("split", [1, 34, 70])
+def test_decode_continues_a_prefill_as_upstream_computes(split):
+    # In bf16 with activations rounded to FP8/FP4 the two paths sum in different orders, and a value rounded the other
+    # way is magnified by this random model: 0.99-0.9999 here, against exact agreement without the rounding (above).
+    for over in CASES:
+        assert agreement(split, **over)[0] > 0.97, over

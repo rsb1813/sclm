@@ -8,16 +8,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from types import SimpleNamespace
+
 from sclm import core, gpu, ssd
 from sclm.checkpoint import Checkpoint, widen_fp8
-from sclm.layerwise import load_params_
+from sclm.layerwise import V4, load_params_
 from sclm.tiered import TieredMoE
 from sclm.upstream import model as m
 
 import kernel  # noqa: E402  (sclm.upstream puts it on the path)
 
-# config overrides of the text-only decode model: no draft (MTP) blocks, no vision tower
-TEXT_ONLY = {"dspark_block_size": 0, "dspark_target_layer_ids": (), "vision_n_layers": 0}
+# config overrides of the text-only decode model: no draft (MTP) blocks, no vision tower (V4.1 has one)
+TEXT_ONLY = {"dspark_block_size": 0, "dspark_target_layer_ids": ()} | ({} if V4 else {"vision_n_layers": 0})
 
 
 class HostEmbedding(nn.Module):
@@ -251,7 +253,19 @@ class _Absent(nn.Module):
 def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.Transformer":
     """upstream's Transformer for `args` (with TEXT_ONLY applied) without what is placed afterwards or stays off the
     device: the routed experts (each block's ffn is a TieredMoE), the engram tables, the embedding and the head.
-    Parameters are uninitialized."""
+    Parameters are uninitialized. V4-Flash-0731 is built from upstream's own blocks (the engine's kernels are not
+    ported to it yet): its decode runs upstream's PyTorch code."""
+    if V4:
+        assert not args.dspark_block_size
+        names = ("MoE", "ParallelEmbedding", "ParallelHead")
+        upstream = [getattr(m, n) for n in names]
+        m.MoE, m.ParallelEmbedding, m.ParallelHead = TieredMoE, _Absent, _Absent
+        try:
+            with torch.device(device):
+                return m.Transformer(args)
+        finally:
+            for n, cls in zip(names, upstream):
+                setattr(m, n, cls)
     assert not args.dspark_block_size and not args.vision_enabled
     names = ("Block", "MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
     upstream = [getattr(m, n) for n in names]
@@ -267,8 +281,19 @@ def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.T
 
 def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda") -> None:
     """Fills build_net's model from the released checkpoint. The engram tables stay in the checkpoint files, the
-    embedding table in RAM, the head in bf16 and attn.wo_a in fp8."""
+    embedding table in RAM, the head in bf16 and attn.wo_a in fp8 (V4-Flash-0731: wo_a in bf16, as upstream's code
+    reads it)."""
     net.embed = HostEmbedding(ckpt.get("embed.weight"))
+    if V4:
+        for i, block in enumerate(net.layers):
+            prefix = f"layers.{i}."
+            load_params_(block, ckpt.module_state(prefix, skip=(".ffn.experts.",)), prefix)
+        with torch.no_grad():
+            for part in ("fn", "base", "scale"):  # the head's hyper-connection
+                getattr(net, "hc_head_" + part).copy_(ckpt.get("hc_head_" + part))
+        load_params_(net.norm, {"weight": ckpt.get("norm.weight")}, "norm.")
+        net.head = Bf16Head(ckpt.get("head.weight").to(device))
+        return
     for i, block in enumerate(net.layers):
         prefix = f"layers.{i}."
         block.attn.wo_a = Fp8Weight(*(ckpt.get(f"{prefix}attn.wo_a.{part}").to(device) for part in ("weight", "scale")))
@@ -281,16 +306,20 @@ def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda
     net.head = Bf16Head(ckpt.get("head.weight").to(device))
 
 
-def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, codes_dir: str, slots: int, lam: float,
+def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, codes_dir: str | None, slots: int, lam: float,
                   device: str = "cuda", background: int = 0) -> ssd.ExpertCache:
     """Gives every block its coded experts (codes_dir/layer_NN.safetensors, held in RAM) and the shared cache of
-    original experts, read from `ckpt` on demand."""
+    original experts, read from `ckpt` on demand. Without codes_dir every routed expert is an original one: the
+    lossless model."""
     cache = ssd.ExpertCache(ssd.ExpertReader(ckpt), args.n_layers, args.n_routed_experts, args.dim, args.moe_inter_dim,
                             args.swiglu_limit, slots, lam, device, scratch=args.n_activated_experts,
                             background=background)
     for i, block in enumerate(net.layers):
-        path = os.path.join(codes_dir, f"layer_{i:02d}.safetensors")
-        block.ffn.ram = core.Layer(path, args.dim, args.moe_inter_dim, args.swiglu_limit)
+        if codes_dir is None:
+            block.ffn.ram = SimpleNamespace(experts={})  # no expert of the layer is coded
+        else:
+            path = os.path.join(codes_dir, f"layer_{i:02d}.safetensors")
+            block.ffn.ram = core.Layer(path, args.dim, args.moe_inter_dim, args.swiglu_limit)
         block.ffn.cache = cache
         if i:  # in a tuple, so that the block before does not register this one's modules as its own
             net.layers[i - 1].ffn.after = (block.ffn, block.ffn_norm.weight, block.ffn_norm.eps)
@@ -305,11 +334,11 @@ class Host:
         self.net, self.cache, self.device = net, cache, device
         self.origin = self.end = 0  # the cache's clock at the start of this sequence and after its last token
         on_gpu = torch.device(device).type == "cuda"
-        self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
+        self.kernels = on_gpu and os.path.exists(gpu.DLL) and not V4 if kernels is None else kernels
         self.first_mix = None  # upstream's identity pre-mix of the first block, made once
         # the n-gram hash on the host for decode(). It is given every token of the sequence; net.engram_hash sees
         # the ones upstream's forward runs.
-        self.hash = HostHash(net.engram_hash) if self.kernels and net.engram_hash is not None else None
+        self.hash = HostHash(net.engram_hash) if self.kernels and getattr(net, "engram_hash", None) is not None else None
 
     def decode(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
         """upstream Transformer.forward for one text token (on the CPU) down to its logits: nothing is sampled
