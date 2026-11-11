@@ -2,7 +2,8 @@
 
 ## 지금
 - **채팅 기본값은 순정** (사용자 요청): 예전 부호 tier20v100, 정확 경로(wait-share 0), temperature 1.0 / top_p 0.95(모델 공식값). 속도는 낮 측정 11 tok/s에 저녁의 무손실 개선이 더해진 값일 텐데 아직 재지 않음
-- 빠른 설정: `chat.bat --codes C:\models\sclm-codes\tier20p02 --wait-share 0.25` (약 24~26 tok/s). 다만 긴 추론에서 기본 사실을 두고 맴도는 모습이 보고됨 (원인이 부호인지 effort high인지 사용자가 확인 중)
+- 빠른 설정: `chat.bat --codes C:\models\sclm-codes\tier20p02 --wait-share 0.25` (약 24~26 tok/s). **긴 추론에서 맴도는 원인이 이 부호로 확인됨**: 같은 대화에서 원본과의 KL 0.71, 첫 선택 일치 73% (tier20v100은 0.15, 85%)
+- **사용자 결정 대기 ⓪: 모델 전환.** DeepSeek-V4-Flash-0731(167GB, 같은 계열, expert 총량 절반, Engram 없음)로 가면 같은 RAM에 약 1.8bpw를 줄 수 있음. GLM-5.3-Flash는 권하지 않음
 - 채팅 명령: `/think`, `/effort low`, `/temperature 0.7`처럼 바로 씀 (`/set …`도 동작). 같은 구절이 96토큰 넘게 되풀이되면 자동으로 멈춤, 생각 과정은 한 줄로 접음(`/showthink`)
 - 저녁의 무손실 개선 6개: 평가 글 기준 tier20p02 채팅 설정 토큰당 43.8 → 약 38.5ms (연속 A/B를 이어 붙인 추정값), 정확 경로 54.5 → 49.9ms
 - 품질은 그대로: 여섯 변경 모두 정확 경로 KL이 마지막 자리까지 같음 (0.3020391283439402, top-1 81.0%)
