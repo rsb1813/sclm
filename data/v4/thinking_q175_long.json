@@ -1,0 +1,81 @@
+{
+ "name": "q175_long",
+ "codes": "C:\\models\\sclm-codes\\v4-q175",
+ "tokens": 3894,
+ "thinking_tokens": 3894,
+ "looped": false,
+ "all": {
+  "kl": 0.012668762356042862,
+  "top1_agree": 0.9573703408241272,
+  "confident_where_original_below_2pct": 1,
+  "mean_logprob_of_written_token_under_original": -0.7072321772575378
+ },
+ "thinking": {
+  "kl": 0.012668762356042862,
+  "top1_agree": 0.9573703408241272,
+  "confident_where_original_below_2pct": 1,
+  "mean_logprob_of_written_token_under_original": -0.7072321772575378
+ },
+ "positions_below_2048": {
+  "kl": 0.01606471836566925,
+  "top1_agree": 0.9588298797607422,
+  "confident_where_original_below_2pct": 1,
+  "mean_logprob_of_written_token_under_original": -0.7276970148086548
+ },
+ "positions_from_2048": {
+  "kl": 0.00960775837302208,
+  "top1_agree": 0.9560546875,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.68878573179245
+ },
+ "largest_gaps": [
+  {
+   "at": 562,
+   "token": ".",
+   "runtime_p": 0.606,
+   "original_p": 0.002
+  },
+  {
+   "at": 1222,
+   "token": "16",
+   "runtime_p": 0.717,
+   "original_p": 0.3721
+  },
+  {
+   "at": 341,
+   "token": " a",
+   "runtime_p": 0.653,
+   "original_p": 0.3717
+  },
+  {
+   "at": 2828,
+   "token": "apping",
+   "runtime_p": 0.493,
+   "original_p": 0.2177
+  },
+  {
+   "at": 901,
+   "token": " fit",
+   "runtime_p": 0.526,
+   "original_p": 0.2508
+  },
+  {
+   "at": 233,
+   "token": "ize",
+   "runtime_p": 0.687,
+   "original_p": 0.4201
+  },
+  {
+   "at": 217,
+   "token": " min",
+   "runtime_p": 0.424,
+   "original_p": 0.1641
+  },
+  {
+   "at": 2736,
+   "token": "vector",
+   "runtime_p": 0.381,
+   "original_p": 0.1416
+  }
+ ]
+}
