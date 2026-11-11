@@ -59,7 +59,7 @@ def main() -> None:
     cats = [str(names["names"][c]) for c in names["category"][3::6][:8]]
     per_seq, seconds, stats = [], 0.0, {}
     for s in map(int, cli.seqs.split(",")):
-        kl = agree = 0.0
+        kl, agree = [], 0.0
         cache.stats.clear()
         for p in range(cli.tokens):
             t0 = time.perf_counter()
@@ -68,14 +68,14 @@ def main() -> None:
             entry = (s // 2) * (tokens.size(1) // CHUNK) + p // CHUNK
             r_ids = ref["ids"][entry][s % 2, p % CHUNK].to(lp.device).long()
             r_lp = ref["lp"][entry][s % 2, p % CHUNK].to(lp.device).float()
-            kl += float((r_lp.exp() * (r_lp - lp[r_ids])).sum())
+            kl.append(float((r_lp.exp() * (r_lp - lp[r_ids])).sum()))
             agree += float(lp.argmax() == r_ids[0])
             if p >= cli.tokens // 4:  # speed over the part after the cache has filled
                 seconds += time.perf_counter() - t0
         for k, v in cache.stats.items():
             stats[k] = stats.get(k, 0.0) + v
-        per_seq.append({"category": cats[s], "kl": kl / cli.tokens, "top1": agree / cli.tokens})
-        print(json.dumps(per_seq[-1]), flush=True)
+        per_seq.append({"category": cats[s], "kl": sum(kl) / cli.tokens, "top1": agree / cli.tokens, "kl_by_position": kl})
+        print(json.dumps({k: v for k, v in per_seq[-1].items() if k != "kl_by_position"}), flush=True)
     n = len(per_seq) * cli.tokens
     timed = len(per_seq) * (cli.tokens - cli.tokens // 4)
     out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "wait_share": cli.wait_share, "ram_share": cli.ram_share, "guess": cli.guess, "tokens": n,
