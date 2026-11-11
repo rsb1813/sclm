@@ -34,10 +34,11 @@ def load_runtime(cli, background: int | None = None) -> tuple:
     net = host.build_net(args) if host.V4 else host.build_net(args, tok)
     host.load_checkpoint_(net, ck)
     out["resident_gib"] = torch.cuda.memory_allocated() / GIB
-    if cli.slots < 0:  # what fits under the process's cap, leaving 0.75 GiB: decoding allocates 0.3 GiB on top of the
-        # slots. With 14.6 GiB free at the start this gives about 440; 460 left 0.47 GiB free on the device, 480 ran out.
+    if cli.slots < 0:  # what fits under the process's cap, leaving 0.75 GiB: decoding takes 0.3 GiB on top of the
+        # slots. Counted from what the allocator holds, which is more than the tensors (0.3 GiB with V4-Flash-0731).
+        # With 14.6 GiB free at the start this gives about 460 and leaves 0.7 GiB of the device free.
         per = 3 * args.moe_inter_dim * args.dim * 17 // 32  # an expert's FP4 weights and their scales
-        cli.slots = out["slots"] = int((free - VRAM_MARGIN - torch.cuda.memory_allocated() - 0.75 * GIB) / per)
+        cli.slots = out["slots"] = int((free - VRAM_MARGIN - torch.cuda.memory_reserved() - 0.75 * GIB) / per)
         if cli.slots <= 0:
             raise SystemExit(f"only {free / GIB:.1f} GiB of VRAM is free: no room for the cache of original experts")
     # the code files go into RAM whole: stop here rather than push the machine into paging. No codes (--codes none):
