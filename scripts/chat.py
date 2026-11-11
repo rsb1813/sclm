@@ -1,6 +1,7 @@
 # An ollama-style terminal chat with the tiered model: the conversation lives in the decoder's state, a reply is
 # streamed token by token, and slash commands change the settings.
 import argparse
+import ctypes
 import os
 import signal
 import time
@@ -162,6 +163,21 @@ def command(line: str, session: Session, cache, opts: dict, console: Console) ->
     return True
 
 
+def echo_typing(on: bool) -> None:
+    """On a Windows console, whether keys typed are shown. Off while a reply streams, or they would land in the
+    middle of it; turning it on again also throws away what was typed meanwhile, so it is not taken for the next
+    message."""
+    if os.name != "nt":
+        return
+    kernel32, mode = ctypes.windll.kernel32, ctypes.c_uint()
+    stdin = kernel32.GetStdHandle(-10)
+    if not kernel32.GetConsoleMode(stdin, ctypes.byref(mode)):  # input is not a console
+        return
+    if on:
+        kernel32.FlushConsoleInputBuffer(stdin)
+    kernel32.SetConsoleMode(stdin, mode.value | 4 if on else mode.value & ~4)  # ENABLE_ECHO_INPUT
+
+
 def reply(line: str, session: Session, opts: dict, console: Console) -> None:
     """Streams the reply to one message, the thinking in grey, then a line with the speed."""
     shown, stopped = [None], [False]
@@ -177,12 +193,14 @@ def reply(line: str, session: Session, opts: dict, console: Console) -> None:
 
     # Ctrl+C only raises a flag that is read between tokens: a token cut half way would leave reads under way
     before = signal.signal(signal.SIGINT, lambda *_: stopped.__setitem__(0, True))
+    echo_typing(False)
     try:
         stats = session.ask(line, opts["num_predict"], opts["temperature"], opts["top_p"], on_text, lambda: stopped[0])
     except ContextFull:
         console.print("[yellow]문맥이 가득 찼습니다. /clear 로 새로 시작하세요.[/]")
         return
     finally:
+        echo_typing(True)
         signal.signal(signal.SIGINT, before)
     console.print("\n")
     if opts["verbose"]:
