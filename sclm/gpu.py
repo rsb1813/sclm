@@ -2,6 +2,8 @@
 # PyTorch's CUDA context on its default stream, in order with its own operations.
 import ctypes as C
 import os
+from functools import lru_cache
+from types import SimpleNamespace
 
 import torch
 
@@ -24,7 +26,11 @@ def lib():
         _lib.sclm_gpu_fp8_expert.argtypes = [C.c_void_p] * 6 + [C.c_int, C.c_int, C.c_float, C.c_void_p, C.c_void_p, C.c_int]
         _lib.sclm_gpu_gate.argtypes = [C.c_void_p] * 4 + [C.c_int] * 3 + [C.c_float, C.c_float, C.c_int]
         _lib.sclm_gpu_gate_guess.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float, C.c_float]
-        _lib.sclm_gpu_moe_finish.argtypes = [C.c_void_p] * 3 + [C.c_int]
+        _lib.sclm_gpu_moe_begin.argtypes = ([C.c_void_p] * 5 + [C.c_int] * 3 + [C.c_float] * 2 + [C.c_int] + [C.c_void_p] * 5 +
+                                            [C.c_int] * 2 + [C.c_float] * 2 + [C.c_void_p] * 6 + [C.c_int, C.c_float] +
+                                            [C.c_void_p] * 3)
+        _lib.sclm_gpu_moe_guess.argtypes = []
+        _lib.sclm_gpu_moe_end.argtypes = [C.c_void_p] * 5 + [C.c_int]
         _lib.sclm_gpu_attn_q.argtypes = [C.c_void_p] * 9 + [C.c_int] * 5 + [C.c_float]
         _lib.sclm_gpu_attn_kv.argtypes = [C.c_void_p] * 6 + [C.c_int] * 3 + [C.c_float]
         _lib.sclm_gpu_sparse_attn.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float]
@@ -194,9 +200,52 @@ def gate_guess(module, norm_weight: torch.Tensor, h: torch.Tensor, pre: torch.Te
                                      module.gate_temp, eps))
 
 
-def moe_finish(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
-    """bf16 of routed + shared (fp32 [dim] each)."""
-    assert routed.dtype == shared.dtype == torch.float32 and routed.numel() == shared.numel()
-    out = torch.empty(routed.numel(), dtype=torch.bfloat16, device=routed.device)
-    _check(lib().sclm_gpu_moe_finish(routed.data_ptr(), shared.data_ptr(), out.data_ptr(), routed.numel()))
+@lru_cache(2)
+def moe_buffers(topk: int, dim: int, guess: int, device: torch.device) -> SimpleNamespace:
+    """What moe_begin and moe_end work in, one set for every layer (their kernels run in order on one stream):
+    pack (the gate's output and 2 * guess floats for the guess), host (its page-locked copy on the host), and
+    the fp32 [dim] vectors xq, shared, routed and ram."""
+    n = 2 * topk + dim + 2 * guess
+    vec = lambda k: torch.empty(k, dtype=torch.float32, device=device)  # noqa: E731
+    return SimpleNamespace(pack=vec(n), host=torch.empty(n, dtype=torch.float32, device="cpu", pin_memory=True), xq=vec(dim),
+                           shared=vec(dim), routed=vec(dim), ram=vec(dim))
+
+
+def moe_begin(module, x: torch.Tensor, expert, limit: float, buf: SimpleNamespace, guess: int = 0, later=None,
+              norm_weight: torch.Tensor | None = None, h: torch.Tensor | None = None, pre: torch.Tensor | None = None,
+              eps: float = 0.0) -> None:
+    """The start of the two-tier MoE for one token x (bf16 [dim]) in one call, into buf (moe_buffers): gate(module, x)
+    into buf.pack; with guess, gate_guess(later, norm_weight, h, pre, eps) for `guess` picks after it; buf.routed = 0,
+    buf.xq = act_quant(x) and buf.shared = fp8_expert(expert, limit, xq, store=True). Returns when the gate's part
+    of the pack is in buf.host, without waiting for the rest; the guess's part is there after moe_guess()."""
+    n, dim = module.weight.shape
+    w1, w2, w3 = expert.w1.weight, expert.w2.weight, expert.w3.weight
+    assert module.score_func == "sqrtsoftplus" and x.dtype == module.weight.dtype == torch.bfloat16 and x.is_contiguous()
+    assert x.numel() == dim == w1.size(1) and dim % 32 == 0 and buf.pack.numel() >= 2 * (module.topk + guess) + dim
+    if guess:
+        assert later.score_func == "sqrtsoftplus" and later.weight.shape == module.weight.shape and norm_weight.numel() == dim
+        assert h.dtype == torch.bfloat16 and h.is_contiguous() and pre.dtype == torch.float32 and pre.is_contiguous()
+        ahead = (later.weight.data_ptr(), later.bias.data_ptr(), h.data_ptr(), pre.data_ptr(), norm_weight.data_ptr(), guess,
+                 pre.numel(), later.gate_temp, eps)
+    else:
+        ahead = (None, None, None, None, None, 0, 0, 0.0, 0.0)
+    _check(lib().sclm_gpu_moe_begin(
+        module.weight.data_ptr(), module.bias.data_ptr(), x.data_ptr(), buf.pack.data_ptr(), buf.host.data_ptr(), n, module.topk,
+        dim, module.gate_temp, module.route_scale, module.norm_topk_prob, *ahead, w1.data_ptr(), w1.scale.data_ptr(),
+        w2.data_ptr(), w2.scale.data_ptr(), w3.data_ptr(), w3.scale.data_ptr(), w1.size(0), limit, buf.xq.data_ptr(),
+        buf.shared.data_ptr(), buf.routed.data_ptr()))
+
+
+def moe_guess() -> None:
+    """Waits until the guess of the last moe_begin is on the host."""
+    _check(lib().sclm_gpu_moe_guess())
+
+
+def moe_end(buf: SimpleNamespace, ram: torch.Tensor) -> torch.Tensor:
+    """bf16 of (buf.routed + ram) + buf.shared: the MoE's output. ram (fp32 [dim], page-locked) is the CPU tier's
+    sum on the host; it is uploaded without waiting, so it has to stay as it is until the device was waited for."""
+    assert ram.dtype == torch.float32 and ram.numel() == buf.ram.numel() and not ram.is_cuda
+    out = torch.empty(ram.numel(), dtype=torch.bfloat16, device=buf.ram.device)
+    _check(lib().sclm_gpu_moe_end(buf.routed.data_ptr(), ram.data_ptr(), buf.ram.data_ptr(), buf.shared.data_ptr(),
+                                  out.data_ptr(), ram.numel()))
     return out

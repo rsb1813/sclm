@@ -27,14 +27,17 @@ class TieredMoE(nn.Module):
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """forward for one token (bf16 [dim]) on the engine's GPU kernels. The host waits for the device once, to
         learn the routing and take x for the CPU tier; while the CPU computes its tier, the device computes the shared
-        expert and the routed experts it already holds."""
+        expert (queued before that wait, but not waited for) and the routed experts it already holds."""
         cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
         guess = cache.guess if self.after else 0
-        pack = gpu.gate(self.gate, x, 2 * guess)
+        buf = gpu.moe_buffers(topk, self.dim, cache.guess, x.device)
         if guess:  # what the next layer's gate makes of this layer's input: its SSD experts are read a layer early
             later, norm_weight, eps = self.after
-            gpu.gate_guess(later.gate, norm_weight, *self.stream, eps, pack[2 * topk + self.dim:])
-        host = pack.cpu().numpy()
+            gpu.moe_begin(self.gate, x, self.shared_experts, self.limit, buf, guess, later.gate, norm_weight, *self.stream, eps)
+        else:
+            gpu.moe_begin(self.gate, x, self.shared_experts, self.limit, buf)
+        cache.uploading = False  # the routing was copied after every slot upload queued so far
+        host, xq, y = buf.host.numpy(), buf.xq, buf.routed
         t1 = perf_counter()
         ids, gates = host[:topk].astype(np.int64).tolist(), host[topk:2 * topk].tolist()
         total = sum(gates)
@@ -45,6 +48,7 @@ class TieredMoE(nn.Module):
         wait = [gates[k] >= cache.wait_share * total for k in ssd] if cache.wait_share else None
         slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token, wait)
         if guess:
+            gpu.moe_guess()  # as a rule it has arrived while the reads above were started
             picks = host[2 * topk + self.dim:2 * topk + self.dim + guess].astype(np.int64).tolist()
             cache.read_ahead(later.layer_id, [e for e in picks if e not in later.ram.experts])
         if wait:  # lossy: the token goes on without the light experts that are not in the cache yet
@@ -52,10 +56,6 @@ class TieredMoE(nn.Module):
         kept = sum(gates[k] for k in ram + ssd)
         if kept < total and kept > 0:  # what is computed keeps the routing weight of all six
             gates = [g * (total / kept) for g in gates]
-        xq = gpu.act_quant(x)
-        shared = torch.empty(self.dim, dtype=torch.float32, device=x.device)
-        gpu.fp8_expert(self.shared_experts, self.limit, xq, shared, store=True)
-        y = torch.zeros(self.dim, dtype=torch.float32, device=x.device)
         reading = {slot for slot, *_ in pending}
         held = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot not in reading]
         read = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot in reading]
@@ -68,10 +68,9 @@ class TieredMoE(nn.Module):
         t3 = perf_counter()
         if read:
             gpu.fp4_experts(cache.store, *zip(*read), self.dim, self.inter, self.limit, xq, y)
-        # not waited for: the device takes the buffer before the next layer's routing comes back, and the CPU tier
-        # writes it again only after that
-        y += cache.ram_out.to(x.device, non_blocking=True)
-        out = gpu.moe_finish(y, shared)
+        # the CPU tier's sum is not waited for: the device takes the buffer before the next layer's routing comes
+        # back, and the CPU tier writes it again only after that
+        out = gpu.moe_end(buf, cache.ram_out)
         t4 = perf_counter()
         for key, value in (("device_s", t1 - t0), ("ram_s", t2 - t1), ("read_s", t3 - t2), ("launch_s", t4 - t3),
                            ("ram_calls", len(ram)), ("ssd_calls", len(ssd)),

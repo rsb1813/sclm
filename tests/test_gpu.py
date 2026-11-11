@@ -201,6 +201,53 @@ def test_fp8_expert_matches_upstream_expert():
     close(y, expert(x))
 
 
+def test_moe_begin_and_end_equal_the_separate_kernels():
+    g = torch.Generator(device=DEV).manual_seed(8)
+    dim, inter, limit, hc, topk = 512, 256, 10.0, 4, 6
+    rand = lambda *shape: torch.randn(*shape, generator=g, device=DEV, dtype=torch.float32)  # noqa: E731
+    args = m.ModelArgs(dim=dim, n_routed_experts=48, n_activated_experts=topk, route_scale=2.5)
+    gates = [m.Gate(i, args).to(DEV) for i in range(2)]  # the layer's and the next layer's
+    m.default_dtype = torch.float8_e4m3fn
+    expert = m.Expert(dim, inter, swiglu_limit=limit).to(DEV)
+    with torch.no_grad():
+        for gate in gates:
+            gate.weight.copy_((0.1 * rand(*gate.weight.shape)).to(torch.bfloat16))
+            gate.bias.copy_(0.05 * rand(*gate.bias.shape))
+        for lin in (expert.w1, expert.w2, expert.w3):
+            weight, scale = rand_fp8(g, *lin.weight.shape)
+            lin.weight.copy_(weight)
+            lin.scale.copy_(scale)
+    norm_weight = (1 + 0.1 * rand(dim)).to(torch.bfloat16)
+    ram = torch.empty(dim, dtype=torch.float32, device="cpu", pin_memory=True)  # the CPU tier's sum
+    for step in range(6):
+        guess = 4 * (step % 2)
+        x, h, pre = (3 * rand(dim)).to(torch.bfloat16), (2 * rand(hc * dim)).to(torch.bfloat16), rand(hc)
+        routed = rand(dim)  # stands for the sum of the routed experts on the device
+        ram.copy_(rand(dim))
+        # the calls a decode token made one by one
+        pack = gpu.gate(gates[0], x, 2 * guess)
+        if guess:
+            gpu.gate_guess(gates[1], norm_weight, h, pre, 1e-6, pack[2 * topk + dim:])
+        xq = gpu.act_quant(x)
+        shared = torch.empty(dim, dtype=torch.float32, device=DEV)
+        gpu.fp8_expert(expert, limit, xq, shared, store=True)
+        want = ((routed + ram.to(DEV)) + shared).to(torch.bfloat16)
+
+        buf = gpu.moe_buffers(topk, dim, guess, torch.device(DEV))
+        buf.host.fill_(torch.nan)
+        if guess:
+            gpu.moe_begin(gates[0], x, expert, limit, buf, guess, gates[1], norm_weight, h, pre, 1e-6)
+        else:
+            gpu.moe_begin(gates[0], x, expert, limit, buf)
+        head = buf.host[:2 * topk + dim].clone()  # on the host when moe_begin returns
+        if guess:
+            gpu.moe_guess()
+        assert torch.equal(head, pack[:2 * topk + dim].cpu()) and torch.equal(buf.host, pack.cpu())
+        assert torch.equal(buf.xq, xq) and torch.equal(buf.shared, shared) and not buf.routed.any()
+        buf.routed.copy_(routed)
+        assert torch.equal(gpu.moe_end(buf, ram), want)
+
+
 def test_gate_matches_upstream_gate():
     g = torch.Generator(device=DEV).manual_seed(6)
     args = m.ModelArgs(dim=512, n_routed_experts=48, n_activated_experts=6, route_scale=2.5)

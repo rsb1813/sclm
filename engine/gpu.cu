@@ -395,10 +395,10 @@ __global__ void gate_pick_k(const float* scores, const float* bias, const uint16
     }
 }
 
-// The two-tier MoE's last step: out = bf16(routed + shared), both fp32 sums of bf16 expert outputs.
-__global__ void moe_finish_k(const float* routed, const float* shared, uint16_t* out, int n) {
+// The two-tier MoE's last step: out = bf16((routed + ram) + shared), three fp32 sums of bf16 expert outputs.
+__global__ void moe_sum_k(const float* routed, const float* ram, const float* shared, uint16_t* out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = to_bf16(routed[i] + shared[i]);
+    if (i < n) out[i] = to_bf16((routed[i] + ram[i]) + shared[i]);
 }
 
 // Hyper-connection mixes, first half (Block.hc_mixes): block i < rows computes <fn[i], h> over the n values of the
@@ -675,8 +675,47 @@ API int sclm_gpu_gate_guess(const uint16_t* weight, const float* bias, const uin
     return cudaGetLastError();
 }
 
-// out[n] (bf16) = routed[n] + shared[n] (fp32): the MoE's output from its two sums.
-API int sclm_gpu_moe_finish(const float* routed, const float* shared, uint16_t* out, int n) {
-    moe_finish_k<<<(n + 255) / 256, 256>>>(routed, shared, out, n);
+static cudaEvent_t moe_copied[2];  // reached when the last sclm_gpu_moe_begin's routing is on the host; when its guess is
+
+// The start of the two-tier MoE for one token x[dim], in one call that returns as soon as the host has the routing.
+// Queued in this order: sclm_gpu_gate into pack and the copy of those 2 * topk + dim floats to `host` (page-locked);
+// with g_weight, sclm_gpu_gate_guess (k picks of the gate g_weight, g_bias on the stream h mixed by pre and normed
+// by norm_w) into the 2 * k floats after them and their copy (sclm_gpu_moe_guess waits for it); then what does not
+// depend on the routing: routed[dim] = 0, xq[dim] = sclm_gpu_act_quant(x) and shared[dim] = the shared expert
+// (sclm_gpu_fp8_expert, stored). Only the first copy is waited for: the device goes on while the host works.
+API int sclm_gpu_moe_begin(const uint16_t* weight, const float* bias, const uint16_t* x, float* pack, float* host, int n,
+                           int topk, int dim, float temp, float route_scale, int norm, const uint16_t* g_weight,
+                           const float* g_bias, const uint16_t* h, const float* pre, const uint16_t* norm_w, int k, int hc,
+                           float g_temp, float eps, const uint8_t* w1, const uint8_t* s1, const uint8_t* w2,
+                           const uint8_t* s2, const uint8_t* w3, const uint8_t* s3, int inter, float limit, float* xq,
+                           float* shared, float* routed) {
+    if (!moe_copied[0])
+        for (cudaEvent_t& event : moe_copied) cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    const int head = 2 * topk + dim;
+    int status = sclm_gpu_gate(weight, bias, x, pack, n, topk, dim, temp, route_scale, norm);
+    if (status) return status;
+    cudaMemcpyAsync(host, pack, head * sizeof(float), cudaMemcpyDeviceToHost, 0);
+    cudaEventRecord(moe_copied[0], 0);
+    if (g_weight) {
+        status = sclm_gpu_gate_guess(g_weight, g_bias, h, pre, norm_w, pack + head, n, k, dim, hc, g_temp, eps);
+        if (status) return status;
+        cudaMemcpyAsync(host + head, pack + head, 2 * k * sizeof(float), cudaMemcpyDeviceToHost, 0);
+        cudaEventRecord(moe_copied[1], 0);
+    }
+    cudaMemsetAsync(routed, 0, dim * sizeof(float), 0);
+    act_quant_k<float><<<dim / 32, 32>>>(x, xq);
+    status = sclm_gpu_fp8_expert(w1, s1, w2, s2, w3, s3, dim, inter, limit, xq, shared, 1);
+    if (status) return status;
+    return cudaEventSynchronize(moe_copied[0]);
+}
+
+// Waits until the guess of the last sclm_gpu_moe_begin is on the host.
+API int sclm_gpu_moe_guess() { return cudaEventSynchronize(moe_copied[1]); }
+
+// The end of the two-tier MoE: out[n] (bf16) = (routed[n] + ram[n]) + shared[n], ram being the CPU tier's sum in
+// (page-locked) host memory, uploaded into the device buffer `staged` without waiting.
+API int sclm_gpu_moe_end(const float* routed, const float* ram, float* staged, const float* shared, uint16_t* out, int n) {
+    cudaMemcpyAsync(staged, ram, n * sizeof(float), cudaMemcpyHostToDevice, 0);
+    moe_sum_k<<<(n + 255) / 256, 256>>>(routed, staged, shared, out, n);
     return cudaGetLastError();
 }
