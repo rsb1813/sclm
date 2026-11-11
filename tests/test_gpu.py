@@ -128,6 +128,60 @@ def test_sparse_attn_matches_upstream():
         close(gpu.sparse_attn(q.flatten(), window, compressed, use, sink, heads, win, d**-0.5), want)
 
 
+@pytest.mark.parametrize("ratio", [1, 2, 4])
+def test_compress_matches_upstream_compressor_and_index_key(ratio):
+    g = torch.Generator(device=DEV).manual_seed(7 + ratio)
+    dim, d, kd, rd, groups = 256, 64, 32, 16, 6
+    rand = lambda *shape: torch.randn(*shape, generator=g, device=DEV, dtype=torch.float32)  # noqa: E731
+
+    def linear(out, k, dtype):
+        lin = torch.nn.Linear(k, out, bias=False, device=DEV, dtype=dtype)
+        with torch.no_grad():
+            lin.weight.copy_((rand(out, k) / k**0.5).to(dtype))
+        return lin
+
+    def norm(n):
+        mod = m.RMSNorm(n, 1e-6).to(DEV)
+        with torch.no_grad():
+            mod.weight.copy_((1 + 0.1 * rand(n)).to(torch.bfloat16))
+        return mod
+
+    def state():
+        return torch.zeros(1, ratio, d, dtype=torch.float32, device=DEV), torch.full((1, ratio, d), -torch.inf, dtype=torch.float32, device=DEV)
+
+    wdt = torch.float32 if ratio > 1 else torch.bfloat16  # as upstream Compressor builds them
+    parts = dict(compress_ratio=ratio, head_dim=d, norm=norm(d), wkv=linear(d, dim, wdt), wgate=linear(d, dim, wdt))
+    ours, theirs = (SimpleNamespace(**parts, kv_state=kv, score_state=score) for kv, score in (state(), state()))
+    wk, k_norm = linear(kd, d, torch.bfloat16), norm(kd)
+    indexer = SimpleNamespace(owns_k=True, wk=wk, k_norm=k_norm, index_head_dim=kd,
+                              k_cache=torch.zeros(1, groups, kd, dtype=torch.bfloat16, device=DEV))
+    freqs_cis = torch.polar(torch.ones(groups * ratio + 1, rd // 2, device=DEV, dtype=torch.float32),
+                            6.28 * torch.rand(groups * ratio + 1, rd // 2, generator=g, device=DEV, dtype=torch.float32))
+    kv_cache = torch.zeros(groups, d, dtype=torch.bfloat16, device=DEV)
+    same = total = 0
+    for pos in range(1, groups * ratio):  # position 0 is the prefill's
+        x = (2 * rand(dim)).to(torch.bfloat16)
+        gpu.compress(ours, indexer, x, pos, freqs_cis, kv_cache, rd)
+        latent = m.Compressor.forward(theirs, x.view(1, 1, -1), pos)
+        if ratio > 1:
+            assert torch.allclose(ours.kv_state, theirs.kv_state, rtol=1e-4, atol=1e-5)
+            assert torch.allclose(ours.score_state, theirs.score_state, rtol=1e-4, atol=1e-5)
+        if latent is None:
+            assert (pos + 1) % ratio
+            continue
+        freqs = freqs_cis[pos + 1 - ratio].unsqueeze(0)
+        key = k_norm(wk(latent))  # Indexer.forward
+        m.apply_rotary_emb(key[..., -rd:], freqs)
+        kernel.fp4_act_quant(key, 32, True)
+        m.apply_rotary_emb(latent[..., -rd:], freqs)  # Attention._compress_kv
+        kernel.fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
+        for got, want in ((kv_cache[pos // ratio], latent), (indexer.k_cache[0, pos // ratio], key)):
+            same, total = same + int((got == want.flatten()).sum()), total + got.numel()
+            # a last bit that differs before the rounding can move a value to the next FP4 step, not further
+            assert ((got.float() - want.flatten().float()).abs() <= want.flatten().float().abs() * 0.5 + 1e-3).all()
+    assert total >= (groups - 1) * (d + kd) and same / total > 0.97, same / total
+
+
 def test_fp8_expert_matches_upstream_expert():
     g = torch.Generator(device=DEV).manual_seed(5)
     dim, inter, limit = 512, 256, 10.0

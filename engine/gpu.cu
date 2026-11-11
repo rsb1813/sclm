@@ -26,6 +26,20 @@ __device__ __forceinline__ float e2m1x2(uint32_t code) {
 
 __device__ __forceinline__ float from_bf16(uint16_t h) { return __uint_as_float(uint32_t(h) << 16); }
 
+__device__ __forceinline__ float widen(uint16_t v) { return from_bf16(v); }  // a stored bf16 or fp32 value
+__device__ __forceinline__ float widen(float v) { return v; }
+
+// kernel.round_fp4: a value in [-6, 6] to the nearest E2M1 magnitude (0, .5, 1, 1.5, 2, 3, 4, 6), a tie to the
+// even code.
+__device__ __forceinline__ float round_e2m1(float v) {
+    const float a = fabsf(v);
+    int hi = 1;
+    while (hi < 7 && a > 0.5f * float((0xC8643210u >> (hi * 4)) & 15)) ++hi;
+    const float lo = 0.5f * float((0xC8643210u >> (hi * 4 - 4)) & 15), up = 0.5f * float((0xC8643210u >> (hi * 4)) & 15);
+    const bool pick_up = up - a < a - lo || (up - a == a - lo && hi % 2 == 0);
+    return copysignf(pick_up ? up : lo, v);
+}
+
 __device__ __forceinline__ uint16_t to_bf16(float f) {  // nearest, ties to even
     const uint32_t u = __float_as_uint(f);
     return uint16_t((u + 0x7fffu + ((u >> 16) & 1)) >> 16);
@@ -206,13 +220,70 @@ __global__ void fp4_gemv_k(const uint8_t* w, const uint8_t* scale, const float* 
     if (threadIdx.x == 0) put(y, row, acc, mode);
 }
 
-// upstream Gate.forward for one token, first half: block e computes <weight[e], x> (bf16 rows of dim values).
-__global__ void gate_scores_k(const uint16_t* w, const uint16_t* x, float* scores, int dim) {
-    const uint16_t* wr = w + size_t(blockIdx.x) * dim;
+// out[row] = <w[row], x> for a bf16 or fp32 weight with rows of k values and x in bf16; block `row` computes one.
+// The first half of upstream Gate.forward for one token, and F.linear on unquantized weights.
+template <class W>
+__global__ void dots_k(const W* w, const uint16_t* x, float* out, int k) {
+    const W* wr = w + size_t(blockIdx.x) * k;
     float acc = 0;
-    for (int c = threadIdx.x; c < dim; c += blockDim.x) acc += from_bf16(wr[c]) * from_bf16(x[c]);
+    for (int c = threadIdx.x; c < k; c += blockDim.x) acc += widen(wr[c]) * from_bf16(x[c]);
     acc = block_sum(acc);
-    if (threadIdx.x == 0) scores[blockIdx.x] = acc;
+    if (threadIdx.x == 0) out[blockIdx.x] = acc;
+}
+
+// upstream Compressor.forward for one token, after its projections: v[i] = sum over the group's `ratio` tokens s of
+// kv[s][i] * softmax over s of score[s][i] (ratio 1: kv[i] itself), rounded to bf16; out = RMSNorm of v with
+// weight w. One block of n threads.
+__global__ void latent_k(const float* kv, const float* score, int ratio, const uint16_t* w, uint16_t* out, int n, float eps) {
+    const int i = threadIdx.x;
+    float v = kv[i];
+    if (ratio > 1) {
+        float mx = -INFINITY, den = 0;
+        for (int s = 0; s < ratio; ++s) mx = fmaxf(mx, score[s * n + i]);
+        for (int s = 0; s < ratio; ++s) den += expf(score[s * n + i] - mx);
+        v = 0;
+        for (int s = 0; s < ratio; ++s) v += kv[s * n + i] * (expf(score[s * n + i] - mx) / den);
+    }
+    v = from_bf16(to_bf16(v));
+    const float r = rsqrtf(block_reduce(v * v, false) / float(n) + eps);
+    out[i] = to_bf16(from_bf16(w[i]) * (v * r));
+}
+
+// What upstream does to a compressed latent or its index key before caching it, one block of n threads:
+// v = bf16(in); with norm_w, v = RMSNorm(v); the last rd values are rotated (apply_rotary_emb with freqs) and
+// rounded to bf16; then kernel.fp4_act_quant in place over groups of `group` values, with power-of-two scales
+// (the index keys) or E4M3 scales (the compressed KV).
+template <class In>
+__global__ void norm_rope_fp4_k(const In* in, const uint16_t* norm_w, const float* freqs, uint16_t* out, int n, int rd,
+                                int group, bool e4m3_scale, float eps) {
+    __shared__ float vals[1024];
+    const int i = threadIdx.x;
+    float v = from_bf16(to_bf16(widen(in[i])));
+    if (norm_w) {
+        const float r = rsqrtf(block_reduce(v * v, false) / float(n) + eps);
+        v = from_bf16(to_bf16(from_bf16(norm_w[i]) * (v * r)));
+    }
+    vals[i] = v;
+    __syncthreads();
+    if (i >= n - rd) {
+        const int pair = (i - (n - rd)) >> 1, at = n - rd + 2 * pair;
+        const float a = vals[at], b = vals[at + 1], c = freqs[2 * pair], d = freqs[2 * pair + 1];
+        v = from_bf16(to_bf16(i == at ? a * c - b * d : a * d + b * c));
+    }
+    __syncthreads();
+    vals[i] = v;
+    __syncthreads();
+    float mx = 0, s;
+    for (int k = 0; k < group; ++k) mx = fmaxf(mx, fabsf(vals[i / group * group + k]));
+    if (e4m3_scale) {  // amax / 6 rounded to E4M3; even an all-zero group keeps a nonzero scale
+        const float t = fmaxf(mx, scalbnf(6.0f, -9)) / 6.0f;
+        const int q = max(ilogbf(t), -6) - 3;
+        s = scalbnf(rintf(scalbnf(t, -q)), q);
+    } else {  // 2^ceil(log2(amax / 6))
+        const uint32_t bits = __float_as_uint(fmaxf(mx, scalbnf(6.0f, -126)) * float(1.0 / 6.0));
+        s = scalbnf(1.0f, int(bits >> 23 & 255) - 127 + ((bits & 0x7fffff) != 0));
+    }
+    out[i] = to_bf16(round_e2m1(fminf(fmaxf(v / s, -6.0f), 6.0f)) * s);
 }
 
 // Second half, one block of 1024 threads (n <= 1024, a thread per expert): a score becomes
@@ -431,6 +502,36 @@ API int sclm_gpu_attn_kv(const uint8_t* w, const uint8_t* s, const uint16_t* nor
     return cudaGetLastError();
 }
 
+// One decode token of upstream's compressed KV at a layer that makes it (Compressor.forward, the index key of
+// Indexer.forward, the rotation and rounding of Attention._compress_kv), `ratio` tokens to a group.
+// ratio > 1: kv_state and score_state [ratio][d] (fp32) get the token's projections at `slot` (wkv and wgate are
+// fp32 [d, dim]); ratio 1: wkv is bf16 and nothing is pooled. When the token completes its group
+// (slot == ratio - 1), kv_out[d] gets the group's latent with the rotation `freqs` of its first position, as FP4
+// values over groups of 16 with E4M3 scales, and k_out[kd] its index key (wk bf16 [kd, d], or null for none) as FP4
+// values over groups of 32. x, the norm weights and the outputs are bf16.
+API int sclm_gpu_compress(const void* wkv, const float* wgate, const uint16_t* norm_w, const uint16_t* x, float* kv_state,
+                          float* score_state, int ratio, int slot, const uint16_t* wk, const uint16_t* k_norm_w,
+                          const float* freqs, uint16_t* k_out, uint16_t* kv_out, int dim, int d, int kd, int rd, float eps) {
+    if (d > 1024 || d % 32 || kd > 1024 || kd % 32) return -1;
+    ensure_scratch();
+    const float* kv = kv_state;
+    if (ratio > 1) {
+        dots_k<float><<<d, 128>>>((const float*)wkv, x, kv_state + slot * d, dim);
+        dots_k<float><<<d, 128>>>(wgate, x, score_state + slot * d, dim);
+        if (slot != ratio - 1) return cudaGetLastError();
+    } else {
+        dots_k<uint16_t><<<d, 128>>>((const uint16_t*)wkv, x, scratch.xq, dim);
+        kv = scratch.xq;
+    }
+    latent_k<<<1, d>>>(kv, score_state, ratio, norm_w, scratch.h, d, eps);
+    if (wk) {
+        dots_k<uint16_t><<<kd, 128>>>(wk, scratch.h, scratch.dots, d);
+        norm_rope_fp4_k<float><<<1, kd>>>(scratch.dots, k_norm_w, freqs, k_out, kd, rd, 32, false, eps);
+    }
+    norm_rope_fp4_k<uint16_t><<<1, d>>>(scratch.h, nullptr, freqs, kv_out, d, rd, 16, true, eps);
+    return cudaGetLastError();
+}
+
 // out[heads * d] (bf16) = kernel.sparse_attn of one token's q over the `count` positions idx names (see sparse_attn_k).
 API int sclm_gpu_sparse_attn(const uint16_t* q, const uint16_t* window, const uint16_t* compressed, const int* idx,
                              const float* sink, uint16_t* out, int heads, int d, int count, int win, float scale) {
@@ -485,7 +586,7 @@ API int sclm_gpu_gate(const uint16_t* weight, const float* bias, const uint16_t*
                       float temp, float route_scale, int norm) {
     if (n > 1024) return -1;
     ensure_scratch();
-    gate_scores_k<<<n, 128>>>(weight, x, scratch.dots, dim);
+    dots_k<uint16_t><<<n, 128>>>(weight, x, scratch.dots, dim);
     gate_pick_k<<<1, 1024>>>(scratch.dots, bias, x, pack, n, topk, dim, temp, route_scale, norm != 0);
     return cudaGetLastError();
 }

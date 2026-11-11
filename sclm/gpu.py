@@ -27,6 +27,7 @@ def lib():
         _lib.sclm_gpu_attn_kv.argtypes = [C.c_void_p] * 6 + [C.c_int] * 3 + [C.c_float]
         _lib.sclm_gpu_sparse_attn.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float]
         _lib.sclm_gpu_attn_out.argtypes = [C.c_void_p] * 7 + [C.c_int] * 6
+        _lib.sclm_gpu_compress.argtypes = [C.c_void_p] * 6 + [C.c_int] * 2 + [C.c_void_p] * 5 + [C.c_int] * 4 + [C.c_float]
     return _lib
 
 
@@ -119,6 +120,25 @@ def attn_kv(wkv, norm_weight: torch.Tensor, x: torch.Tensor, freqs: int, kv: tor
     assert x.dtype == kv.dtype == torch.bfloat16 and x.is_contiguous() and kv.is_contiguous()
     _check(lib().sclm_gpu_attn_kv(wkv.weight.data_ptr(), wkv.scale.data_ptr(), norm_weight.data_ptr(), x.data_ptr(), freqs,
                                   kv.data_ptr(), x.numel(), kv.numel(), rd, eps))
+
+
+def compress(compressor, indexer, x: torch.Tensor, pos: int, freqs_cis: torch.Tensor, kv_cache: torch.Tensor, rd: int) -> None:
+    """One decode token x (bf16 [dim]) at position pos through an upstream Compressor: its state takes the token,
+    and when the token completes a group of compress_ratio, the group's rotated FP4 latent goes into kv_cache
+    ([groups, d]) and its index key into the k_cache of `indexer` (an upstream Indexer that owns the keys, or None).
+    What upstream's Attention._compress_kv and Indexer.forward do for it; freqs_cis is the attention's."""
+    ratio, d = compressor.compress_ratio, compressor.head_dim
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and kv_cache.is_contiguous()
+    pooled = ratio > 1
+    freqs = freqs_cis.data_ptr() + (pos + 1 - ratio) * rd * 4  # of the group's first position
+    key = indexer is not None and indexer.owns_k
+    _check(lib().sclm_gpu_compress(
+        compressor.wkv.weight.data_ptr(), compressor.wgate.weight.data_ptr() if pooled else None,
+        compressor.norm.weight.data_ptr(), x.data_ptr(), compressor.kv_state.data_ptr() if pooled else None,
+        compressor.score_state.data_ptr() if pooled else None, ratio, pos % ratio,
+        indexer.wk.weight.data_ptr() if key else None, indexer.k_norm.weight.data_ptr() if key else None, freqs,
+        indexer.k_cache[0, pos // ratio].data_ptr() if key else None, kv_cache[pos // ratio].data_ptr(), x.numel(), d,
+        indexer.index_head_dim if key else 32, rd, compressor.norm.eps))
 
 
 def sparse_attn(q: torch.Tensor, window: torch.Tensor, compressed: torch.Tensor, idx: torch.Tensor, sink: torch.Tensor,

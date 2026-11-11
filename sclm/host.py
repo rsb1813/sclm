@@ -1,6 +1,7 @@
 # Token-by-token decode on one device: upstream's Transformer with every block resident and its routed experts on two
 # tiers (sclm.tiered). PyTorch hosts the always-on path for now; the engine core computes the RAM tier and reads the SSD tier.
 import os
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -66,47 +67,53 @@ def kernel_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     return _upstream_linear(x, weight, bias)
 
 
+@lru_cache(4)
+def attended(win: int, topk: int, device: torch.device) -> torch.Tensor:
+    """[win, win + topk] int32. The start of row p lists what a decode token at position p attends to while nothing
+    has to be chosen (the last row: any later position): the window slots filled so far, -1 for the others, then the
+    compressed positions in order."""
+    slots = torch.arange(win, device=device, dtype=torch.int32)
+    ring = torch.where(slots[None] > slots[:, None], -1, slots[None])
+    more = (win + torch.arange(topk, device=device, dtype=torch.int32)).expand(win, -1)
+    return torch.cat([ring, more], dim=1).contiguous()
+
+
 class HostAttention(m.Attention):
     """upstream Attention; decoding one token with the kernels on, the engine computes the query, the token's
-    key/value, the attention itself and the output projection (wo_a read as stored, see Fp8Weight). The compressed
-    KV and its index stay upstream's code."""
+    key/value, the attention itself and the output projection (wo_a read as stored, see Fp8Weight). While every
+    compressed position still fits in index_topk it also makes the compressed KV and its index keys, and nothing is
+    scored: the top-k of fewer than k positions is all of them. Past that, the compressed KV and its index are
+    upstream's code."""
+
+    def __init__(self, layer_id: int, args: "m.ModelArgs"):
+        super().__init__(layer_id, args)
+        self.index_topk = args.index_topk
 
     def forward(self, x: torch.Tensor, start_pos: int):
         if not (gpu.active and x.size(0) * x.size(1) == 1 and start_pos):  # position 0 is upstream's prefill case
             return super().forward(x, start_pos)
-        rd, win, heads = self.rope_head_dim, self.window_size, self.n_local_heads
+        rd, win, heads, ratio = self.rope_head_dim, self.window_size, self.n_local_heads, self.compress_ratio
         freqs = self.freqs_cis.data_ptr() + start_pos * rd * 4  # the position's row: rd / 2 complex64
         token = x.contiguous()
         qr, q = gpu.attn_q(self.wq_a, self.q_norm.weight, self.wq_b, token, freqs, heads, self.head_dim, rd, self.eps)
         gpu.attn_kv(self.wkv, self.kv_norm.weight, token, freqs, self.window_kv_cache[0, start_pos % win], rd, self.eps)
-        with torch.device(x.device):  # upstream creates index tensors on the default device
-            idxs, compressed = m.get_window_topk_idxs(win, 1, 1, start_pos).view(-1), self.window_kv_cache
-            if self.compress_ratio:
+        count = (start_pos + 1) // ratio if ratio else 0
+        if count <= self.index_topk:
+            if self.is_kv_source:
+                gpu.compress(self.compressor, self.indexer, token.view(-1), start_pos, self.freqs_cis,
+                             self.compress_kv_cache[0], rd)
+                m.shared_attn.compress_kv = self.compress_kv_cache
+                if self.indexer is not None and self.indexer.owns_k:
+                    m.shared_attn.index_k = self.indexer.k_cache
+            compressed = m.shared_attn.compress_kv if ratio else self.window_kv_cache
+            idxs = attended(win, self.index_topk, x.device)[min(start_pos, win - 1), :win + count]
+        else:
+            with torch.device(x.device):  # upstream creates index tensors on the default device
                 compressed, compress_idxs = self._compress_kv(x, qr.view(1, 1, -1), start_pos, win)
-                idxs = torch.cat([idxs, compress_idxs.view(-1)])
+                idxs = torch.cat([m.get_window_topk_idxs(win, 1, 1, start_pos).view(-1), compress_idxs.view(-1)])
         o = gpu.sparse_attn(q, self.window_kv_cache, compressed, idxs, self.attn_sink, heads, win, self.softmax_scale)
         out = gpu.attn_out(o, freqs, self.wo_a.fp8, self.wo_a.scale, self.wo_b, heads, rd, self.n_local_groups)
         return out.view(1, 1, -1)
-
-
-class HostIndexer(m.Indexer):
-    """upstream Indexer; decoding with the kernels on while every compressed position still fits in index_topk,
-    nothing is scored: the top-k of fewer than k positions is all of them, in order. The index keys are still made
-    and kept, for when the context outgrows that."""
-
-    def forward(self, x, qr, latent, start_pos, offset):
-        count = (start_pos + x.size(1)) // self.compress_ratio
-        if not (gpu.active and start_pos and count <= self.index_topk):
-            return super().forward(x, qr, latent, start_pos, offset)
-        if self.owns_k:
-            if latent is not None:  # upstream's key update, one completed group
-                ratio = self.compress_ratio
-                k = self.k_norm(self.wk(latent))
-                m.apply_rotary_emb(k[..., -self.rope_head_dim:], self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0))
-                m.fp4_act_quant(k, m.fp4_block_size, True)
-                self.k_cache[:x.size(0), start_pos // ratio : start_pos // ratio + k.size(1)] = k
-            m.shared_attn.index_k = self.k_cache
-        return (torch.arange(count, device=x.device, dtype=torch.int32) + offset).view(1, 1, count)
 
 
 class HostBlock(m.Block):
@@ -146,9 +153,9 @@ def build_net(args: "m.ModelArgs", tokenizer=None, device: str = "cuda") -> "m.T
     device: the routed experts (each block's ffn is a TieredMoE), the engram tables, the embedding and the head.
     Parameters are uninitialized."""
     assert not args.dspark_block_size and not args.vision_enabled
-    names = ("Block", "Indexer", "MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
+    names = ("Block", "MoE", "ParallelEngramEmbedding", "ParallelEmbedding", "ParallelHead")
     upstream = [getattr(m, n) for n in names]
-    m.Block, m.Indexer, m.MoE = HostBlock, HostIndexer, TieredMoE
+    m.Block, m.MoE = HostBlock, TieredMoE
     m.ParallelEngramEmbedding = m.ParallelEmbedding = m.ParallelHead = _Absent
     try:
         with torch.device(device):
