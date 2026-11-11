@@ -400,15 +400,21 @@ __device__ __forceinline__ float row_dot(const uint8_t* wr, const uint8_t* sr, c
 // 32 rows of the hidden vector of expert blockIdx / (inter / 32), a warp per row: the row of w1 and of w3 (each
 // rounded to bf16 as the reference's GEMM output is), h = weight * silu(min(gate, limit)) * clamp(up, -limit, limit)
 // rounded to bf16, and the block's 32 values quantized as kernel.act_quant does before w2 -> hq[expert][inter].
+// The block first copies xq into shared memory: every weight takes one read of x, and with those reads going to
+// global memory an FP4 expert (half the bytes of an FP8 one) took longer than an FP8 one, 51 us against 43; with
+// both kernels reading x from shared memory it takes 33 us (28 in a batch of three).
 template <bool FP4>
 __global__ void expert_hidden_k(Batch b, const float* xq, float* hq, int dim, int inter, float limit) {
     __shared__ float vals[32];
+    extern __shared__ float xs[];  // xq: every row of the block reads all of it
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) xs[i] = xq[i];
+    __syncthreads();
     const int blocks = inter / 32, e = blockIdx.x / blocks, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = (blockIdx.x % blocks) * 32 + warp;
     const Mats& m = b.m[e];
     const size_t at = size_t(row) * (FP4 ? dim / 2 : dim), scale_at = size_t(FP4 ? row : row >> 5) * (dim >> 5);
-    const float gate = row_dot<FP4>(m.w1 + at, m.s1 + scale_at, xq, dim, lane);
-    const float up = row_dot<FP4>(m.w3 + at, m.s3 + scale_at, xq, dim, lane);
+    const float gate = row_dot<FP4>(m.w1 + at, m.s1 + scale_at, xs, dim, lane);
+    const float up = row_dot<FP4>(m.w3 + at, m.s3 + scale_at, xs, dim, lane);
     if (lane == 0) {
         float g = from_bf16(to_bf16(gate)), u = from_bf16(to_bf16(up));
         if (limit > 0) g = fminf(g, limit), u = fminf(fmaxf(u, -limit), limit);
@@ -421,15 +427,21 @@ __global__ void expert_hidden_k(Batch b, const float* xq, float* hq, int dim, in
     hq[size_t(e) * inter + row] = fp8_round(vals[warp], mx);
 }
 
-// The second half, one warp per output row: y[row] (fp32), or zero with STORE_F32, plus each expert's
-// <w2[row], hq[expert]> rounded to bf16, added in the batch's order.
+// The second half, a block per 32 output rows and a warp per row: y[row] (fp32), or zero with STORE_F32, plus each
+// expert's <w2[row], hq[expert]> rounded to bf16, added in the batch's order. The block holds the expert's hq in
+// shared memory while its rows read it.
 template <bool FP4>
 __global__ void expert_out_k(Batch b, const float* hq, float* y, int dim, int inter, Mode mode) {
-    const int row = blockIdx.x, lane = threadIdx.x;
+    extern __shared__ float xs[];  // an expert's hq: every row of the block reads all of it
+    const int row = blockIdx.x * 32 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const size_t at = size_t(row) * (FP4 ? inter / 2 : inter), scale_at = size_t(FP4 ? row : row >> 5) * (inter >> 5);
     float sum = lane == 0 && mode == ADD ? y[row] : 0.0f;
-    for (int e = 0; e < b.n; ++e)
-        sum += from_bf16(to_bf16(row_dot<FP4>(b.m[e].w2 + at, b.m[e].s2 + scale_at, hq + size_t(e) * inter, inter, lane)));
+    for (int e = 0; e < b.n; ++e) {
+        __syncthreads();  // every row is through with the expert before
+        for (int i = threadIdx.x; i < inter; i += blockDim.x) xs[i] = hq[size_t(e) * inter + i];
+        __syncthreads();
+        sum += from_bf16(to_bf16(row_dot<FP4>(b.m[e].w2 + at, b.m[e].s2 + scale_at, xs, inter, lane)));
+    }
     if (lane == 0) y[row] = sum;
 }
 
@@ -737,10 +749,10 @@ struct Rows {
 
 template <bool FP4>
 int launch_experts(const Batch& b, int dim, int inter, float limit, const float* xq, float* y, Mode mode) {
-    if (dim > SCRATCH || b.n * inter > SCRATCH || inter % 32) return -1;
+    if (dim > SCRATCH || b.n * inter > SCRATCH || inter % 32 || dim % 32 || max(dim, inter) > 8192) return -1;
     ensure_scratch();
-    expert_hidden_k<FP4><<<b.n * (inter / 32), 1024>>>(b, xq, scratch.xq, dim, inter, limit);
-    expert_out_k<FP4><<<dim, 32>>>(b, scratch.xq, y, dim, inter, mode);
+    expert_hidden_k<FP4><<<b.n * (inter / 32), 1024, dim * sizeof(float)>>>(b, xq, scratch.xq, dim, inter, limit);
+    expert_out_k<FP4><<<dim / 32, 1024, inter * sizeof(float)>>>(b, scratch.xq, y, dim, inter, mode);
     return cudaGetLastError();
 }
 
