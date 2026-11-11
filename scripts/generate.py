@@ -18,13 +18,13 @@ GIB = 2**30
 
 def load_runtime(cli, background: int | None = None) -> tuple:
     """(tokenizer, expert cache, decoder, facts about the load) of the tiered model for the options in cli (ckpt,
-    codes, slots, lam, threads, max_seq_len, min_ram_margin, wait_share, ram_share, topk, guess). background:
+    codes, slots, lam, threads, max_seq_len, min_ram_margin, wait_share, ram_share, topk, guess, ram_cache). background:
     staging buffers for unwaited reads (default: what the options given need)."""
     torch.set_default_dtype(torch.bfloat16)
     # Windows pages over-subscribed VRAM out to system RAM instead of failing: cap the process so it fails instead
     free, total = torch.cuda.mem_get_info()
     torch.cuda.set_per_process_memory_fraction((free - VRAM_MARGIN) / total)
-    out = {"slots": cli.slots, "lam": cli.lam, "threads": cli.threads, "codes": cli.codes,
+    out = {"slots": cli.slots, "lam": cli.lam, "threads": cli.threads, "codes": cli.codes, "ram_cache": cli.ram_cache,
            "vram_free_at_start_gib": free / GIB, "ram_used_at_start_gib": status.ram()[0]}
 
     tok = AutoTokenizer.from_pretrained(cli.ckpt)
@@ -45,6 +45,11 @@ def load_runtime(cli, background: int | None = None) -> tuple:
         background = (12 if cli.wait_share else 0) + (16 if cli.guess else 0)
     cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam, background=background)
     cache.topk, cache.wait_share, cache.ram_share, cache.guess = cli.topk, cli.wait_share, cli.ram_share, cli.guess
+    pinned = cli.ram_cache * cache.store.size(1) / GIB  # it cannot be paged out
+    if pinned and total_ram - status.ram()[0] - pinned < cli.min_ram_margin:
+        raise SystemExit(f"--ram-cache {cli.ram_cache} takes {pinned:.1f} GiB and would leave less than "
+                         f"--min-ram-margin {cli.min_ram_margin} GiB of RAM")
+    cache.keep_in_ram(cli.ram_cache)
     out.update(load_s=time.perf_counter() - t0, allocated_gib=torch.cuda.memory_allocated() / GIB,
                ram_used_loaded_gib=status.ram()[0])
     print(f"loaded in {out['load_s']:.0f}s: resident {out['resident_gib']:.2f} GiB, with the cache "
@@ -73,6 +78,8 @@ def main() -> None:
     ap.add_argument("--topk", type=int, default=0, help="lossy: routed experts computed per token (0: all six)")
     ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
                     "the SSD a layer early (0: none)")
+    ap.add_argument("--ram-cache", type=int, default=0, help="experts kept in RAM after they leave the VRAM cache, "
+                    "18.8 MB each of pinned memory (scripts/ram_cache.py)")
     ap.add_argument("--name", default="stage3")
     cli = ap.parse_args()
 

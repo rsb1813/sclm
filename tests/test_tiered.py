@@ -160,3 +160,34 @@ def test_cache_takes_experts_read_ahead_from_their_staging_buffers(tmp_path):
     slots, pending = cache.request(0, [0, 4], 2, wait=[True, False])  # 0 is read again; 4 is there, waited for or not
     cache.finish(pending)
     assert sum(ticket == 0 for *_, ticket in pending) == 1 and holds(slots[0], 0) and holds(slots[1], 4)
+
+
+def test_cache_takes_experts_that_left_their_slots_from_ram(tmp_path):
+    rng = np.random.default_rng(3)
+    data = write_checkpoint(tmp_path, {
+        f"layers.0.ffn.experts.{e}.{w}.{part}": rng.integers(0, 256, (out, k // per_byte), dtype=np.uint8)
+        for e in range(6) for w, (out, k) in SHAPES.items() for part, per_byte in (("scale", m.fp4_block_size), ("weight", 2))})
+    reader = ssd.ExpertReader(Checkpoint(str(tmp_path)), chunk=64 * 1024)
+    cache = ssd.ExpertCache(reader, 1, 6, tc.DIM, tc.INTER, tc.LIMIT, slots=2, lam=0.1, device="cpu", scratch=TOPK, background=2)
+    cache.keep_in_ram(3)
+
+    def holds(slot: int, e: int) -> bool:
+        want = [data[f"layers.0.ffn.experts.{e}.{w}.{part}"].ravel() for part in ("scale", "weight") for w in SHAPES]
+        return np.array_equal(cache.store[slot].numpy(), np.concatenate(want))
+
+    def use(experts: list, token: int) -> tuple[list, int]:
+        """The slots of the experts, each checked to hold its expert's bytes, and how many had to be read."""
+        slots, pending = cache.request(0, experts, token)
+        cache.finish(pending)
+        assert all(holds(slot, e) for slot, e in zip(slots, experts))
+        return slots, sum(ticket == 0 for *_, ticket in pending)
+
+    assert use([0, 1], 0)[1] == 2 and use([2, 3], 100)[1] == 2  # 0 and 1 leave their slots
+    assert use([0, 1], 200)[1] == 0 and cache.stats["ram_cache_hits"] == 2  # and come back unread, for 2 and 3
+    cache.read_ahead(0, [2, 3])  # in RAM: not read
+    assert cache.stats["ahead"] == 0 and sorted(cache.ram_cache) == [2, 3]
+    use([0, 1], 200)
+    slots, reads = use([2], 200)  # scores below 0 and 1 now: computed from a scratch slot, and stays in RAM
+    assert slots[0] >= 2 and reads == 0 and list(cache.ram_cache) == [3, 2]
+    assert use([4, 5], 300)[1] == 2 and list(cache.ram_cache) == [2, 0, 1]  # room for three: 3 has left RAM too
+    assert use([3], 400)[1] == 1 and cache.stats["ram_cache_hits"] == 3  # and is read again

@@ -78,6 +78,8 @@ class ExpertCache:
         self.wait_share = 0.0
         self.ram_share = 0.0  # > 0: a CPU-tier expert with less than this share of the routing weight is left out
         self.guess = 0  # > 0: a layer's gate guesses this many experts of the next layer, which are read ahead
+        self.ram_cache = {}  # key -> host buffer holding an expert that left its slot (keep_in_ram), oldest first
+        self.ram_free = []  # the host buffers of keep_in_ram that hold nothing
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
@@ -105,21 +107,43 @@ class ExpertCache:
         self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
         self.uploading = self.store.is_cuda
 
+    def keep_in_ram(self, n: int) -> None:
+        """Adds a second level of n experts in host memory (pinned, an expert's bytes each): an expert that leaves
+        its slot is copied there by the device, and while it is among the last n to have left, request() takes it
+        from there instead of reading it from the SSD. The host never touches these buffers: the device fills and
+        reads them in the order the copies were queued, so nothing has to be waited for."""
+        row = self.store.size(1)
+        while n > 0:  # torch rounds a pinned allocation up to a power of two: blocks that fill one, of at most 1 GiB
+            size = 1 << 30
+            while size // 2 >= row and size // row > n:
+                size //= 2
+            block = torch.empty(min(n, size // row), row, dtype=torch.uint8, pin_memory=self.store.is_cuda)
+            self.ram_free += block.unbind(0)
+            n -= block.size(0)
+
     def _give(self, slot: int, key: int | None) -> None:
-        """The slot holds, or is being given, the bytes of `key` from now on (None: of nobody)."""
-        self.held.pop(self.loaded[slot], None)
+        """The slot holds, or is being given, the bytes of `key` from now on (None: of nobody). The expert it held
+        goes to the RAM level (keep_in_ram), into a free buffer or that of the expert that left longest ago: this
+        has to be queued before the copy of the new bytes into the slot."""
+        old = self.loaded[slot]
+        self.held.pop(old, None)
+        if old is not None and old not in self.ram_cache and (self.ram_free or self.ram_cache):
+            buf = self.ram_free.pop() if self.ram_free else self.ram_cache.pop(next(iter(self.ram_cache)))
+            buf.copy_(self.store[slot], non_blocking=True)
+            self.ram_cache[old] = buf
         self.loaded[slot] = key
         if key is not None:
             self.held[key] = slot
 
     def read_ahead(self, layer: int, experts: list) -> None:
         """Starts reading experts the layer is expected to ask for (a guess made a layer early), unless they are in
-        the cache or being read already. They wait in staging buffers, where request() finds them; a guess that does
-        not come true costs its read and nothing else. Called after the token's request() for the layer before."""
+        the cache (either level) or being read already. They wait in staging buffers, where request() finds them; a
+        guess that does not come true costs its read and nothing else. Called after the token's request() for the
+        layer before."""
         loading = {key for _, key, _ in self.loads.values()}
         for e in experts:
             key = layer * self.n_experts + e
-            if key in self.held or key in self.ahead or key in loading:
+            if key in self.held or key in self.ahead or key in loading or key in self.ram_cache:
                 continue
             if not self.idle:  # the oldest guess nobody asked for gives up its buffer, if its read is over
                 self.reader.reader.poll()
@@ -134,7 +158,8 @@ class ExpertCache:
     def request(self, layer: int, experts: list, token: int, wait: list | None = None) -> tuple[list, list]:
         """Slots of a layer's SSD-tier experts at a token, with the reads of the missing ones started.
         Returns (slots, pending); finish(pending) has to run before the slots of `pending` (its first field) are used.
-        An expert read ahead is taken from its staging buffer, at once if its read is over.
+        An expert read ahead is taken from its staging buffer, at once if its read is over; one that keep_in_ram
+        holds is copied back from there, whether it is waited for or not.
         wait[i] False (lossy): if the expert's bytes are not in its slot, its slot comes back None; it is read in the
         background when a staging buffer is free, and is there for the tokens after."""
         if self.uploading:  # the reads below go into the buffers those uploads copy from
@@ -159,15 +184,28 @@ class ExpertCache:
             kept = slot < self.n_slots  # not a scratch slot
             if kept and self.loaded[slot] == key:
                 out.append(slot)
+            elif key in self.ram_cache:  # it left its slot not long ago: the device copies it back, nobody waits
+                buf = self.ram_cache.pop(key)
+                if kept:
+                    self._give(slot, key)
+                    self.ram_free.append(buf)  # whatever goes into it next is queued after the copy below
+                else:
+                    self.ram_cache[key] = buf  # computed from a scratch slot: it stays, as the newest
+                self.store[slot].copy_(buf, non_blocking=True)
+                # listed with the experts being read (no ticket: finish() has nothing to do for it), so that the
+                # token adds its experts in the order it would without the RAM level, and its result is the same
+                pending.append((slot, buf, None, None))
+                out.append(slot)
+                self.stats["ram_cache_hits"] += 1
             elif key in self.ahead and (self.reader.reader.done(self.ahead[key][0]) or wait is None or wait[k]):
                 i, (at_s, at_w) = self.ahead.pop(key)
+                if kept:
+                    self._give(slot, key)
                 if self.reader.reader.done(i):
                     self._upload(slot, self.staging[i], at_s, at_w)
                 else:
                     pending.append((slot, self.staging[i], (at_s, at_w), i))
                 self.cooling.append(i)
-                if kept:
-                    self._give(slot, key)
                 out.append(slot)
                 self.stats["ahead_used"] += 1
             elif key in self.ahead:  # lossy, and still arriving: it goes on into its slot as a background read
@@ -197,6 +235,7 @@ class ExpertCache:
 
     def finish(self, pending: list) -> None:
         """Waits for the reads (each named by its ticket, the last field) and copies each expert into its slot."""
+        pending = [p for p in pending if p[-1] is not None]  # (the others came from RAM: their copies are queued)
         for ticket in {ticket for *_, ticket in pending}:
             self.reader.reader.wait(ticket)
         for slot, buf, (at_s, at_w), _ in pending:

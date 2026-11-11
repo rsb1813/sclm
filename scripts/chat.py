@@ -202,6 +202,8 @@ def main() -> None:
     ap.add_argument("--wait-share", type=float, default=0.0, help="lossy speed option at the start (/set wait-share changes it)")
     ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
                     "the SSD a layer early (0: none)")
+    ap.add_argument("--ram-cache", type=int, default=0, help="experts kept in RAM after they leave the VRAM cache, "
+                    "18.8 MB each of pinned memory (scripts/ram_cache.py)")
     cli = ap.parse_args()
     cli.ram_share, cli.topk = 0.0, 0
     console = Console()
