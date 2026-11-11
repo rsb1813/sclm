@@ -13,7 +13,12 @@ from rich.console import Console
 
 from scripts.generate import load_runtime
 
-from sclm import CKPT
+from sclm import CKPT, CODES, MODEL
+
+V4 = MODEL == "v4"  # DeepSeek-V4-Flash-0731: upstream's encoding module instead of a chat template
+EFFORTS = ("low", "high", "max") if V4 else ("low", "medium", "high", "max")
+# the model cards' sampling: temperature 1.0, and top_p 0.95 (V4.1) or 1.0 outside agentic use (V4-Flash-0731)
+TOP_P = 1.0 if V4 else 0.95
 
 HELP = """[bold]명령[/]
   /?, /help              이 도움말
@@ -22,16 +27,17 @@ HELP = """[bold]명령[/]
   /show                  지금 설정과 문맥 사용량
   /think, /nothink       생각 과정을 쓸지 (다음 답부터)
   /showthink, /hidethink 생각 과정을 펼쳐 보일지, 한 줄로 접을지 (기본: 접음)
-  /effort <low|medium|high|max>   생각의 깊이 (새 문맥부터 적용)
+  /effort <{efforts}>   생각의 깊이 (새 문맥부터 적용)
   /system <글>           시스템 프롬프트 (새 문맥부터 적용)
   /temperature <수>      기본 1.0 (모델 공식값). 0이면 가장 확률 높은 토큰만 고르는데, 같은 말을 되풀이하기 쉬움
-  /top_p <수>            temperature가 0보다 클 때 쓰는 누적 확률 (기본 0.95)
+  /top_p <수>            temperature가 0보다 클 때 쓰는 누적 확률 (기본 {top_p})
   /num_predict <수>      답 하나의 최대 토큰 수 (기본 2048)
   /wait-share <수>       속도 옵션 (손실): 0이면 정확 (기본), 0.25면 가벼운 SSD expert를 기다리지 않음
   /topk <수>             속도 옵션 (손실): 토큰마다 계산할 expert 수. 0이면 여섯 개 모두 (기본), 5면 조금 더 빠르고 4부터는 품질이 눈에 띄게 떨어짐
   /verbose, /quiet       답 뒤에 속도를 보일지
 [bold]입력[/]
-  \"\"\"로 시작하면 여러 줄을 쓸 수 있고, \"\"\"로 끝냅니다. 답이 나오는 중에 Ctrl+C를 누르면 멈춥니다."""
+  \"\"\"로 시작하면 여러 줄을 쓸 수 있고, \"\"\"로 끝냅니다. 답이 나오는 중에 Ctrl+C를 누르면 멈춥니다.""".replace(
+    "{efforts}", "|".join(EFFORTS)).replace("{top_p}", f"{TOP_P:g}")
 
 
 class ContextFull(Exception):
@@ -68,7 +74,7 @@ class Session:
         self.tok, self.decoder, self.max_seq_len = tok, decoder, max_seq_len
         self.eos = tok.eos_token_id
         self.think_start, self.think_end = tok.convert_tokens_to_ids("<think>"), tok.convert_tokens_to_ids("</think>")
-        self.system, self.think, self.effort = "", True, "high"
+        self.system, self.think, self.effort = "", True, "low" if V4 else "high"  # V4-Flash-0731's own default is low
         self.clear()
 
     def clear(self) -> None:
@@ -79,8 +85,18 @@ class Session:
         what the template puts after it."""
         kw = {"thinking_mode": "thinking" if self.think else "chat", "reasoning_effort": self.effort}
         user = {"role": "user", "content": message}
+        first = ([{"role": "system", "content": self.system}] if self.system else []) + [user]
+        if V4:
+            import sclm.upstream  # noqa: F401  (puts the model's folder on sys.path)
+            from encoding_dsv4 import encode_messages
+
+            if self.pos == 0:
+                return self.tok.encode(encode_messages(first, **kw), add_special_tokens=False)
+            # after an earlier exchange the module writes only the new turn; the effort's text stands at the very start
+            earlier = [{"role": "user", "content": ""}, {"role": "assistant", "content": ""}]
+            return [self.eos] + self.tok.encode(encode_messages([user], kw["thinking_mode"], context=earlier), add_special_tokens=False)
         if self.pos == 0:
-            messages = ([{"role": "system", "content": self.system}] if self.system else []) + [user]
+            messages = first
             return self.tok.encode(self.tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kw))
         a, b = "\x02A\x02", "\x02B\x02"  # stand-ins for an earlier exchange: the template's text after it is wanted
         text = self.tok.apply_chat_template([{"role": "user", "content": a}, {"role": "assistant", "content": b}, user],
@@ -170,7 +186,7 @@ def command(line: str, session: Session, cache, opts: dict, console: Console) ->
             session.think = key == "think"
         elif key in ("showthink", "hidethink"):
             opts["showthink"] = key == "showthink"
-        elif key == "effort" and value in ("low", "medium", "high", "max"):
+        elif key == "effort" and value in EFFORTS:
             session.effort = value
             if session.pos:
                 console.print("[grey62]/clear 뒤부터 적용됩니다.[/]")
@@ -252,9 +268,9 @@ def reply(line: str, session: Session, opts: dict, console: Console) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100",
-                    help=r"the CPU tier's codes (C:\models\sclm-codes\tier20p02 with --wait-share 0.25: twice as fast, "
-                    "but its replies lose the thread)")
+    ap.add_argument("--codes", default=CODES, type=lambda v: None if v == "none" else v,
+                    help=r"the CPU tier's codes; none: every expert original. (V4.1: C:\models\sclm-codes\tier20p02 with "
+                    "--wait-share 0.25 is twice as fast, but its replies lose the thread)")
     ap.add_argument("--slots", type=int, default=320, help="original experts the VRAM cache keeps")
     ap.add_argument("--lam", type=float, default=0.1, help="cache score decay per token")
     ap.add_argument("--threads", type=int, default=8, help="CPU threads of the RAM tier")
@@ -280,7 +296,7 @@ def main() -> None:
         tok, cache, decoder, info = load_runtime(cli, background=28)  # enough for read-ahead and for wait-share later
     # The model's card samples at temperature 1.0 and top_p 0.95. Taking the likeliest token every time (0, the
     # default at first, for runs that can be compared) let a reply fall into a loop it never left.
-    opts = {"temperature": 1.0, "top_p": 0.95, "num_predict": 2048, "verbose": True, "showthink": False}
+    opts = {"temperature": 1.0, "top_p": TOP_P, "num_predict": 2048, "verbose": True, "showthink": False}
     session = Session(tok, decoder, cli.max_seq_len)
     console.print(f"\n[bold]sclm chat[/] · {os.path.basename(cli.ckpt)} · VRAM {info['allocated_gib']:.1f}GiB, RAM 부호 "
                   f"{info['codes_gib']:.1f}GiB, RAM 캐시 {cli.ram_cache}개\n[grey62]{settings(session, cache, opts)}\n"

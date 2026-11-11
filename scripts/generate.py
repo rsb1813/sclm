@@ -8,7 +8,7 @@ import torch
 from transformers import AutoTokenizer
 
 from scripts import status
-from sclm import CKPT, DATA
+from sclm import CKPT, CODES, DATA
 from sclm import core, host
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import VRAM_MARGIN, load_args
@@ -66,7 +66,8 @@ def load_runtime(cli, background: int | None = None) -> tuple:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100")
+    ap.add_argument("--codes", default=CODES, type=lambda v: None if v == "none" else v,
+                    help="directory of the layers' code files; none: every routed expert original (the lossless model)")
     ap.add_argument("--slots", type=int, default=370, help="original experts the VRAM cache keeps")
     ap.add_argument("--lam", type=float, default=0.1, help="cache score decay per token")
     ap.add_argument("--threads", type=int, default=8, help="CPU threads of the RAM tier")

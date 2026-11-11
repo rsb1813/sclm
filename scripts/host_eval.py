@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from sclm import CKPT, DATA
+from sclm import CKPT, CODES, DATA
 from sclm import core, host
 from sclm.checkpoint import Checkpoint
 from sclm.layerwise import VRAM_MARGIN, load_args
@@ -21,7 +21,8 @@ CHUNK = 256  # positions per entry of eval_ref.pt
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100")
+    ap.add_argument("--codes", default=CODES, type=lambda v: None if v == "none" else v,
+                    help="directory of the layers' code files; none: every routed expert original (the lossless model)")
     ap.add_argument("--slots", type=int, default=320)
     ap.add_argument("--lam", type=float, default=0.1)
     ap.add_argument("--threads", type=int, default=8)
@@ -49,7 +50,7 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(cli.ckpt)
     ck = Checkpoint(cli.ckpt)
     args = load_args(max_batch_size=1, max_seq_len=max(1024, cli.tokens), **host.TEXT_ONLY)
-    net = host.build_net(args, tok)
+    net = host.build_net(args) if host.V4 else host.build_net(args, tok)
     host.load_checkpoint_(net, ck)
     cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam,
                                background=(12 if cli.wait_share else 0) + (16 if cli.guess else 0))
