@@ -2,7 +2,7 @@
 
 ## 지금
 - **모델 전환 중: DeepSeek-V4-Flash-0731** (사용자 결정 2026-11-11 밤, "이번엔 속도, 품질 2개 신경써"). 진행은 아래 "V4-Flash-0731 전환" 절
-- 지금 하는 일: 원본 다운로드(167GB, `C:\models\DeepSeek-V4-Flash-0731`, 리비전 7872f01b)와 포팅 전 확인 세 가지
+- 지금까지: 원본 다운로드 완료, 포팅 전 확인 세 가지 통과, 공식 코드가 우리 커널 위에서 실제 가중치로 돌고 perplexity 정상. 다음은 transformers 구현과의 층 단위 대조, 그다음 무손실 런타임
 - 그동안 쓸 수 있는 것: `chat.bat` (V4.1 Flash, 순정 설정: tier20v100, 정확 경로, temperature 1.0). 빠른 설정 tier20p02는 긴 추론에서 원본과 크게 어긋나는 것이 확인됨 (같은 대화에서 KL 0.71, 첫 선택 일치 73%; tier20v100은 0.15, 85%)
 - 열린 문제: 순정(tier20v100)에서도 사용자가 이상을 봤는데 출력과 원인을 아직 모름. 채팅 계층(인코딩, 다중 턴, 샘플링)이 원인이면 새 모델에도 따라오므로 전환 작업의 확인 ③과 무손실 런타임 대조로 닫는다
 - V4.1의 원본과 부호(tier20v100 64GB, tier20p02 44GB)는 지우지 않음 (사용자 결정 사항)
@@ -10,14 +10,15 @@
 
 ## V4-Flash-0731 전환
 순서의 원칙: 양자화보다 먼저 모든 expert를 원본으로 쓰는 무손실 런타임을 세워, 포팅 버그와 양자화 손실을 가른다.
-- [ ] 원본 다운로드 완료 확인 (HF API의 파일 수 74개와 크기 166.9GB로 대조)
+- [x] 원본 다운로드 완료: 74개 파일, 166.9GB, HF API의 파일별 크기와 일치 (`C:\models\DeepSeek-V4-Flash-0731`, 리비전 7872f01b)
 - [x] 확인 ① 실제 예산 (헤더를 원격으로 읽음): expert 하나 13.37MB × 11,008개 = 147.2GB, RAM 65GB에 전부 부호면 평균 1.88bpw. 상시 경로 VRAM 약 7.2GiB(어텐션 4.6GB, 공유 expert 1.1GB, 압축기 0.5GB, 인덱서 0.3GB, head 1.06GB), VRAM 슬롯 약 540개. 토큰당 routed 원본 3.45GB(258회). 추정과 일치
 - [x] 확인 ② transformers 5.22.2에 `DeepseekV4ForCausalLM`, 이 체크포인트용 이름 대응표(`conversion_mapping.py`)와 FP8 처리기가 있음. FP8 활성 양자화 흉내 여부는 층 단위 대조에서 확인. 기준은 공식 `inference/`
 - [x] 확인 ③ 토크나이저: vocab·merges·정규화가 V4.1과 같고 공통 특수 토큰의 id도 같음(다른 것은 특수 토큰 9개: V4.1의 `<｜System｜>` 128799가 여기서는 DSpark 잡음 토큰). 일반 글의 토큰 id가 같으므로 calib·eval 토큰 재사용 가능. 채팅 인코딩은 다름: `reasoning_effort` 기본 "low"(접두 없음), high·max는 글머리 접두, 이전 턴의 생각은 지우는 것이 기본(`drop_thinking`). `generation_config.json`은 temperature 1.0, top_p 1.0. 채팅을 옮길 때 `encoding_dsv4.py`의 테스트 벡터로 대조할 것 [남음]
 - [x] 레퍼런스 코드: 공식 `inference/model.py`를 수정 없이 `sclm/reference_v4/`에 두고, 커널은 `sclm/reference/kernel.py`(순수 PyTorch)를 같이 씀(호출 방식이 같음). `SCLM_MODEL=v4`로 고름(프로세스당 모델 하나). Hadamard 회전은 직접 쓴 `fast_hadamard_transform.py`. 작은 무작위 모델이 프리필과 디코드로 돌아감 (`SCLM_MODEL=v4 pytest tests/test_v4_model_small.py`)
 - [ ] 열린 항목: 비율 4 압축 층에서 앞 16토큰 안에서 디코드를 시작하면 프리필과의 일치도가 0.975 (32 이후 시작은 0.998, 창만 쓰면 0.9996). 주목 위치 집합은 같아 반올림 증폭으로 보지만 첫 어긋남을 추적하지 않았음
-- [ ] 레퍼런스 실행기: 층 단위 실행기와 체크포인트 읽기를 새 모델에 맞춤 (이름은 `layers.N.…` 그대로, expert는 I8로 저장된 FP4, 활성 양자화 묶음 128)
-- [ ] 레퍼런스 검증: 실제 가중치 perplexity, transformers 구현과 층 단위 대조
+- [x] 레퍼런스 실행기: 층 단위 실행기가 새 모델을 돌림 (`SCLM_MODEL=v4`). 실제 층 0·2·3이 공식 모듈에 엄격 적재됨(해시 gate, 비율 4, 비율 128). 층 하나 3.35GiB, 43층 통과에 약 95초
+- [x] 레퍼런스 검증 1: 원본 가중치 perplexity 영어 2.31 / 한국어 2.61 / 코드 1.34 (`SCLM_MODEL=v4 python -m scripts.ppl --ckpt C:\models\DeepSeek-V4-Flash-0731`; 모두 128토큰 미만이라 창 경로만 검증됨)
+- [ ] 레퍼런스 검증 2: 긴 문맥(압축 어텐션 경로) perplexity, transformers 구현(`DeepseekV4DecoderLayer`, 이름 대응은 `conversion_mapping.py`)과 층 단위 대조
 - [ ] 무손실 런타임: 모든 expert를 원본(SSD·RAM 수준·VRAM 슬롯)으로 두는 호스트. 새 블록 구조에 맞춤 (앞 3층 해시 라우팅, 층별 압축 어텐션 비율 4·128과 겹치는 창, 층마다의 hyper-connection). 레퍼런스와 logit 대조
 - [ ] 품질 기준 고정 (양자화 전, 사용자 확인): 무손실 런타임이 쓴 긴 thinking 글과 양자화 런타임이 스스로 쓴 글 양쪽에서 KL, 첫 선택 일치, "원본은 2% 미만인데 30% 넘게 확신하는 토큰 수"
 - [ ] 라우팅 기록과 계층 배분 (품질·속도 두 목표)
