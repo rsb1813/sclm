@@ -1,0 +1,45 @@
+{
+ "tokens": 16128,
+ "ssd_calls_per_token": 113.32696533203125,
+ "reads_per_token": 20.28720238095238,
+ "bypassed_per_token": 1.9331597222222223,
+ "ram_0": {
+  "ram_gb": 0.0,
+  "fifo": 20.28720238095238,
+  "fifo_saved_ms": 0.0,
+  "fifo_bypass_hits": 0.0,
+  "lru": 20.28720238095238,
+  "lru_saved_ms": 0.0,
+  "lru_bypass_hits": 0.0,
+  "evicted": 20.28720238095238,
+  "evicted_saved_ms": 0.0,
+  "evicted_bypass_hits": 0.0,
+  "one_cache": 20.28720238095238
+ },
+ "ram_1200": {
+  "ram_gb": 22.560000000000002,
+  "fifo": 5.306485615079365,
+  "fifo_saved_ms": 17.61732291666667,
+  "fifo_bypass_hits": 0.92401123046875,
+  "lru": 4.206473214285714,
+  "lru_saved_ms": 18.9109375,
+  "lru_bypass_hits": 1.005126953125,
+  "evicted": 3.1351686507936507,
+  "evicted_saved_ms": 20.170791666666666,
+  "evicted_bypass_hits": 1.26605224609375,
+  "one_cache": 2.8236607142857144
+ },
+ "ram_2000": {
+  "ram_gb": 37.6,
+  "fifo": 2.497829861111111,
+  "fifo_saved_ms": 20.920302083333336,
+  "fifo_bypass_hits": 1.39324951171875,
+  "lru": 1.7379092261904763,
+  "lru_saved_ms": 21.813968750000004,
+  "lru_bypass_hits": 1.5115966796875,
+  "evicted": 1.4816468253968254,
+  "evicted_saved_ms": 22.115333333333332,
+  "evicted_bypass_hits": 1.5679931640625,
+  "one_cache": 1.263578869047619
+ }
+}
