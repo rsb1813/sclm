@@ -222,13 +222,13 @@ def main() -> None:
     ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
                     "the SSD a layer early (0: none)")
     ap.add_argument("--ram-cache", type=int, default=-1, help="experts kept in RAM after they leave the VRAM cache, "
-                    "18.8 MB each of pinned memory (default: what fits, up to 256, leaving 3 GiB free)")
+                    "18.8 MB each of pinned memory (default: what fits, up to 1200, leaving 3 GiB free)")
     cli = ap.parse_args()
     cli.ram_share, cli.topk = 0.0, 0
     if cli.ram_cache < 0:
         used, total = status.ram()
         codes = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
-        cli.ram_cache = max(0, min(256, int((total - used - codes - 3.0) * GIB / 18.8e6)))
+        cli.ram_cache = max(0, min(1200, int((total - used - codes - 3.0) * GIB / 18.8e6)))
     console = Console()
     console.print("[grey62]모델을 올리는 중입니다 (약 20초)…[/]")
     tok, cache, decoder, info = load_runtime(cli, background=28)  # enough for read-ahead and for wait-share later
