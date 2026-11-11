@@ -6,6 +6,7 @@ import ctypes
 import io
 import os
 import signal
+import threading
 import time
 
 import torch
@@ -70,7 +71,7 @@ class Session:
     """One conversation as a single token sequence in the decoder: a turn is appended to it. V4.1: nothing is fed
     twice, so the model's thinking stays in the context (the template's drop_thinking=false form). V4-Flash-0731:
     an earlier reply's thinking leaves the context, as upstream's encoding does by default: before the next turn the
-    decoder is taken back to where the thinking began and the answer is fed again without it."""
+    decoder is taken back to where the thinking began and the answer is fed again without it (settle)."""
 
     def __init__(self, tok, decoder, max_seq_len: int):
         self.tok, self.decoder, self.max_seq_len = tok, decoder, max_seq_len
@@ -82,7 +83,8 @@ class Session:
 
     def clear(self) -> None:
         self.pos, self.logits = 0, None  # tokens fed so far, and the logits after the last of them
-        self.redo = None  # (position where the last reply's thinking began, the decoder's state there, the answer's tokens)
+        self.redo = None  # (position where the last reply's thinking began, the decoder's state there), until settle() goes back
+        self.owed = []  # what settle() still has to feed: "</think>" in the thinking's place, then the answer's tokens
 
     def turn_ids(self, message: str) -> list:
         """The tokens a user message adds: the whole prompt at the start, later the end of the assistant's turn and
@@ -111,19 +113,27 @@ class Session:
         self.logits = self.decoder.logits(torch.tensor([[token]]), self.pos)
         self.pos += 1
 
+    def settle(self, stop=lambda: False) -> None:
+        """Takes the last reply's thinking out of the context: the decoder goes back to where the thinking began, and
+        "</think>" and the answer are fed again, at the speed of decoding. ask() does it before a turn; the chat
+        starts it as soon as a reply ends, while the next message is read. stop() is asked between tokens, and what
+        is left is done by the next call."""
+        if self.redo is not None:
+            pos, state = self.redo
+            self.decoder.restore(state, self.pos - pos)
+            self.pos, self.redo = pos, None
+        while self.owed and not stop():
+            self._feed(self.owed.pop(0))
+
     def ask(self, message: str, max_new: int, temperature: float, top_p: float, on_text, stop=lambda: False) -> dict:
         """Feeds the user's message and generates the reply, handing each piece of text to on_text(kind, text) with
         kind "think" or "answer" (an empty text marks the change from one to the other). stop() is asked between
         tokens, and a reply that runs into a loop (looping) ends there. Returns the counts and times of the turn."""
-        ids, redo = self.turn_ids(message), self.redo
-        if redo is not None:  # the last reply without its thinking: "</think>" in its place, then the answer
-            ids = [self.think_end] + redo[2] + ids
-        if (redo[0] if redo else self.pos) + len(ids) + 1 >= self.max_seq_len:
+        ids, owed = self.turn_ids(message), len(self.owed)
+        if (self.redo[0] if self.redo else self.pos) + owed + len(ids) + 1 >= self.max_seq_len:
             raise ContextFull
         t0 = time.perf_counter()
-        if redo is not None:
-            self.decoder.restore(redo[1], self.pos - redo[0])
-            self.pos, self.redo = redo[0], None
+        self.settle()
         mark = None
         for i, token in enumerate(ids):
             if self.drop and i == len(ids) - 1 and token == self.think_start:
@@ -151,8 +161,8 @@ class Session:
                 on_text(kind, text[len(sent):])
                 sent = text
         if mark is not None:  # a reply cut off in its thinking leaves an empty answer
-            self.redo = (*mark, said[said.index(self.think_end) + 1:] if self.think_end in said else [])
-        return {"prompt_tokens": len(ids), "prompt_s": t1 - t0, "tokens": new, "seconds": time.perf_counter() - t1,
+            self.redo, self.owed = mark, [self.think_end] + (said[said.index(self.think_end) + 1:] if self.think_end in said else [])
+        return {"prompt_tokens": owed + len(ids), "prompt_s": t1 - t0, "tokens": new, "seconds": time.perf_counter() - t1,
                 "looped": looped}
 
 
@@ -317,6 +327,11 @@ def main() -> None:
                   f"{info['codes_gib']:.1f}GiB, RAM 캐시 {cli.ram_cache}개\n[grey62]{settings(session, cache, opts)}\n"
                   f"/? 도움말 · /show 설정 보기 · /bye 끝내기[/]\n", highlight=False)
     while True:
+        # the last reply's thinking leaves the context while the next message is read: after a long answer that takes
+        # a minute, which the turn would otherwise begin with
+        halt = threading.Event()
+        ahead = threading.Thread(target=session.settle, args=(halt.is_set,))
+        ahead.start()
         try:
             line = read_message(">>> ")
         except EOFError:
@@ -324,6 +339,9 @@ def main() -> None:
         except KeyboardInterrupt:
             print()
             continue
+        finally:
+            halt.set()
+            ahead.join()
         if line.startswith("/"):
             if not command(line, session, cache, opts, console):
                 break

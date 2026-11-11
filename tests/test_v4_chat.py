@@ -38,8 +38,11 @@ class Decoder:
         return out
 
 
+# ahead: how many tokens of the earlier reply are fed again before the next message comes (the chat does that while it
+# reads the message; None: not started)
+@pytest.mark.parametrize("ahead", [None, 0, 3, 1000])
 @pytest.mark.parametrize("think,effort,system", [(True, "low", ""), (True, "high", "You answer briefly."), (False, "low", "")])
-def test_the_chat_feeds_what_upstream_encodes(think, effort, system):
+def test_the_chat_feeds_what_upstream_encodes(think, effort, system, ahead):
     from transformers import AutoTokenizer
 
     import sclm.upstream  # noqa: F401
@@ -59,6 +62,9 @@ def test_the_chat_feeds_what_upstream_encodes(think, effort, system):
     for n, (question, reasoning, answer) in enumerate(turns):
         decoder.reply = (enc(reasoning) + [session.think_end] if think else []) + enc(answer)
         decoder.skip = 1 if think and n else 0
+        if ahead is not None:
+            left = [ahead]
+            session.settle(lambda: left.__setitem__(0, left[0] - 1) or left[0] < 0)
         session.ask(question, 500, 0.0, 1.0, lambda kind, text: None)
         messages += [{"role": "user", "content": question},
                      {"role": "assistant", "content": answer, **({"reasoning_content": reasoning} if think else {})}]
