@@ -271,7 +271,7 @@ def main() -> None:
     ap.add_argument("--codes", default=CODES, type=lambda v: None if v == "none" else v,
                     help=r"the CPU tier's codes; none: every expert original. (V4.1: C:\models\sclm-codes\tier20p02 with "
                     "--wait-share 0.25 is twice as fast, but its replies lose the thread)")
-    ap.add_argument("--slots", type=int, default=320, help="original experts the VRAM cache keeps")
+    ap.add_argument("--slots", type=int, default=400 if V4 else 320, help="original experts the VRAM cache keeps")
     ap.add_argument("--lam", type=float, default=0.1, help="cache score decay per token")
     ap.add_argument("--threads", type=int, default=8, help="CPU threads of the RAM tier")
     ap.add_argument("--max-seq-len", type=int, default=4096, help="tokens a conversation can hold")
@@ -284,7 +284,7 @@ def main() -> None:
     ap.add_argument("--touch", type=int, default=8, help="guessed experts of the next layer whose CPU-tier codes are read "
                     "into the CPU's cache while the device computes the attention before them (0: none)")
     ap.add_argument("--ram-cache", type=int, default=-1, help="experts kept in RAM after they leave the VRAM cache, "
-                    "18.8 MB each of pinned memory (default: what fits, up to 1200, leaving 3 GiB free)")
+                    "pinned memory, 18.8 MB each (V4-Flash-0731: 13.4 MB) (default: what fits, up to 1200, leaving 3 GiB free)")
     cli = ap.parse_args()
     cli.ram_share = 0.0
     console = Console()

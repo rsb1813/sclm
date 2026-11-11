@@ -93,9 +93,15 @@ def main() -> None:
 
     tok, cache, decoder, out = load_runtime(cli)
 
-    text = cli.prompt if cli.raw else tok.apply_chat_template([{"role": "user", "content": cli.prompt}],
-                                                              add_generation_prompt=True, tokenize=False)
-    ids = tok.encode(text)
+    if host.V4 and not cli.raw:  # upstream's encoding module writes the prompt (no thinking: a short, comparable run)
+        import sclm.upstream  # noqa: F401  (puts the model's folder on sys.path)
+        from encoding_dsv4 import encode_messages
+
+        ids = tok.encode(encode_messages([{"role": "user", "content": cli.prompt}], "chat"), add_special_tokens=False)
+    else:
+        text = cli.prompt if cli.raw else tok.apply_chat_template([{"role": "user", "content": cli.prompt}],
+                                                                  add_generation_prompt=True, tokenize=False)
+        ids = tok.encode(text)
     t0 = time.perf_counter()
     for pos, token in enumerate(ids):  # a token at a time: a batched prefill runs upstream's kernels, which widen
         logits = decoder.logits(torch.tensor([[token]]), pos)  # every weight and need about 1 GiB more VRAM
