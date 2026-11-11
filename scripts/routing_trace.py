@@ -18,9 +18,12 @@ DEVICE = "cuda"
 RECALL_K = (6, 12, 24)
 
 
-def predict(block, raw: torch.Tensor) -> torch.Tensor:
-    """Top-24 experts layer `block` would pick if its FFN input were ffn_norm(raw); [n, 24]."""
+def predict(block, raw: torch.Tensor) -> torch.Tensor | None:
+    """Top-24 experts layer `block` would pick if its FFN input were ffn_norm(raw); [n, 24]. None for a layer that
+    picks by the token id (V4-Flash-0731's hash layers): there the token gives the experts exactly."""
     gate = block.ffn.gate
+    if getattr(gate, "hash", False):
+        return None
     assert gate.score_func == "sqrtsoftplus"
     x = block.ffn_norm(raw).flatten(0, -2)
     scores = F.softplus(F.linear(x.float(), gate.weight.float())).sqrt() + gate.bias

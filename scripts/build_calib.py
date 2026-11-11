@@ -9,7 +9,7 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from sclm import CKPT, DATA
+from sclm import CKPT, DATA, MODEL
 
 SEQ_LEN = 2048
 DOC_MAX = 1024  # cap tokens per document so one long document cannot fill a category
@@ -38,7 +38,12 @@ def docs(category: str, tok):
     def text(t: str):
         return [tok.bos_token_id] + tok.encode(t, add_special_tokens=False) + [tok.eos_token_id]
 
-    def chat(messages):
+    def chat(messages, thinking: bool = False):
+        if MODEL == "v4":  # no chat template in the tokenizer: upstream's encoding module writes the prompt text
+            import sclm.upstream  # noqa: F401  (puts the model's folder on sys.path)
+            from encoding_dsv4 import encode_messages
+
+            return tok.encode(encode_messages(messages, thinking_mode="thinking" if thinking else "chat"), add_special_tokens=False)
         return list(tok.apply_chat_template(messages, tokenize=True)["input_ids"])
 
     if category == "en_web":
@@ -68,6 +73,11 @@ def docs(category: str, tok):
                 yield text(f.read())
     elif category == "math":
         for r in stream("openai/gsm8k", "main"):
+            if MODEL == "v4":  # the worked solution as the reasoning, the result as the answer: thinking-format text
+                steps, _, result = r["answer"].partition("####")
+                yield chat([{"role": "user", "content": r["question"]},
+                            {"role": "assistant", "reasoning_content": steps.strip(), "content": result.strip()}], thinking=True)
+                continue
             yield chat([{"role": "user", "content": r["question"]}, {"role": "assistant", "content": r["answer"]}])
     elif category == "tools":
         for r in stream("glaiveai/glaive-function-calling-v2"):
