@@ -44,3 +44,17 @@ def test_hash_ids_stay_in_their_bucket(hash_state):
     assert ((hashes >= lo) & (hashes < lo + primes)).all()
     for li, rows in enumerate(args.engram_num_embeddings):
         assert hashes[..., li, :].max() < rows
+
+
+def test_host_hash_gives_the_rows_of_upstream(hash_state):
+    from sclm.host import HostHash
+
+    args, layout, state, tok = hash_state
+    ids = tok.encode("def merge(a, b): return sorted(a + b)  # 두 리스트를 합친다. The quick brown fox, twice: the quick brown fox.")[:60]
+    want = state(torch.tensor([ids], device="cuda"), 0)[0].cpu()  # [L, engram layers, columns]
+    fast = HostHash(state)
+    fast.put(ids[:5], 0)  # a prefill, then a token at a time
+    for pos in range(5, len(ids)):
+        assert fast.rows(ids[pos], pos) == want[pos].tolist(), pos
+    # a new sequence: nothing of the last one is looked back at
+    assert fast.rows(ids[7], 0) == state(torch.tensor([[ids[7]]], device="cuda"), 0)[0, 0].cpu().tolist()

@@ -160,6 +160,13 @@ __declspec(dllexport) int sclm_reader_submit(SclmReader* R, int file, uint64_t o
     return int(head);
 }
 
+// sclm_reader_submit for n reads in one call: read i is bytes[i] at offsets[i] of files[i] into dsts[i], and heads[i]
+// is where its first byte lands. (The engram rows of a token are a hundred reads.)
+__declspec(dllexport) void sclm_reader_submit_many(SclmReader* R, int n, const int* files, const uint64_t* offsets,
+                                                   const uint64_t* bytes, uint8_t* const* dsts, int ticket, int* heads) {
+    for (int i = 0; i < n; ++i) heads[i] = sclm_reader_submit(R, files[i], offsets[i], bytes[i], dsts[i], ticket);
+}
+
 // How many chunks failed since the last call that reported them (nothing is waited for).
 __declspec(dllexport) int sclm_reader_poll(SclmReader* R) {
     std::lock_guard lock(R->mutex);

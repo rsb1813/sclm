@@ -35,6 +35,7 @@ def _dll():
     lib.sclm_reader_new.argtypes = [C.POINTER(C.c_wchar_p), C.c_int, C.c_int]
     lib.sclm_reader_free.argtypes = [C.c_void_p]
     lib.sclm_reader_submit.argtypes = [C.c_void_p, C.c_int, C.c_uint64, C.c_uint64, C.c_void_p, C.c_int]
+    lib.sclm_reader_submit_many.argtypes = [C.c_void_p, C.c_int] + [C.c_void_p] * 4 + [C.c_int, C.c_void_p]
     lib.sclm_reader_poll.argtypes = [C.c_void_p]
     lib.sclm_reader_open.argtypes = [C.c_void_p, C.c_int]
     lib.sclm_reader_wait_ticket.argtypes = [C.c_void_p, C.c_int]
@@ -152,6 +153,14 @@ class Reader:
         others on the SSD."""
         assert dst.ctypes.data % PAGE == 0 and dst.nbytes >= nbytes + 2 * PAGE
         return self.lib.sclm_reader_submit(self.handle, file, offset, nbytes, dst.ctypes.data, ticket)
+
+    def submit_many(self, files: np.ndarray, offsets: np.ndarray, sizes: np.ndarray, dsts: np.ndarray, ticket: int = 0) -> np.ndarray:
+        """submit() for several reads in one call: files (int32), offsets, sizes and the addresses dsts (uint64) of
+        page-aligned buffers with sizes[i] + 2 pages each. Returns where in each buffer the first byte lands."""
+        heads = np.empty(len(files), np.int32)
+        self.lib.sclm_reader_submit_many(self.handle, len(files), files.ctypes.data, offsets.ctypes.data, sizes.ctypes.data,
+                                         dsts.ctypes.data, ticket, heads.ctypes.data)
+        return heads
 
     def wait(self, ticket: int | None = None) -> None:
         """Waits for every read submitted, or only for those submitted under the ticket."""

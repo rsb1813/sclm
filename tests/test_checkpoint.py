@@ -94,6 +94,10 @@ def test_engram_rows_read_directly_match_the_mapped_table():
         idx = torch.randint(0, w.shape[0], shape, generator=g)
         idx[0, 0, 1] = idx[0, 0, 0]  # a repeated row
         assert torch.equal(rows(idx.cuda()), MappedEngramEmbedding(w, s)(idx.cuda()))
+        # a decode token gives the row numbers as a list, started ahead and decoded on the host: the same values
+        numbers = idx.reshape(-1).tolist()
+        rows.start(numbers, "cuda")
+        assert torch.equal(rows(numbers).view(*shape, -1), MappedEngramEmbedding(w, s)(idx.cuda()))
 
 
 @needs_layer0

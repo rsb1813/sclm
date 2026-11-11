@@ -282,6 +282,8 @@ class EngramRows(torch.nn.Module):
     needs a few dozen rows scattered over a file of about 100 GB; mapping the file and faulting them in took 3 ms a
     layer. Same output as upstream ParallelEngramEmbedding for one rank."""
 
+    tables = None  # the fp32 value of every E4M3 byte and of every E8M0 byte
+
     def __init__(self, ck: Checkpoint, prefix: str, block_size: int = 32):
         super().__init__()
         (weight, self.at_w, n_w), (scale, self.at_s, n_s) = ck.extent([prefix + "weight"]), ck.extent([prefix + "scale"])
@@ -291,24 +293,35 @@ class EngramRows(torch.nn.Module):
         self.room = self.dim + 2 * core.PAGE + -self.dim % core.PAGE  # a row's read, start rounded down and end up
         self.buf = core.pages(0)
         self.started = None  # (the rows, where they land, the device for the result) of reads start() has under way
+        self.plan = None  # start()'s constant arguments for the number of rows it was last given
+        self.pin = self.bits = self.dev = None  # decoded()'s host buffer (page-locked), its bits, the device's copy
 
-    def start(self, indices: torch.Tensor, device=None) -> None:
-        """Starts reading the rows forward(indices) returns. A decode token knows them before its first layer, and
-        the layers before the engram's hide the read (0.85 ms). device: where forward puts those rows (default:
-        where its indices are), so that the indices can stay on the host."""
-        rows, room = indices.reshape(-1).tolist(), self.room
+    def start(self, indices, device=None) -> None:
+        """Starts reading the rows forward(indices) returns (a tensor, or a list of row numbers). A decode token
+        knows them before its first layer, and the layers before the engram's hide the read (0.85 ms). device: where
+        forward puts those rows (default: where its indices are), so that the indices can stay on the host."""
+        rows, room = indices if isinstance(indices, list) else indices.reshape(-1).tolist(), self.room
         if self.started is not None:  # reads nobody took are still landing in the buffer
             self.reader.wait()
-        if self.buf.nbytes < 2 * len(rows) * room:
-            self.buf = core.pages(2 * len(rows) * room)
-        at = []  # where each row's weights and scales land in the buffer
-        for i, r in enumerate(rows):
-            w, s = self.buf[2 * i * room:(2 * i + 1) * room], self.buf[(2 * i + 1) * room:(2 * i + 2) * room]
-            at.append((2 * i * room + self.reader.submit(0, self.at_w + r * self.dim, self.dim, w),
-                       (2 * i + 1) * room + self.reader.submit(1, self.at_s + r * self.cols, self.cols, s)))
-        self.started = (rows, at, device)
+        n = len(rows)
+        if self.buf.nbytes < 2 * n * room:
+            self.buf = core.pages(2 * n * room)
+        if self.plan is None or len(self.plan[0]) != 2 * n:  # of a row: its weights from file 0, its scales from file 1
+            self.plan = (np.tile(np.array([0, 1], np.int32), n), np.tile(np.array([self.dim, self.cols], np.uint64), n),
+                         np.arange(2 * n, dtype=np.uint64) * np.uint64(room))
+        files, sizes, at = self.plan
+        r, offsets = np.asarray(rows, np.uint64), np.empty(2 * n, np.uint64)
+        offsets[0::2], offsets[1::2] = self.at_w + r * np.uint64(self.dim), self.at_s + r * np.uint64(self.cols)
+        heads = self.reader.submit_many(files, offsets, sizes, at + np.uint64(self.buf.ctypes.data))
+        land = (at.astype(np.int64) + heads).tolist()  # where each row's weights and scales land in the buffer
+        self.started = (rows, list(zip(land[0::2], land[1::2])), device)
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, indices) -> torch.Tensor:
+        """The rows as upstream's embedding returns them (bf16 [*indices.shape, dim]). Given the list of row numbers
+        start() was given (a decode token), they are decoded on the host: [1, 1, rows, dim]."""
+        if isinstance(indices, list):
+            assert self.started is not None and self.started[0] == indices
+            return self.decoded().view(1, 1, len(indices), self.dim)
         if self.started is None or indices.is_cuda or self.started[0] != indices.reshape(-1).tolist():
             self.start(indices)  # other rows than the ones under way (which the reader still finishes)
         (_, at, device), self.started = self.started, None
@@ -318,3 +331,27 @@ class EngramRows(torch.nn.Module):
         s = torch.from_numpy(np.stack([self.buf[b:b + self.cols] for _, b in at])).to(device).view(torch.float8_e8m0fnu)
         values = (w.float().unflatten(-1, (-1, self.block_size)) * s.float().unsqueeze(-1)).flatten(-2)
         return values.to(torch.bfloat16).view(*indices.shape, -1)
+
+    def decoded(self) -> torch.Tensor:
+        """The rows start() is reading, as forward computes them but on the host and flat (bf16 [rows * dim]), sent
+        to the device without waiting. forward's two copies from pageable memory each wait for the device, and its
+        conversions are half a dozen small device operations; here a byte is a table lookup. The same values: an fp8
+        weight times a power-of-two scale is exact, and so is its bf16 unless it is subnormal (then it is rounded to
+        nearest even, as torch rounds)."""
+        (rows, at, device), self.started = self.started, None
+        self.reader.wait()
+        n = len(rows)
+        if self.pin is None or self.pin.numel() != n * self.dim:
+            if EngramRows.tables is None:
+                codes = torch.arange(256, dtype=torch.uint8)
+                EngramRows.tables = tuple(codes.view(t).float().numpy() for t in (torch.float8_e4m3fn, torch.float8_e8m0fnu))
+            self.pin = torch.empty(n * self.dim, dtype=torch.bfloat16, pin_memory=torch.device(device).type == "cuda")
+            self.bits = self.pin.view(torch.int16).numpy().view(np.uint16)
+            self.dev = torch.empty(n * self.dim, dtype=torch.bfloat16, device=device)
+        e4m3, e8m0 = EngramRows.tables
+        w = np.stack([self.buf[a:a + self.dim] for a, _ in at])
+        s = np.stack([self.buf[b:b + self.cols] for _, b in at])
+        u = (e4m3[w].reshape(n, self.cols, self.block_size) * e8m0[s][:, :, None]).reshape(-1).view(np.uint32)
+        self.bits[:] = (u + np.uint32(0x7fff) + ((u >> np.uint32(16)) & np.uint32(1))) >> np.uint32(16)
+        self.dev.copy_(self.pin, non_blocking=True)
+        return self.dev

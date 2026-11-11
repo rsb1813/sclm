@@ -1,9 +1,9 @@
 # Token-by-token decode on one device: upstream's Transformer with every block resident and its routed experts on two
 # tiers (sclm.tiered). PyTorch hosts the always-on path for now; the engine core computes the RAM tier and reads the SSD tier.
-import copy
 import os
 from functools import lru_cache
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -29,6 +29,36 @@ class HostEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.embedding(x.cpu(), self.weight).to(x.device)
+
+
+class HostHash:
+    """upstream NgramHashState (the engram rows of each position) for text tokens on the host, a token at a time, on
+    numpy integers: the same row numbers, without the thirty small tensor operations upstream spends on one token.
+    It has to be given every token of the sequence (put, or rows)."""
+
+    def __init__(self, state):
+        self.token_map, self.pad = state.token_map.cpu().numpy(), int(state.pad_id)
+        self.multipliers = state.multipliers.cpu().numpy()  # [engram layers, n-gram sizes]
+        self.primes, self.offsets = state.primes.cpu().numpy(), state.offsets.cpu().numpy()
+        self.seen = np.empty(state.cache.size(1), np.int64)  # the sequence's tokens in the compressed vocabulary
+        assert self.multipliers.dtype == self.primes.dtype == self.offsets.dtype == np.int64
+
+    def put(self, input_ids, start_pos: int) -> None:
+        """The tokens of positions start_pos .. (any tensor or list of ids)."""
+        ids = np.asarray(input_ids, np.int64).reshape(-1)
+        self.seen[start_pos:start_pos + len(ids)] = self.token_map[ids]
+
+    def rows(self, token: int, pos: int) -> list:
+        """[engram layer][column] row numbers of the token at position pos."""
+        self.seen[pos] = self.token_map[token]
+        n = self.multipliers.shape[1]
+        tokens = np.full(n, self.pad, np.int64)  # the token and the ones before it; padding before the sequence
+        back = min(n, pos + 1)
+        tokens[:back] = self.seen[pos - back + 1:pos + 1][::-1]
+        # the running XOR of the multiplied ids after i look-backs is the hash of the (i + 1)-gram, and each lands in
+        # the bucket range of its (n-gram size, head)
+        rolling = np.bitwise_xor.accumulate(tokens * self.multipliers, axis=1)
+        return ((rolling[:, 1:, None] % self.primes).reshape(len(rolling), -1) + self.offsets).tolist()
 
 
 class Bf16Head(nn.Module):
@@ -277,26 +307,26 @@ class Host:
         on_gpu = torch.device(device).type == "cuda"
         self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
         self.first_mix = None  # upstream's identity pre-mix of the first block, made once
-        # the n-gram hash on the CPU for decode(): the same integers, without some thirty small device operations a
-        # token. It is given every token of the sequence; net.engram_hash sees the ones upstream's forward runs.
-        self.hash = copy.deepcopy(net.engram_hash).cpu() if self.kernels and net.engram_hash is not None else None
+        # the n-gram hash on the host for decode(). It is given every token of the sequence; net.engram_hash sees
+        # the ones upstream's forward runs.
+        self.hash = HostHash(net.engram_hash) if self.kernels and net.engram_hash is not None else None
 
     def decode(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
         """upstream Transformer.forward for one text token (on the CPU) down to its logits: nothing is sampled
         from them."""
         net = self.net
-        hashes = self.hash(input_ids, start_pos) if self.hash is not None else None
-        if hashes is not None:
+        rows = self.hash.rows(int(input_ids), start_pos) if self.hash is not None else None
+        if rows is not None:
             for layer in net.layers:  # the rows are read while the layers before run
                 if layer.engram is not None:
-                    layer.engram.embed.start(hashes[:, :, layer.engram.layer_hash_index, :], self.device)
+                    layer.engram.embed.start(rows[layer.engram.layer_hash_index], self.device)
         h = net.embed(input_ids).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1)
         if self.first_mix is None:
             self.first_mix = m.make_identity_pre_mix(h, net.hc_mult)
         pre_mix = self.first_mix
         for layer in net.layers:
             if layer.engram is not None:
-                h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index, :])
+                h = layer.engram(h, rows[layer.engram.layer_hash_index])
             h, pre_mix = layer(h, start_pos, pre_mix, None)
         return net.head(net.norm(layer.hc_pre(h, pre_mix)))
 
@@ -314,7 +344,7 @@ class Host:
                 # the kernel path enters it only around upstream's index code (HostAttention)
                 return self.decode(input_ids.cpu(), start_pos)
             if self.hash is not None:
-                self.hash(input_ids.cpu(), start_pos)
+                self.hash.put(input_ids.cpu(), start_pos)
             with torch.device(self.device):  # upstream creates index tensors on the default device
                 return self.net(input_ids.to(self.device), start_pos)[1]
         finally:
