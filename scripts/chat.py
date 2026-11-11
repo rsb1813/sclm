@@ -8,7 +8,8 @@ import time
 import torch
 from rich.console import Console
 
-from scripts.generate import load_runtime
+from scripts import status
+from scripts.generate import GIB, load_runtime
 
 HELP = """[bold]명령[/]
   /?, /help              이 도움말
@@ -202,16 +203,20 @@ def main() -> None:
     ap.add_argument("--wait-share", type=float, default=0.0, help="lossy speed option at the start (/set wait-share changes it)")
     ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
                     "the SSD a layer early (0: none)")
-    ap.add_argument("--ram-cache", type=int, default=0, help="experts kept in RAM after they leave the VRAM cache, "
-                    "18.8 MB each of pinned memory (scripts/ram_cache.py)")
+    ap.add_argument("--ram-cache", type=int, default=-1, help="experts kept in RAM after they leave the VRAM cache, "
+                    "18.8 MB each of pinned memory (default: what fits, up to 256, leaving 3 GiB free)")
     cli = ap.parse_args()
     cli.ram_share, cli.topk = 0.0, 0
+    if cli.ram_cache < 0:
+        used, total = status.ram()
+        codes = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB
+        cli.ram_cache = max(0, min(256, int((total - used - codes - 3.0) * GIB / 18.8e6)))
     console = Console()
     console.print("[grey62]모델을 올리는 중입니다 (약 20초)…[/]")
     tok, cache, decoder, info = load_runtime(cli, background=28)  # enough for read-ahead and for wait-share later
     session, opts = Session(tok, decoder, cli.max_seq_len), {"temperature": 0.0, "top_p": 0.95, "num_predict": 2048, "verbose": True}
     console.print(f"\n[bold]sclm chat[/] · {os.path.basename(cli.ckpt)} · VRAM {info['allocated_gib']:.1f}GiB, RAM 부호 "
-                  f"{info['codes_gib']:.1f}GiB · [grey62]/? 도움말, /bye 끝내기[/]\n")
+                  f"{info['codes_gib']:.1f}GiB, RAM 캐시 {cli.ram_cache}개 · [grey62]/? 도움말, /bye 끝내기[/]\n")
     while True:
         try:
             line = read_message(">>> ")
