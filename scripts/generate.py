@@ -18,8 +18,8 @@ GIB = 2**30
 
 def load_runtime(cli, background: int | None = None) -> tuple:
     """(tokenizer, expert cache, decoder, facts about the load) of the tiered model for the options in cli (ckpt,
-    codes, slots, lam, threads, max_seq_len, min_ram_margin, wait_share, ram_share, topk, guess, touch, ram_cache). background:
-    staging buffers for unwaited reads (default: what the options given need)."""
+    codes, slots (-1: what fits in VRAM), lam, threads, max_seq_len, min_ram_margin, wait_share, ram_share, topk, guess,
+    touch, ram_cache). background: staging buffers for unwaited reads (default: what the options given need)."""
     torch.set_default_dtype(torch.bfloat16)
     # Windows pages over-subscribed VRAM out to system RAM instead of failing: cap the process so it fails instead
     free, total = torch.cuda.mem_get_info()
@@ -34,6 +34,12 @@ def load_runtime(cli, background: int | None = None) -> tuple:
     net = host.build_net(args) if host.V4 else host.build_net(args, tok)
     host.load_checkpoint_(net, ck)
     out["resident_gib"] = torch.cuda.memory_allocated() / GIB
+    if cli.slots < 0:  # what fits under the process's cap, leaving 0.75 GiB: decoding allocates 0.3 GiB on top of the
+        # slots. With 14.6 GiB free at the start this gives about 440; 460 left 0.47 GiB free on the device, 480 ran out.
+        per = 3 * args.moe_inter_dim * args.dim * 17 // 32  # an expert's FP4 weights and their scales
+        cli.slots = out["slots"] = int((free - VRAM_MARGIN - torch.cuda.memory_allocated() - 0.75 * GIB) / per)
+        if cli.slots <= 0:
+            raise SystemExit(f"only {free / GIB:.1f} GiB of VRAM is free: no room for the cache of original experts")
     # the code files go into RAM whole: stop here rather than push the machine into paging. No codes (--codes none):
     # every routed expert is an original one, the lossless model
     need = sum(os.path.getsize(os.path.join(cli.codes, f)) for f in os.listdir(cli.codes) if f.startswith("layer_")) / GIB if cli.codes else 0.0

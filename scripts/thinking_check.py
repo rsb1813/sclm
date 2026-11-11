@@ -122,7 +122,7 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--slots", type=int, default=400)
+    ap.add_argument("--slots", type=int, default=-1)
     ap.add_argument("--ram-cache", type=int, default=-1)
     ap.add_argument("--max-seq-len", type=int, default=4096)
     cli = ap.parse_args()
