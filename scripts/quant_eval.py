@@ -42,7 +42,7 @@ CONFIGS = {"none": None, "dense": "dense", "rtn3_had": (3, 64, True), "rtn2_had"
            # per-expert GPTQ option or the original FP4 expert (the SSD tier) from scripts/allocate_tiers.py
            "tier20": ("gptq_alloc", "tier20", False), "tier20g": ("gptq_alloc", "tier20g", False),
            "tier20v": ("gptq_alloc", "tier20v", False), "tier20v110": ("gptq_alloc", "tier20v110", False),
-           "tier20v100": ("gptq_alloc", "tier20v100", False),
+           "tier20v100": ("gptq_alloc", "tier20v100", False), "tier20r100": ("gptq_alloc", "tier20r100", False),
            # the codes a gptq_alloc run saved (--codes DIR): no calibration, the experts not in a file stay original
            "codes": "codes"}
 # GPTQ storage options: name -> (bits, levels, group); "orig" keeps the original FP4 expert
