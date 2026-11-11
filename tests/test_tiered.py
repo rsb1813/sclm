@@ -127,3 +127,36 @@ def test_cache_reads_unwaited_experts_in_the_background(tmp_path):
     slots, pending = cache.request(0, [2, 0], 2, wait=[True, False])  # a waited expert is read as before
     cache.finish(pending)
     assert len(pending) == 1 and holds(slots[0], 2) and holds(slots[1], 0)
+
+
+def test_cache_takes_experts_read_ahead_from_their_staging_buffers(tmp_path):
+    rng = np.random.default_rng(2)
+    data = write_checkpoint(tmp_path, {
+        f"layers.0.ffn.experts.{e}.{w}.{part}": rng.integers(0, 256, (out, k // per_byte), dtype=np.uint8)
+        for e in range(5) for w, (out, k) in SHAPES.items() for part, per_byte in (("scale", m.fp4_block_size), ("weight", 2))})
+    reader = ssd.ExpertReader(Checkpoint(str(tmp_path)), chunk=64 * 1024)
+    cache = ssd.ExpertCache(reader, 1, 5, tc.DIM, tc.INTER, tc.LIMIT, slots=2, lam=0.1, device="cpu", scratch=TOPK, background=2)
+
+    def holds(slot: int, e: int) -> bool:
+        want = [data[f"layers.0.ffn.experts.{e}.{w}.{part}"].ravel() for part in ("scale", "weight") for w in SHAPES]
+        return np.array_equal(cache.store[slot].numpy(), np.concatenate(want))
+
+    cache.read_ahead(0, [0, 1])
+    cache.read_ahead(0, [0])  # being read already
+    assert cache.stats["ahead"] == 2
+    slots, pending = cache.request(0, [1, 2], 0)  # 1 was guessed, 2 was not: only 2 is read now
+    cache.finish(pending)
+    assert holds(slots[0], 1) and holds(slots[1], 2)
+    assert cache.stats["ahead_used"] == 1 and sum(ticket == 0 for *_, ticket in pending) == 1
+    cache.read_ahead(0, [1])  # in the cache
+    assert cache.stats["ahead"] == 2
+    slots, pending = cache.request(0, [1], 1)  # (the buffer expert 1 came from is free again)
+    assert not pending
+    cache.read_ahead(0, [3])
+    reader.reader.wait()
+    cache.read_ahead(0, [4])  # no buffer left: the oldest guess nobody asked for (0) gives up its own
+    assert cache.stats["ahead"] == 4 and sorted(cache.ahead) == [3, 4]
+    reader.reader.wait()
+    slots, pending = cache.request(0, [0, 4], 2, wait=[True, False])  # 0 is read again; 4 is there, waited for or not
+    cache.finish(pending)
+    assert sum(ticket == 0 for *_, ticket in pending) == 1 and holds(slots[0], 0) and holds(slots[1], 4)

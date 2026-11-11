@@ -27,38 +27,69 @@ struct Request {
 };
 
 const int TICKETS = 256;
+const int AHEAD = 4;  // chunks of unwaited reads (tickets other than 0) under way at a time
 
 }  // namespace
 
 // Starting a read costs about 0.3 ms per 18 MB (the buffer's pages are locked for the transfer), so a thread of its
-// own issues them: the caller queues a request and goes on computing.
+// own issues them: the caller queues a request and goes on computing. The same thread takes in the completions, so
+// it knows how much is under way: a read somebody waits for (ticket 0) is issued at once, the others (read-ahead
+// guesses, background loads) only a few chunks at a time, so that they do not share the SSD's speed with it.
 struct SclmReader {
     std::vector<HANDLE> files;
     HANDLE port = nullptr;
     uint64_t chunk = 0;
-    std::deque<Request> requests;  // of the reads submitted since the last wait; a deque keeps their addresses
-    int pending = 0, failed = 0;   // the caller's: reads not yet completed, reads that failed
-    int open[TICKETS] = {};        // the caller's: chunks not yet completed, per ticket
-    std::mutex mutex;
-    std::condition_variable wake;
-    std::vector<Request*> queue;  // submitted, not yet issued
+    std::mutex mutex;              // guards what follows
+    std::condition_variable done;  // a chunk completed
+    std::deque<Request> requests;  // of the reads not all completed yet; a deque keeps their addresses
+    std::deque<Request*> queue;    // submitted, not yet issued
+    int pending = 0, failed = 0;   // chunks not yet completed, chunks that failed
+    int open[TICKETS] = {};        // chunks not yet completed, per ticket
+    int flight = 0;                // chunks issued and not yet completed
     bool stop = false;
-    std::thread issuer;
+    std::thread server;
 
-    void issue() {
+    void serve() {
         std::vector<Request*> batch;
         for (;;) {
             {
-                std::unique_lock lock(mutex);
-                wake.wait(lock, [this] { return stop || !queue.empty(); });
+                std::lock_guard lock(mutex);
                 if (stop) return;
-                batch.swap(queue);
+                for (const bool waited : {true, false})
+                    for (auto it = queue.begin(); it != queue.end();) {
+                        if (((*it)->ticket == 0) == waited && (waited || flight < AHEAD)) {
+                            batch.push_back(*it), ++flight;
+                            it = queue.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
             }
             for (Request* q : batch)
                 if (!ReadFile(q->file, q->dst, q->len, nullptr, &q->ov) && GetLastError() != ERROR_IO_PENDING)
                     PostQueuedCompletionStatus(port, 0, 1, &q->ov);  // key 1: the read did not start
             batch.clear();
+            DWORD got;
+            ULONG_PTR key;
+            OVERLAPPED* ov;
+            const BOOL ok = GetQueuedCompletionStatus(port, &got, &key, &ov, INFINITE);
+            if (!ov) continue;  // woken: something was submitted, or the reader stops
+            const Request* q = CONTAINING_RECORD(ov, Request, ov);
+            {
+                std::lock_guard lock(mutex);
+                --flight, --pending, --open[q->ticket];
+                if (!ok || key == 1 || got < q->need) ++failed;
+            }
+            done.notify_all();
         }
+    }
+
+    // How many chunks failed since the last call that reported them. With the mutex held.
+    int settle() {
+        if (!pending) requests.clear();
+        const int n = failed;
+        failed = 0;
+        return n;
     }
 };
 
@@ -90,7 +121,7 @@ __declspec(dllexport) SclmReader* sclm_reader_new(const wchar_t* const* paths, i
             return nullptr;
         }
     }
-    R->issuer = std::thread([R] { R->issue(); });
+    R->server = std::thread([R] { R->serve(); });
     return R;
 }
 
@@ -99,8 +130,8 @@ __declspec(dllexport) void sclm_reader_free(SclmReader* R) {
         std::lock_guard lock(R->mutex);
         R->stop = true;
     }
-    R->wake.notify_one();
-    R->issuer.join();
+    PostQueuedCompletionStatus(R->port, 0, 0, nullptr);
+    R->server.join();
     for (HANDLE h : R->files) CloseHandle(h);
     CloseHandle(R->port);
     delete R;
@@ -108,73 +139,51 @@ __declspec(dllexport) void sclm_reader_free(SclmReader* R) {
 
 // Starts reading bytes [offset, offset + bytes) of file `file` into dst and returns where in dst the first of them
 // lands (the read starts on the page boundary below offset). dst is page-aligned and holds bytes + 2 pages.
-// `ticket` (below 256) names the read for sclm_reader_open and sclm_reader_wait_ticket.
+// `ticket` (below 256) names the read for sclm_reader_open and sclm_reader_wait_ticket; ticket 0 is for reads the
+// caller is about to wait for, which go ahead of the others.
 __declspec(dllexport) int sclm_reader_submit(SclmReader* R, int file, uint64_t offset, uint64_t bytes, uint8_t* dst, int ticket) {
     const uint64_t head = offset % PAGE, begin = offset - head, end = (offset + bytes + PAGE - 1) / PAGE * PAGE;
-    const size_t first = R->requests.size();
-    for (uint64_t at = begin; at < end; at += R->chunk) {
-        const uint64_t len = std::min(R->chunk, end - at);
-        Request& q = R->requests.emplace_back();
-        q.ov = {};
-        q.ov.Offset = DWORD(at), q.ov.OffsetHigh = DWORD(at >> 32);
-        q.need = DWORD(std::min(len, offset + bytes - at));
-        q.file = R->files[file], q.dst = dst + (at - begin), q.len = DWORD(len), q.ticket = ticket;
-        ++R->pending, ++R->open[ticket];
-    }
     {
         std::lock_guard lock(R->mutex);
-        for (size_t i = first; i < R->requests.size(); ++i) R->queue.push_back(&R->requests[i]);
+        for (uint64_t at = begin; at < end; at += R->chunk) {
+            const uint64_t len = std::min(R->chunk, end - at);
+            Request& q = R->requests.emplace_back();
+            q.ov = {};
+            q.ov.Offset = DWORD(at), q.ov.OffsetHigh = DWORD(at >> 32);
+            q.need = DWORD(std::min(len, offset + bytes - at));
+            q.file = R->files[file], q.dst = dst + (at - begin), q.len = DWORD(len), q.ticket = ticket;
+            R->queue.push_back(&q);
+            ++R->pending, ++R->open[ticket];
+        }
     }
-    R->wake.notify_one();
+    PostQueuedCompletionStatus(R->port, 0, 0, nullptr);
     return int(head);
 }
 
-// Takes one completed chunk off the port, waiting up to `wait` ms. Returns 1, 0 if none completed, -1 if the port failed.
-static int take(SclmReader* R, DWORD wait) {
-    DWORD got;
-    ULONG_PTR key;
-    OVERLAPPED* ov;
-    const BOOL ok = GetQueuedCompletionStatus(R->port, &got, &key, &ov, wait);
-    if (!ov) return GetLastError() == WAIT_TIMEOUT ? 0 : -1;
-    const Request* q = CONTAINING_RECORD(ov, Request, ov);
-    --R->pending, --R->open[q->ticket];
-    if (!ok || key == 1 || got < q->need) ++R->failed;
-    return 1;
-}
-
-// How many reads failed since the last call that reported them.
-static int settle(SclmReader* R) {
-    if (!R->pending) R->requests.clear();
-    const int failed = R->failed;
-    R->failed = 0;
-    return failed;
-}
-
-// Takes in the reads that have completed, without waiting. Returns how many failed.
+// How many chunks failed since the last call that reported them (nothing is waited for).
 __declspec(dllexport) int sclm_reader_poll(SclmReader* R) {
-    while (R->pending) {
-        const int took = take(R, 0);
-        if (took < 0) return -1;
-        if (!took) break;
-    }
-    return settle(R);
+    std::lock_guard lock(R->mutex);
+    return R->settle();
 }
 
-// Chunks of the ticket's reads that have not completed, as of the last poll or wait.
-__declspec(dllexport) int sclm_reader_open(SclmReader* R, int ticket) { return R->open[ticket]; }
+// Chunks of the ticket's reads that have not completed.
+__declspec(dllexport) int sclm_reader_open(SclmReader* R, int ticket) {
+    std::lock_guard lock(R->mutex);
+    return R->open[ticket];
+}
 
-// Waits for the reads submitted under the ticket (others may still run). Returns how many reads failed.
+// Waits for the reads submitted under the ticket (others may still run). Returns how many chunks failed.
 __declspec(dllexport) int sclm_reader_wait_ticket(SclmReader* R, int ticket) {
-    while (R->open[ticket])
-        if (take(R, INFINITE) < 0) return -1;
-    return settle(R);
+    std::unique_lock lock(R->mutex);
+    R->done.wait(lock, [&] { return R->open[ticket] == 0; });
+    return R->settle();
 }
 
-// Waits for every read submitted. Returns how many of them failed.
+// Waits for every read submitted. Returns how many chunks failed.
 __declspec(dllexport) int sclm_reader_wait(SclmReader* R) {
-    while (R->pending)
-        if (take(R, INFINITE) < 0) return -1;
-    return settle(R);
+    std::unique_lock lock(R->mutex);
+    R->done.wait(lock, [&] { return R->pending == 0; });
+    return R->settle();
 }
 
 // A cache of `slots` experts out of n_keys; lam is the score's decay per token.

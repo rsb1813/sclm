@@ -34,7 +34,7 @@ def main() -> None:
     ap.add_argument("--ram-share", type=float, default=0.0, help="lossy: leave out CPU-tier experts with less than this "
                     "share of the token's routing weight")
     ap.add_argument("--topk", type=int, default=0, help="lossy: routed experts computed per token (0: all six)")
-    ap.add_argument("--guess", type=int, default=0, help="experts of the next layer each layer guesses, to read those on "
+    ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
                     "the SSD a layer early (0: none)")
     ap.add_argument("--name", default="stage3")
     cli = ap.parse_args()

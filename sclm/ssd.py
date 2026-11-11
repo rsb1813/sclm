@@ -159,7 +159,7 @@ class ExpertCache:
             kept = slot < self.n_slots  # not a scratch slot
             if kept and self.loaded[slot] == key:
                 out.append(slot)
-            elif key in self.ahead:
+            elif key in self.ahead and (self.reader.reader.done(self.ahead[key][0]) or wait is None or wait[k]):
                 i, (at_s, at_w) = self.ahead.pop(key)
                 if self.reader.reader.done(i):
                     self._upload(slot, self.staging[i], at_s, at_w)
@@ -170,6 +170,14 @@ class ExpertCache:
                     self._give(slot, key)
                 out.append(slot)
                 self.stats["ahead_used"] += 1
+            elif key in self.ahead:  # lossy, and still arriving: it goes on into its slot as a background read
+                out.append(None)
+                if kept and slot not in loading:
+                    i, starts = self.ahead.pop(key)
+                    self._give(slot, None)
+                    self.loads[i] = (slot, key, starts)
+                    loading.add(slot)
+                    self.stats["loads"] += 1
             elif wait is None or wait[k]:
                 buf, waited = self.staging[waited], waited + 1
                 pending.append((slot, buf, self.reader.submit(layer, e, buf.numpy()), 0))

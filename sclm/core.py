@@ -108,7 +108,8 @@ class Reader:
     def submit(self, file: int, offset: int, nbytes: int, dst: np.ndarray, ticket: int = 0) -> int:
         """Starts reading bytes [offset, offset + nbytes) of paths[file] into dst (from pages(), nbytes + 2 pages or
         more, alive until the read is done). Returns where in dst the first byte lands. `ticket` (below 256) names the
-        read for wait(ticket) and done(ticket)."""
+        read for wait(ticket) and done(ticket); ticket 0 is for reads about to be waited for, which go ahead of the
+        others on the SSD."""
         assert dst.ctypes.data % PAGE == 0 and dst.nbytes >= nbytes + 2 * PAGE
         return self.lib.sclm_reader_submit(self.handle, file, offset, nbytes, dst.ctypes.data, ticket)
 
@@ -121,7 +122,7 @@ class Reader:
         assert failed == 0, f"{failed} reads failed"
 
     def poll(self) -> None:
-        """Takes in the reads that have completed, without waiting; done() answers as of the last poll or wait."""
+        """Checks, without waiting, that no read has failed."""
         failed = self.lib.sclm_reader_poll(self.handle)
         assert failed == 0, f"{failed} reads failed"
 

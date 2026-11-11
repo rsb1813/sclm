@@ -34,6 +34,8 @@ def main() -> None:
     ap.add_argument("--wait-share", type=float, default=0.0, help="lossy: an expert that has to be read is waited for "
                     "only if it carries this share of the token's routing weight (above 1: never); else it is left out "
                     "of the token and read in the background")
+    ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
+                    "the SSD a layer early (0: none)")
     ap.add_argument("--name", required=True)
     cli = ap.parse_args()
 
@@ -45,8 +47,9 @@ def main() -> None:
     args = load_args(max_batch_size=1, max_seq_len=max(1024, cli.tokens), **host.TEXT_ONLY)
     net = host.build_net(args, tok)
     host.load_checkpoint_(net, ck)
-    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam, background=12 if cli.wait_share else 0)
-    cache.topk, cache.wait_share, cache.ram_share = cli.topk, cli.wait_share, cli.ram_share
+    cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam,
+                               background=(12 if cli.wait_share else 0) + (16 if cli.guess else 0))
+    cache.topk, cache.wait_share, cache.ram_share, cache.guess = cli.topk, cli.wait_share, cli.ram_share, cli.guess
     core.set_threads(cli.threads)
     decoder = host.Host(net, cache)
 
@@ -75,7 +78,7 @@ def main() -> None:
         print(json.dumps(per_seq[-1]), flush=True)
     n = len(per_seq) * cli.tokens
     timed = len(per_seq) * (cli.tokens - cli.tokens // 4)
-    out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "wait_share": cli.wait_share, "ram_share": cli.ram_share, "tokens": n,
+    out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "wait_share": cli.wait_share, "ram_share": cli.ram_share, "guess": cli.guess, "tokens": n,
            "kl_top64": sum(x["kl"] for x in per_seq) / len(per_seq), "top1_agree": sum(x["top1"] for x in per_seq) / len(per_seq),
            "tok_s": timed / seconds, "ms_per_token": 1e3 * seconds / timed,
            "per_token": {k: (1e3 * v / n if k.endswith("_s") else v / n) for k, v in stats.items()}, "per_seq": per_seq}
