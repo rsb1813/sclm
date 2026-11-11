@@ -976,6 +976,29 @@ API int sclm_gpu_moe_begin(const uint16_t* weight, const float* bias, const uint
 // Waits until the guess of the last sclm_gpu_moe_begin is on the host.
 API int sclm_gpu_moe_guess() { return cudaEventSynchronize(moe_copied[1]); }
 
+static cudaStream_t copy_stream;  // the copies of sclm_gpu_copy, in the order they were asked for
+static cudaEvent_t copies_done;
+
+// Copies n bytes between host (page-locked) and device memory, in either direction, beside the kernels instead of in
+// line with them: an expert's bytes take the bus 0.35 ms, during which the device can compute what does not need them.
+// The copies run in the order of the calls. Kernels that read or write the same memory have to be ordered by the
+// caller: sclm_gpu_copies_wait before those that come after the copy, and no copy over memory that kernels already
+// queued still use.
+API int sclm_gpu_copy(void* to, const void* from, size_t n) {
+    if (!copy_stream) {
+        cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&copies_done, cudaEventDisableTiming);
+    }
+    return cudaMemcpyAsync(to, from, n, cudaMemcpyDefault, copy_stream);
+}
+
+// The kernels launched from now on start when every copy asked for so far is done.
+API int sclm_gpu_copies_wait() {
+    if (!copy_stream) return 0;
+    cudaEventRecord(copies_done, copy_stream);
+    return cudaStreamWaitEvent(0, copies_done, 0);
+}
+
 // The end of the two-tier MoE: out[n] (bf16) = (routed[n] + ram[n]) + shared[n], ram being the CPU tier's sum in
 // (page-locked) host memory, uploaded into the device buffer `staged` without waiting.
 API int sclm_gpu_moe_end(const float* routed, const float* ram, float* staged, const float* shared, uint16_t* out, int n) {

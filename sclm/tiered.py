@@ -59,7 +59,9 @@ class TieredMoE(nn.Module):
         begin, end, _, _ = bound if bound is not None and bound[2] is buf and bound[3] == guess else self.bind(buf, guess)
         later = self.after[0] if guess else None
         begin(x.data_ptr())
-        cache.uploading = False  # the routing was copied after every slot upload queued so far
+        # the routing was copied after every slot upload queued so far, and after every kernel that read a slot: from
+        # here to the next layer's routing, the slot copies run beside the kernels (gpu.copy)
+        cache.uploading, cache.beside = False, True
         host, xq, y = buf.host.numpy(), buf.xq, buf.routed
         t1 = perf_counter()
         ids, gates = host[:topk].astype(np.int64).tolist(), host[topk:2 * topk].tolist()
@@ -83,6 +85,8 @@ class TieredMoE(nn.Module):
         held = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot not in reading]
         read = [(slot, gates[k]) for k, slot in zip(ssd, slots) if slot in reading]
         if held:
+            if not cache.fresh.isdisjoint(slot for slot, _ in held):  # read ahead and copied in just now
+                cache.barrier()
             gpu.fp4_experts(cache.store, *zip(*held), self.dim, self.inter, self.limit, xq, y)
         self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:2 * topk + self.dim],
                          cache.ram_out.numpy())
@@ -93,6 +97,7 @@ class TieredMoE(nn.Module):
         t2 = perf_counter()
         cache.finish(pending)
         t3 = perf_counter()
+        cache.barrier()  # also when nothing reads the copied slots now: the next layer counts on the copies being done
         if read:
             gpu.fp4_experts(cache.store, *zip(*read), self.dim, self.inter, self.limit, xq, y)
         # the CPU tier's sum is not waited for: the device takes the buffer before the next layer's routing comes
@@ -111,6 +116,7 @@ class TieredMoE(nn.Module):
         if gpu.active and x.numel() == self.dim and self.gate.score_func == "sqrtsoftplus" and image_mask is None:
             return self.decode(x.reshape(-1)).view(shape)
         x = x.view(-1, self.dim)
+        self.cache.beside = False  # several tokens: a slot copy has to wait for the kernels of the token before
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)
         stats, t0 = self.cache.stats, perf_counter()

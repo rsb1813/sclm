@@ -31,6 +31,8 @@ def lib():
                                             [C.c_void_p] * 3)
         _lib.sclm_gpu_moe_guess.argtypes = []
         _lib.sclm_gpu_moe_end.argtypes = [C.c_void_p] * 5 + [C.c_int]
+        _lib.sclm_gpu_copy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
+        _lib.sclm_gpu_copies_wait.argtypes = []
         _lib.sclm_gpu_attn_q.argtypes = [C.c_void_p] * 9 + [C.c_int] * 5 + [C.c_float]
         _lib.sclm_gpu_attn_kv.argtypes = [C.c_void_p] * 6 + [C.c_int] * 3 + [C.c_float]
         _lib.sclm_gpu_sparse_attn.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float]
@@ -282,6 +284,18 @@ def moe_begin(module, x: torch.Tensor, expert, limit: float, buf: SimpleNamespac
 def moe_guess() -> None:
     """Waits until the guess of the last moe_begin is on the host."""
     _check(lib().sclm_gpu_moe_guess())
+
+
+def copy(to: int, source: int, nbytes: int) -> None:
+    """Queues a copy of nbytes between page-locked host memory and device memory (addresses, either direction) on a
+    stream of its own: it runs beside the kernels, after the copies asked for before it. The caller keeps kernels and
+    copies that touch the same memory in order (copies_wait)."""
+    _check(lib().sclm_gpu_copy(to, source, nbytes))
+
+
+def copies_wait() -> None:
+    """The kernels launched from now on start when every copy() so far is done."""
+    _check(lib().sclm_gpu_copies_wait())
 
 
 def moe_end(buf: SimpleNamespace, ram: torch.Tensor) -> torch.Tensor:

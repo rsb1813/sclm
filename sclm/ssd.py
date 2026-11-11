@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sclm import core
+from sclm import core, gpu
 from sclm.checkpoint import Checkpoint
 from sclm.upstream import model as m
 
@@ -71,6 +71,10 @@ class ExpertCache:
         self.token = 0  # position of the first token of the forward in progress, set by the host
         self.stats = defaultdict(float)  # seconds and counts the tiered MoE adds up, for whoever measures
         self.uploading = False  # slot uploads may still be reading the staging buffers
+        # the decode path (sclm.tiered) turns this on: copies into and out of the slots run on the engine's copy
+        # stream (gpu.copy), beside the kernels instead of in line with them. `fresh`: the slots such copies write,
+        # until barrier()
+        self.beside, self.fresh = False, set()
         # lossy speed options of the decode path (sclm.tiered), off by default
         self.topk = 0  # > 0: only the best `topk` routed experts of a token are computed
         # > 0: an expert that has to be read is waited for only if it carries at least this share of the token's
@@ -106,9 +110,33 @@ class ExpertCache:
 
     def _upload(self, slot: int, buf: torch.Tensor, at_s: int, at_w: int) -> None:
         n_scale, n_weight = self.reader.sizes
-        self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale], non_blocking=True)
-        self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
+        if self.beside:
+            to, source = self.store.data_ptr() + slot * self.store.size(1), buf.data_ptr()
+            gpu.copy(to, source + at_s, n_scale)
+            gpu.copy(to + n_scale, source + at_w, n_weight)
+            self.fresh.add(slot)
+        else:
+            self.store[slot, :n_scale].copy_(buf[at_s:at_s + n_scale], non_blocking=True)
+            self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
         self.uploading = self.store.is_cuda
+
+    def _move(self, slot: int, buf: torch.Tensor, out: bool) -> None:
+        """Queues the copy of a whole expert between its slot and a host buffer of the RAM level (out: to the host)."""
+        if self.beside:
+            at = self.store.data_ptr() + slot * self.store.size(1)
+            gpu.copy(*((buf.data_ptr(), at) if out else (at, buf.data_ptr())), self.store.size(1))
+            if not out:
+                self.fresh.add(slot)
+        elif out:
+            buf.copy_(self.store[slot], non_blocking=True)
+        else:
+            self.store[slot].copy_(buf, non_blocking=True)
+
+    def barrier(self) -> None:
+        """The kernels launched from now on find the bytes of every slot copy queued so far in place."""
+        if self.fresh:
+            gpu.copies_wait()
+            self.fresh.clear()
 
     def keep_in_ram(self, n: int) -> None:
         """Adds a second level of n experts in host memory (pinned, an expert's bytes each): an expert that leaves
@@ -134,7 +162,7 @@ class ExpertCache:
         self.held.pop(old, None)
         if old is not None and old not in self.ram_cache and (self.ram_free or self.ram_cache):
             buf = self.ram_free.pop() if self.ram_free else self.ram_cache.pop(next(iter(self.ram_cache)))
-            buf.copy_(self.store[slot], non_blocking=True)
+            self._move(slot, buf, out=True)
             self.ram_cache[old] = buf
         self.loaded[slot] = key
         if key is not None:
@@ -196,7 +224,7 @@ class ExpertCache:
                 # it stays, as the newest: when it leaves its slot again, nothing has to be copied (a copy back to
                 # the host shares the memory's bandwidth with the CPU tier)
                 self.ram_cache[key] = buf
-                self.store[slot].copy_(buf, non_blocking=True)
+                self._move(slot, buf, out=False)
                 # listed with the experts being read (no ticket: finish() has nothing to do for it), so that the
                 # token adds its experts in the order it would without the RAM level, and its result is the same
                 pending.append((slot, buf, None, None))
