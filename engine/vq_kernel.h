@@ -13,25 +13,52 @@ struct Tables {
     int groups = 0, codes = 0;
     float scale = 0;
     int8_t* t = nullptr;  // [groups][codes]
-    float* tmp = nullptr;
 };
 
-// cb is [D][codes]: dimension-major, so one input value scales a whole column of entries.
-static void build_tables(const float* cb, int d, const float* x, int k, Tables& tb) {
-    const int g = k / d, codes = tb.codes;
+// Entries v .. v+63 of one group's table before the scale: cb points at code v of the codebook ([D][codes]:
+// dimension-major, so one input value scales a whole column of entries), x at the group's D inputs. An entry adds its
+// dimensions in order; four entries' sums run side by side, so one does not wait for the one before.
+static __forceinline void table_entries(const float* cb, int d, int codes, const float* x, __m512& a0, __m512& a1, __m512& a2, __m512& a3) {
+    a0 = a1 = a2 = a3 = _mm512_setzero_ps();
+    for (int i = 0; i < d; ++i, cb += codes) {
+        const __m512 xi = _mm512_set1_ps(x[i]);
+        a0 = _mm512_fmadd_ps(xi, _mm512_load_ps(cb), a0);
+        a1 = _mm512_fmadd_ps(xi, _mm512_load_ps(cb + 16), a1);
+        a2 = _mm512_fmadd_ps(xi, _mm512_load_ps(cb + 32), a2);
+        a3 = _mm512_fmadd_ps(xi, _mm512_load_ps(cb + 48), a3);
+    }
+}
+
+// The largest magnitude among the table entries of groups j0 .. j1-1.
+static float table_max(const float* cb, int d, int codes, const float* x, int j0, int j1) {
     __m512 mx = _mm512_setzero_ps();
-    for (int j = 0; j < g; ++j)
-        for (int v = 0; v < codes; v += 16) {
-            __m512 acc = _mm512_setzero_ps();
-            for (int i = 0; i < d; ++i)
-                acc = _mm512_fmadd_ps(_mm512_set1_ps(x[j * d + i]), _mm512_load_ps(cb + i * codes + v), acc);
-            _mm512_store_ps(tb.tmp + j * codes + v, acc);
-            mx = _mm512_max_ps(mx, _mm512_abs_ps(acc));
+    for (int j = j0; j < j1; ++j)
+        for (int v = 0; v < codes; v += 64) {
+            __m512 a0, a1, a2, a3;
+            table_entries(cb + v, d, codes, x + j * d, a0, a1, a2, a3);
+            mx = _mm512_max_ps(mx, _mm512_max_ps(_mm512_max_ps(_mm512_abs_ps(a0), _mm512_abs_ps(a1)),
+                                                 _mm512_max_ps(_mm512_abs_ps(a2), _mm512_abs_ps(a3))));
         }
-    tb.groups = g, tb.scale = _mm512_reduce_max_ps(mx) / 127.0f;
-    const __m512 inv = _mm512_set1_ps(1.0f / tb.scale);
-    for (int n = 0; n < g * codes; n += 16)
-        _mm_store_si128((__m128i*)(tb.t + n), _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(_mm512_load_ps(tb.tmp + n), inv))));
+    return _mm512_reduce_max_ps(mx);
+}
+
+// t[j][c] of groups j0 .. j1-1: the entries as int8 on the scale. They are computed again rather than kept from
+// table_max, so threads can share a table's parts with no fp32 copy of it to write, read back and pass between them.
+static void table_fill(const float* cb, int d, int codes, const float* x, int j0, int j1, float scale, int8_t* t) {
+    const __m512 inv = _mm512_set1_ps(1.0f / scale);
+    for (int j = j0; j < j1; ++j)
+        for (int v = 0; v < codes; v += 64) {
+            __m512 a[4];
+            table_entries(cb + v, d, codes, x + j * d, a[0], a[1], a[2], a[3]);
+            for (int u = 0; u < 4; ++u)
+                _mm_store_si128((__m128i*)(t + j * codes + v + 16 * u), _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(a[u], inv))));
+        }
+}
+
+// The tables of x[k] on one common scale: the largest entry is 127.
+static void build_tables(const float* cb, int d, const float* x, int k, Tables& tb) {
+    tb.groups = k / d, tb.scale = table_max(cb, d, tb.codes, x, 0, tb.groups) / 127.0f;
+    table_fill(cb, d, tb.codes, x, 0, tb.groups, tb.scale, tb.t);
 }
 
 // y[0..255] = sums over the steps of lookup(step, r), the int8 table entries of rows 64r .. 64r+63, times the scale.

@@ -71,7 +71,10 @@ def test_layer_forward_matches_the_reference_expert(tmp_path):
             assert rel(y, ref) < 1e-2, ids  # what the int8 tables cost at this toy size
             for threads in (2, 5, 1):  # the same bits however the tiles are shared out
                 core.set_threads(threads)
-                for _ in range(20):
+                for late in range(20):
                     assert (layer.forward(ids, gates.tolist(), x.float().numpy()[0]) == y.numpy()).all(), (ids, threads)
+                    layer.start(ids, gates.tolist(), x.float().numpy()[0])
+                    sum(range(late * 500))  # the caller joins at once, or when the other threads are done
+                    assert (layer.wait() == y.numpy()).all(), (ids, threads)
     finally:
         torch.set_default_dtype(prev)

@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < K; ++i) x[i] = nd(rng);
     Tables tb;
     tb.codes = codes;
-    tb.t = (int8_t*)_aligned_malloc(size_t(groups) * codes, 64), tb.tmp = (float*)_aligned_malloc(sizeof(float) * groups * codes, 64);
+    tb.t = (int8_t*)_aligned_malloc(size_t(groups) * codes, 64);
 
     const size_t n_mat = std::max<size_t>(threads, size_t(pool_gb * 1e9 / mat));
     auto* pool = (uint8_t*)VirtualAlloc(nullptr, n_mat * mat + 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);  // 6-bit loads read 16 bytes on

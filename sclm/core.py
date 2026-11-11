@@ -25,6 +25,8 @@ def _dll():
                                    C.c_void_p, C.c_int, C.c_void_p, C.c_int]
     lib.sclm_layer_free.argtypes = [C.c_void_p]
     lib.sclm_layer_forward.argtypes = [C.c_void_p, C.POINTER(Expert), C.c_void_p, C.c_int, C.c_void_p, C.c_void_p]
+    lib.sclm_layer_start.argtypes = [C.c_void_p, C.POINTER(Expert), C.c_void_p, C.c_int, C.c_void_p]
+    lib.sclm_layer_wait.argtypes = [C.c_void_p, C.c_void_p]
     lib.sclm_set_threads.argtypes = [C.c_int]
     lib.sclm_reader_new.restype = C.c_void_p
     lib.sclm_reader_new.argtypes = [C.POINTER(C.c_wchar_p), C.c_int, C.c_int]
@@ -47,9 +49,10 @@ def set_threads(threads: int) -> None:
 
 
 def phase_seconds() -> list:
-    """Seconds the engine has spent so far in each phase of Layer.forward: input quantization and rotation, input
-    tables, w1 and w3, hidden vectors with their tables, w2, sum."""
-    out = (C.c_double * 6)()
+    """Seconds the engine has spent so far in each phase of the layer calls. Summed over the threads, which work on
+    them at the same time: input quantization and rotation, input tables, w1 and w3, hidden vectors with their tables,
+    w2. Then the sum, and by the clock the time from a call's start to its last expert."""
+    out = (C.c_double * 7)()
     _dll().sclm_phase_seconds(out)
     return list(out)
 
@@ -80,6 +83,21 @@ class Layer:
         x, g = np.ascontiguousarray(x, np.float32), np.asarray(gates, np.float32)
         y = np.empty(self.dim, np.float32) if out is None else out
         self.lib.sclm_layer_forward(self.handle, ex, g.ctypes.data, len(experts), x.ctypes.data, y.ctypes.data)
+        return y
+
+    def start(self, experts: list, gates: list, x: np.ndarray) -> None:
+        """Starts forward on the other threads and returns at once: the caller does other work, then takes the result
+        with wait(). One call at a time over all layers (they share the threads)."""
+        ex = (Expert * len(experts))(*[self.experts[e] for e in experts])
+        x, g = np.ascontiguousarray(x, np.float32), np.asarray(gates, np.float32)
+        self.started = (ex, x)  # the engine reads them until wait()
+        self.lib.sclm_layer_start(self.handle, ex, g.ctypes.data, len(experts), x.ctypes.data)
+
+    def wait(self, out: np.ndarray | None = None) -> np.ndarray:
+        """Joins the call started and returns its result, written into `out` (fp32 [dim]) when given."""
+        y = np.empty(self.dim, np.float32) if out is None else out
+        self.lib.sclm_layer_wait(self.handle, y.ctypes.data)
+        self.started = None
         return y
 
     def __del__(self):

@@ -1,12 +1,14 @@
 // CPU engine for the RAM tier: a layer's vector-coded SwiGLU experts, computed step for step as the reference computes
 // them (quant.VQLinear inside the upstream Expert), except that the GEMVs sum int8 tables instead of fp32 products.
-// A call is split into row tiles that a thread pool shares; the arithmetic does not depend on the thread count.
+// A call is split into tasks (row tiles, parts of tables) that a thread pool shares; the arithmetic does not depend on
+// the thread count.
 #include <malloc.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -34,10 +36,13 @@ struct Rotation {
     int block = 0;
 };
 
+constexpr int PARTS = 16;  // the tables over the layer input are built in this many parts
+
 struct Format {
     float* cb;
     int d;
-    Tables in;  // over the layer input: w1 and w3 of every expert of the format read them
+    Tables in;          // over the layer input: w1 and w3 of every expert of the format read them
+    float peak[PARTS];  // the largest entry of each part
 };
 
 // One expert of the call in progress.
@@ -48,7 +53,15 @@ struct Slot {
     std::vector<float> gate, up, out;
 };
 
-// Runs fn(ctx, i) for i < count on the calling thread and the workers. Idle workers spin for about 0.1 ms, then sleep.
+// Tasks of one kind of a call. They can start when what they read is complete, and something waits for the last one.
+struct Group {
+    int count = 0;
+    std::atomic<int> next{0}, left{0};  // the first unclaimed task, tasks not finished
+    std::atomic<bool> ready{false};
+};
+
+// Runs fn(ctx, i) for i < count on the workers and, once it joins, the calling thread. Idle workers spin for about
+// 0.1 ms, then sleep.
 struct Pool {
     std::vector<std::thread> workers;
     std::atomic<uint64_t> next{0};   // count << 32 | first unclaimed index, so a claim reads and takes in one step
@@ -57,6 +70,7 @@ struct Pool {
     std::atomic<bool> stop{false};
     void (*fn)(void*, int) = nullptr;
     void* ctx = nullptr;
+    int count = 0;
 
     explicit Pool(int threads) {
         for (int t = 1; t < threads; ++t) workers.emplace_back([this] { work(); });
@@ -82,37 +96,30 @@ struct Pool {
                     _mm_pause();
                 } else {
                     epoch.wait(seen);
-                    seen = epoch.load(), t0 = __rdtsc();  // a job's phases follow each other closely
+                    seen = epoch.load(), t0 = __rdtsc();
                 }
             }
             fn(ctx, i);  // set before the job's `next`, and the job cannot end before this task does
             ++done;
         }
     }
-    void run(int count, void (*f)(void*, int), void* c) {
-        if (workers.empty() || count < 2) {
-            for (int i = 0; i < count; ++i) f(c, i);
-            return;
-        }
-        fn = f, ctx = c, done = 0;
-        next = uint64_t(count) << 32;
+    void start(int n, void (*f)(void*, int), void* c) {
+        fn = f, ctx = c, done = 0, count = n;
+        next = uint64_t(n) << 32;
         ++epoch, epoch.notify_all();
-        for (int i; claim(i); ++done) f(c, i);
+    }
+    // The calling thread takes what is unclaimed and returns when the job is done.
+    void join() {
+        for (int i; claim(i); ++done) fn(ctx, i);
         while (done.load() < count) _mm_pause();
     }
 };
 
 Pool* pool = new Pool(1);
 
-// Seconds spent in each phase of sclm_layer_forward since the process started (a measuring aid).
-double phase_seconds[6];
-struct Phase {
-    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
-    void end(int i) {
-        const auto now = std::chrono::steady_clock::now();
-        phase_seconds[i] += std::chrono::duration<double>(now - t).count(), t = now;
-    }
-};
+// Seconds spent in each phase of the layer calls since the process started (a measuring aid).
+std::atomic<double> phase_seconds[7];
+double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // The reference's activation fake-quant before a quantized GEMM (kernel.act_quant: blocks of 32, power-of-2 scale):
 // a block is scaled so its largest magnitude is at most 448, then rounded to FP8 E4M3.
@@ -143,18 +150,29 @@ void bf16(float* x, int n) {
     }
 }
 
-// x <- H (signs * x) / sqrt(block) over each block (quant.BlockHadamard.rotate).
+// x <- H (signs * x) / sqrt(block) over each block (quant.BlockHadamard.rotate); a block is a power of two, 16 or
+// more. Step h of the transform takes every pair (a, b) that is h apart to (a + b, a - b): 16 pairs at a time here.
 void rotate(float* x, int n, const Rotation& rot) {
-    for (int i = 0; i < n; ++i) x[i] *= rot.signs[i];
-    const float norm = float(std::sqrt(double(rot.block)));
+    const __m512 norm = _mm512_set1_ps(float(std::sqrt(double(rot.block))));
+    const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     for (float* p = x; p < x + n; p += rot.block) {
-        for (int h = 1; h < rot.block; h *= 2)
+        for (int i = 0; i < rot.block; i += 16) {  // h = 1, 2, 4, 8: both of a pair are in one vector
+            __m512 v = _mm512_mul_ps(_mm512_loadu_ps(p + i), _mm512_loadu_ps(rot.signs.data() + (p - x) + i));
+            for (int h = 1; h < 16; h *= 2) {
+                const __m512i bit = _mm512_set1_epi32(h);
+                const __m512 other = _mm512_permutexvar_ps(_mm512_xor_si512(lane, bit), v);
+                // the upper of a pair holds b and gets a - b
+                v = _mm512_mask_sub_ps(_mm512_add_ps(v, other), _mm512_test_epi32_mask(lane, bit), other, v);
+            }
+            _mm512_storeu_ps(p + i, v);
+        }
+        for (int h = 16; h < rot.block; h *= 2)
             for (int i = 0; i < rot.block; i += 2 * h)
-                for (int j = i; j < i + h; ++j) {
-                    const float a = p[j], b = p[j + h];
-                    p[j] = a + b, p[j + h] = a - b;
+                for (int j = i; j < i + h; j += 16) {
+                    const __m512 a = _mm512_loadu_ps(p + j), b = _mm512_loadu_ps(p + j + h);
+                    _mm512_storeu_ps(p + j, _mm512_add_ps(a, b)), _mm512_storeu_ps(p + j + h, _mm512_sub_ps(a, b));
                 }
-        for (int i = 0; i < rot.block; ++i) p[i] /= norm;
+        for (int i = 0; i < rot.block; i += 16) _mm512_storeu_ps(p + i, _mm512_div_ps(_mm512_loadu_ps(p + i), norm));
     }
 }
 
@@ -170,7 +188,7 @@ void matvec_tile(const uint8_t* codes, const uint16_t* scales, const Tables& tb,
 
 Tables tables(int groups, int codes) {
     Tables tb;
-    tb.codes = codes, tb.t = aligned<int8_t>(size_t(groups) * codes), tb.tmp = aligned<float>(size_t(groups) * codes);
+    tb.groups = groups, tb.codes = codes, tb.t = aligned<int8_t>(size_t(groups) * codes);
     return tb;
 }
 
@@ -182,29 +200,23 @@ struct SclmLayer {
     std::vector<Format> formats;
     Rotation rot_dim, rot_inter;
     std::vector<float> x;
-    std::vector<int> used;    // the formats of the call in progress
+    // the call in progress
+    const float* in = nullptr;
+    std::vector<int> used;    // its formats
     std::vector<Slot> slots;  // its experts
+    int n = 0;
+    // its tasks: the input (one task), then per format the largest table entry (PARTS tasks) and the tables (PARTS),
+    // then per expert w1 with w3 (a task a tile) and w2
+    std::unique_ptr<Group[]> groups;
+    int n_groups = 0, room = 0;
+    std::atomic<int> open{0};  // experts not finished
+    double started = 0, ended = 0;
 };
 
 namespace {
 
-void build_in(void* ctx, int i) {
-    auto* L = (SclmLayer*)ctx;
-    Format& f = L->formats[L->used[i]];
-    build_tables(f.cb, f.d, L->x.data(), L->dim, f.in);
-}
-
-// w1 and w3: task i is one tile of one of the two matrices of one expert.
-void in_tile(void* ctx, int i) {
-    auto* L = (SclmLayer*)ctx;
-    const int tiles = L->inter / TILE, w = i / tiles % 2;
-    Slot& s = L->slots[i / (2 * tiles)];
-    matvec_tile(s.ex->codes[2 * w], s.ex->scales[2 * w], L->formats[s.ex->format].in, i % tiles, (w ? s.up : s.gate).data());
-}
-
 // SwiGLU with the routing weight, then the input of w2 prepared as the reference prepares it.
-void hidden(void* ctx, int e) {
-    auto* L = (SclmLayer*)ctx;
+void hidden(SclmLayer* L, int e) {
     Slot& s = L->slots[e];
     const Format& f = L->formats[s.ex->format];
     const int inter = L->inter;
@@ -222,13 +234,80 @@ void hidden(void* ctx, int e) {
     build_tables(f.cb, f.d, gate, inter, s.mid);
 }
 
-// w2: task i is one tile of one expert.
-void out_tile(void* ctx, int i) {
+// Task i of group g. Returns its phase (see sclm_phase_seconds).
+int task(SclmLayer* L, int g, int i) {
+    const int dim = L->dim, formats = int(L->used.size());
+    float* x = L->x.data();
+    if (g == 0) {
+        std::memcpy(x, L->in, sizeof(float) * dim);
+        fp8_blocks(x, dim);
+        rotate(x, dim, L->rot_dim);
+        return 0;
+    }
+    if (g <= 2 * formats) {  // part i of a format's input tables: first its largest entry, then the entries on the scale
+        Format& f = L->formats[L->used[(g - 1) % formats]];
+        const int j0 = i * f.in.groups / PARTS, j1 = (i + 1) * f.in.groups / PARTS;
+        if (g <= formats) f.peak[i] = table_max(f.cb, f.d, f.in.codes, x, j0, j1);
+        else table_fill(f.cb, f.d, f.in.codes, x, j0, j1, f.in.scale, f.in.t);
+        return 1;
+    }
+    Slot& s = L->slots[(g - 1 - 2 * formats) % L->n];
+    if (g <= 2 * formats + L->n) {  // a tile of w1, then of w3
+        const int tiles = L->inter / TILE, w = i / tiles;
+        matvec_tile(s.ex->codes[2 * w], s.ex->scales[2 * w], L->formats[s.ex->format].in, i % tiles, (w ? s.up : s.gate).data());
+        return 2;
+    }
+    matvec_tile(s.ex->codes[1], s.ex->scales[1], s.mid, i, s.out.data());  // a tile of w2
+    bf16(s.out.data() + i * TILE, TILE);
+    return 4;
+}
+
+// Group g's last task is done: the calling thread does what follows it and lets the tasks that waited for it start.
+void finish(SclmLayer* L, int g) {
+    Group* groups = L->groups.get();
+    const int formats = int(L->used.size()), n = L->n;
+    if (g == 0) {
+        for (int f = 1; f <= formats; ++f) groups[f].ready = true;
+    } else if (g <= formats) {
+        Format& f = L->formats[L->used[g - 1]];
+        f.in.scale = *std::max_element(f.peak, f.peak + PARTS) / 127.0f;
+        groups[g + formats].ready = true;
+    } else if (g <= 2 * formats) {
+        for (int e = 0; e < n; ++e)
+            if (L->slots[e].ex->format == L->used[g - 1 - formats]) groups[1 + 2 * formats + e].ready = true;
+    } else if (g <= 2 * formats + n) {
+        hidden(L, g - 1 - 2 * formats);
+        groups[g + n].ready = true;
+    } else if (L->open.fetch_sub(1) == 1) {
+        L->ended = now();
+    }
+}
+
+// One thread's share of a call: tasks of the groups that are ready, the earlier group first, until every expert is
+// done. While the tiles keep the memory busy, the tables and hidden vectors cost the call next to nothing.
+void work(void* ctx, int) {
     auto* L = (SclmLayer*)ctx;
-    const int tiles = L->dim / TILE, t = i % tiles;
-    Slot& s = L->slots[i / tiles];
-    matvec_tile(s.ex->codes[1], s.ex->scales[1], s.mid, t, s.out.data());
-    bf16(s.out.data() + t * TILE, TILE);
+    double seconds[5] = {};
+    while (L->open.load() > 0) {
+        int g = 0, i = 0;
+        for (; g < L->n_groups; ++g) {
+            Group& group = L->groups[g];
+            if (group.ready.load() && group.next.load() < group.count && (i = group.next.fetch_add(1)) < group.count) break;
+        }
+        if (g == L->n_groups) {  // what is left waits for a task another thread is at
+            _mm_pause();
+            continue;
+        }
+        const double t0 = now();
+        const int phase = task(L, g, i);
+        const double t1 = now();
+        seconds[phase] += t1 - t0;
+        if (L->groups[g].left.fetch_sub(1) == 1) {
+            finish(L, g);
+            if (phase == 2) seconds[3] += now() - t1;  // the expert's hidden vector
+        }
+    }
+    for (int p = 0; p < 5; ++p) phase_seconds[p] += seconds[p];
 }
 
 }  // namespace
@@ -253,31 +332,28 @@ __declspec(dllexport) SclmLayer* sclm_layer_new(int dim, int inter, float swiglu
 
 __declspec(dllexport) void sclm_layer_free(SclmLayer* L) {
     for (Format& f : L->formats)
-        for (void* p : {(void*)f.cb, (void*)f.in.t, (void*)f.in.tmp}) _aligned_free(p);
-    for (Slot& s : L->slots)
-        for (void* p : {(void*)s.mid.t, (void*)s.mid.tmp}) _aligned_free(p);
+        for (void* p : {(void*)f.cb, (void*)f.in.t}) _aligned_free(p);
+    for (Slot& s : L->slots) _aligned_free(s.mid.t);
     delete L;
 }
 
-// Threads that share a layer call (the caller's included). Not to be called while a forward runs.
+// Threads that share a layer call (the caller's included). Not to be called while a call runs.
 __declspec(dllexport) void sclm_set_threads(int threads) {
     delete pool;
     pool = new Pool(threads);
 }
 
-// y[dim] = sum of gates[e] * expert e of x[dim] over the n experts (MoE.forward's routed sum for one token).
-__declspec(dllexport) void sclm_layer_forward(SclmLayer* L, const SclmExpert* experts, const float* gates, int n, const float* x, float* y) {
+// Starts y = sum of gates[e] * expert e of x[dim] over the n experts (MoE.forward's routed sum for one token) on the
+// pool's workers and returns: the caller can do other work until it takes y with sclm_layer_wait. experts and x are
+// read until then. One call at a time over all layers: the pool is shared.
+__declspec(dllexport) void sclm_layer_start(SclmLayer* L, const SclmExpert* experts, const float* gates, int n, const float* x) {
     const int dim = L->dim, inter = L->inter;
-    Phase phase;
-    float* xr = L->x.data();
-    std::memcpy(xr, x, sizeof(float) * dim);
-    fp8_blocks(xr, dim);
-    rotate(xr, dim, L->rot_dim);
+    L->started = L->ended = now();
     while (int(L->slots.size()) < n) {  // a slot's tables are sized for the largest format
         size_t entries = 0;
         for (const Format& f : L->formats) entries = std::max(entries, size_t(inter / f.d) * f.in.codes);
         Slot& s = L->slots.emplace_back();
-        s.mid.t = aligned<int8_t>(entries), s.mid.tmp = aligned<float>(entries);
+        s.mid.t = aligned<int8_t>(entries);
         s.gate.resize(inter), s.up.resize(inter), s.out.resize(dim);
     }
     L->used.clear();
@@ -285,23 +361,38 @@ __declspec(dllexport) void sclm_layer_forward(SclmLayer* L, const SclmExpert* ex
         L->slots[e].ex = experts + e, L->slots[e].weight = gates[e];
         if (std::find(L->used.begin(), L->used.end(), experts[e].format) == L->used.end()) L->used.push_back(experts[e].format);
     }
-    phase.end(0);
-    pool->run(int(L->used.size()), build_in, L);
-    phase.end(1);
-    pool->run(n * 2 * (inter / TILE), in_tile, L);
-    phase.end(2);
-    pool->run(n, hidden, L);
-    phase.end(3);
-    pool->run(n * (dim / TILE), out_tile, L);
-    phase.end(4);
+    const int formats = int(L->used.size());
+    L->in = x, L->n = n, L->n_groups = 1 + 2 * formats + 2 * n, L->open = n;
+    if (L->room < L->n_groups) L->groups.reset(new Group[L->room = L->n_groups]);
+    for (int g = 0; g < L->n_groups; ++g) {
+        Group& group = L->groups[g];
+        group.count = g == 0 ? 1 : g <= 2 * formats ? PARTS : g <= 2 * formats + n ? 2 * (inter / TILE) : dim / TILE;
+        group.next = 0, group.left = group.count, group.ready = g == 0;
+    }
+    if (n) pool->start(int(pool->workers.size()) + 1, work, L);  // every thread works until the call is done
+}
+
+// The calling thread joins the call started on L, and y[dim] is its result.
+__declspec(dllexport) void sclm_layer_wait(SclmLayer* L, float* y) {
+    const int dim = L->dim, n = L->n;
+    if (n) pool->join();
+    const double t0 = now();
     std::memset(y, 0, sizeof(float) * dim);
     for (int e = 0; e < n; ++e)  // in call order, as the reference adds them
         for (int i = 0; i < dim; ++i) y[i] += L->slots[e].out[i];
-    phase.end(5);
+    phase_seconds[5] += now() - t0, phase_seconds[6] += L->ended - L->started;
 }
 
-// out[6] = seconds so far in the phases of sclm_layer_forward: input quantization and rotation, the input tables,
-// w1 and w3, the hidden vectors with their tables, w2, the sum.
-__declspec(dllexport) void sclm_phase_seconds(double* out) { std::memcpy(out, phase_seconds, sizeof(phase_seconds)); }
+__declspec(dllexport) void sclm_layer_forward(SclmLayer* L, const SclmExpert* experts, const float* gates, int n, const float* x, float* y) {
+    sclm_layer_start(L, experts, gates, n, x);
+    sclm_layer_wait(L, y);
+}
+
+// out[7] = seconds so far in the phases of the layer calls. The first five are summed over the threads, which work
+// on them at the same time: input quantization and rotation, the input tables, w1 and w3, the hidden vectors with
+// their tables, w2. Then the sum of the experts, and by the clock the time from a call's start to its last expert.
+__declspec(dllexport) void sclm_phase_seconds(double* out) {
+    for (int p = 0; p < 7; ++p) out[p] = phase_seconds[p];
+}
 
 }  // extern "C"
