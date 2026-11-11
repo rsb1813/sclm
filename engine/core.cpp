@@ -117,6 +117,52 @@ struct Pool {
 
 Pool* pool = new Pool(1);
 
+// Memory the workers read ahead of the call expected to need it (sclm_layer_touch), so that the call finds it in the
+// cache: a call's time is mostly reading codes from memory, and between two calls the threads and the memory idle.
+struct Touch {
+    static constexpr int RANGES = 48;
+    static constexpr size_t CHUNK = 64 << 10;
+    const uint8_t* at[RANGES];
+    size_t first[RANGES + 1] = {};  // the chunks before each range
+    int n = 0;
+    std::atomic<size_t> next{0};  // the first unclaimed chunk
+    std::atomic<bool> stop{false};
+    bool on = false;  // the pool's job is this
+    const uint8_t* end[RANGES];
+} touch;
+std::atomic<uint64_t> touch_asked{0}, touch_read{0};  // bytes, since the process started
+std::atomic<uint64_t> touch_sink{0};
+// The most workers that read ahead. One reads nearly as fast as seven (a thread fills the memory's bandwidth), and
+// more of them slow the calling thread's own work down: 8 guessed experts a layer, 55.8 ms a token without, 54.2
+// with one worker, 55.0 with two, 55.9 with seven.
+int touch_threads = 1;
+
+// One worker's share: chunks in order (the caller lists the likeliest memory first) until none is left or the job is
+// stopped. A load a cache line is enough; the result only keeps the loads from being dropped.
+void touch_work(void*, int) {
+    __m512i sum = _mm512_setzero_si512();
+    uint64_t bytes = 0;
+    for (int r = 0; !touch.stop.load(std::memory_order_relaxed);) {
+        const size_t c = touch.next.fetch_add(1);
+        if (c >= touch.first[touch.n]) break;
+        while (c >= touch.first[r + 1]) ++r;
+        const uint8_t* p = touch.at[r] + (c - touch.first[r]) * Touch::CHUNK;
+        const uint8_t* e = std::min(p + Touch::CHUNK, touch.end[r]);
+        bytes += e - p;
+        for (; p + 64 <= e; p += 64) sum = _mm512_xor_si512(sum, _mm512_loadu_si512(p));
+    }
+    touch_sink += _mm512_reduce_add_epi64(sum);
+    touch_read += bytes;
+}
+
+// Ends the read-ahead, if one runs: the pool is free for the next job when this returns.
+void touch_end() {
+    if (!touch.on) return;
+    touch.stop = true;
+    pool->join();  // takes the shares no worker has claimed (they return at once) and waits for the others
+    touch.on = false;
+}
+
 // Seconds spent in each phase of the layer calls since the process started (a measuring aid).
 std::atomic<double> phase_seconds[7];
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -339,6 +385,7 @@ __declspec(dllexport) void sclm_layer_free(SclmLayer* L) {
 
 // Threads that share a layer call (the caller's included). Not to be called while a call runs.
 __declspec(dllexport) void sclm_set_threads(int threads) {
+    touch_end();
     delete pool;
     pool = new Pool(threads);
 }
@@ -348,6 +395,7 @@ __declspec(dllexport) void sclm_set_threads(int threads) {
 // read until then. One call at a time over all layers: the pool is shared.
 __declspec(dllexport) void sclm_layer_start(SclmLayer* L, const SclmExpert* experts, const float* gates, int n, const float* x) {
     const int dim = L->dim, inter = L->inter;
+    touch_end();
     L->started = L->ended = now();
     while (int(L->slots.size()) < n) {  // a slot's tables are sized for the largest format
         size_t entries = 0;
@@ -371,6 +419,34 @@ __declspec(dllexport) void sclm_layer_start(SclmLayer* L, const SclmExpert* expe
     }
     if (n) pool->start(int(pool->workers.size()) + 1, work, L);  // every thread works until the call is done
 }
+
+// Starts reading the codes of n experts of L (the likeliest first) into the cache on the pool's workers and returns:
+// for experts a call on L is expected to use soon. The read-ahead ends by itself or when the next call starts; it
+// changes no result. Nothing happens without workers.
+__declspec(dllexport) void sclm_layer_touch(SclmLayer* L, const SclmExpert* experts, int n) {
+    touch_end();
+    if (pool->workers.empty()) return;
+    int r = 0;
+    for (int e = 0; e < n && r + 3 <= Touch::RANGES; ++e) {
+        const Format& f = L->formats[experts[e].format];
+        const size_t step = f.in.codes == 256 ? TILE : 192;  // bytes of a tile's codes for one group of columns
+        const size_t wide = size_t(L->inter / TILE) * (L->dim / f.d) * step, tall = size_t(L->dim / TILE) * (L->inter / f.d) * step;
+        for (int w : {0, 2, 1}) {  // w1, w3, w2: the order a call reads them in
+            const size_t bytes = w == 1 ? tall : wide;
+            touch.at[r] = experts[e].codes[w], touch.end[r] = touch.at[r] + bytes;
+            touch.first[r + 1] = touch.first[r] + (bytes + Touch::CHUNK - 1) / Touch::CHUNK;
+            touch_asked += bytes, ++r;
+        }
+    }
+    if (!r) return;
+    touch.n = r, touch.next = 0, touch.stop = false, touch.on = true;
+    pool->start(std::min(int(pool->workers.size()), touch_threads), touch_work, nullptr);
+}
+
+__declspec(dllexport) void sclm_touch_threads(int threads) { touch_threads = threads; }
+
+// out[2] = bytes sclm_layer_touch was asked to read ahead so far, and bytes it read before the next call started.
+__declspec(dllexport) void sclm_touch_bytes(double* out) { out[0] = double(touch_asked.load()), out[1] = double(touch_read.load()); }
 
 // The calling thread joins the call started on L, and y[dim] is its result.
 __declspec(dllexport) void sclm_layer_wait(SclmLayer* L, float* y) {

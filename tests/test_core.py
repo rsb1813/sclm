@@ -78,3 +78,32 @@ def test_layer_forward_matches_the_reference_expert(tmp_path):
                     assert (layer.wait() == y.numpy()).all(), (ids, threads)
     finally:
         torch.set_default_dtype(prev)
+
+
+def test_reading_codes_ahead_changes_no_result(tmp_path):
+    path = str(tmp_path / "layer_00.safetensors")
+    make_layer(path)
+    layer = core.Layer(path, DIM, INTER, LIMIT)
+    g = torch.Generator().manual_seed(2)
+    x = (3 * torch.randn(DIM, generator=g)).numpy()
+    y = layer.forward([0, 2, 3, 4], [0.4, 0.3, 0.2, 0.1], x).copy()
+    sizes = {e: sum(layer.arrays[f"{o}.{w}.codes"][k].nbytes for w in ("w1", "w2", "w3"))
+             for o in OPTIONS for k, e in enumerate(layer.arrays[f"{o}.experts"].tolist())}
+    for threads in (1, 2, 5):
+        core.set_threads(threads)
+        core.touch_threads(threads - 1)
+        asked, read = core.touch_bytes()
+        for late in range(30):  # the forward ends the read-ahead wherever it is; one read-ahead replaces another
+            layer.touch([4, 0])
+            layer.touch([2, 3, 0])
+            sum(range(late * 300))
+            assert (layer.forward([0, 2, 3, 4], [0.4, 0.3, 0.2, 0.1], x) == y).all(), threads
+        now = core.touch_bytes()
+        if threads == 1:  # nobody to read ahead
+            assert now == (asked, read)
+        else:
+            assert now[0] - asked == 30 * (sizes[4] + 2 * sizes[0] + sizes[2] + sizes[3])
+            assert 0 < now[1] - read <= now[0] - asked
+        layer.touch([0])
+    core.set_threads(1)  # ends a read-ahead under way
+    core.touch_threads(1)

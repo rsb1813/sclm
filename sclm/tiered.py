@@ -49,9 +49,12 @@ class TieredMoE(nn.Module):
         learn the routing and take x for the CPU tier; while the CPU computes its tier, the device computes the shared
         expert (queued before that wait, but not waited for) and the routed experts it already holds."""
         cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
-        guess = cache.guess if self.after else 0
-        buf = gpu.moe_buffers(topk, self.dim, cache.guess, x.device)
-        # with guess: what the next layer's gate makes of this layer's input, so its SSD experts are read a layer early
+        ahead = max(cache.guess, cache.touch)
+        guess = ahead if self.after else 0
+        buf = gpu.moe_buffers(topk, self.dim, ahead, x.device)
+        # with guess: what the next layer's gate makes of this layer's input, best first: of the first cache.guess, the
+        # SSD experts are read a layer early; of the first cache.touch, the CPU-tier experts' codes are read into the
+        # CPU's cache
         bound = self.bound
         begin, end, _, _ = bound if bound is not None and bound[2] is buf and bound[3] == guess else self.bind(buf, guess)
         later = self.after[0] if guess else None
@@ -70,7 +73,7 @@ class TieredMoE(nn.Module):
         if guess:
             gpu.moe_guess()  # as a rule it has arrived while the reads above were started
             picks = host[2 * topk + self.dim:2 * topk + self.dim + guess].astype(np.int64).tolist()
-            cache.read_ahead(later.layer_id, [e for e in picks if e not in later.ram.experts])
+            cache.read_ahead(later.layer_id, [e for e in picks[:cache.guess] if e not in later.ram.experts])
         if wait:  # lossy: the token goes on without the light experts that are not in the cache yet
             ssd, slots = [k for k, s in zip(ssd, slots) if s is not None], [s for s in slots if s is not None]
         kept = sum(gates[k] for k in ram + ssd)
@@ -83,6 +86,10 @@ class TieredMoE(nn.Module):
             gpu.fp4_experts(cache.store, *zip(*held), self.dim, self.inter, self.limit, xq, y)
         self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:2 * topk + self.dim],
                          cache.ram_out.numpy())
+        if guess and cache.touch:  # the CPU's threads and the memory idle until the next layer's routing is known
+            named = [e for e in picks[:cache.touch] if e in later.ram.experts]
+            if named:
+                later.ram.touch(named)
         t2 = perf_counter()
         cache.finish(pending)
         t3 = perf_counter()

@@ -78,6 +78,9 @@ class ExpertCache:
         self.wait_share = 0.0
         self.ram_share = 0.0  # > 0: a CPU-tier expert with less than this share of the routing weight is left out
         self.guess = 0  # > 0: a layer's gate guesses this many experts of the next layer, which are read ahead
+        # > 0: the CPU-tier experts among this many guessed ones have their codes read into the CPU's cache while the
+        # device computes the attention before them (core.Layer.touch)
+        self.touch = 0
         self.ram_cache = {}  # key -> host buffer holding the expert's bytes (keep_in_ram), the oldest first
         self.ram_free = []  # the host buffers of keep_in_ram that hold nothing
         self.policy = core.Cache(n_layers * n_experts, slots, lam)

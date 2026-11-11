@@ -36,6 +36,8 @@ def main() -> None:
                     "of the token and read in the background")
     ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
                     "the SSD a layer early (0: none)")
+    ap.add_argument("--touch", type=int, default=8, help="guessed experts of the next layer whose CPU-tier codes are read "
+                    "into the CPU's cache while the device computes the attention before them (0: none)")
     ap.add_argument("--ram-cache", type=int, default=0, help="experts kept in RAM after they leave the VRAM cache, "
                     "18.8 MB each of pinned memory (scripts/ram_cache.py)")
     ap.add_argument("--name", required=True)
@@ -52,6 +54,7 @@ def main() -> None:
     cache = host.attach_tiers_(net, args, ck, cli.codes, cli.slots, cli.lam,
                                background=(12 if cli.wait_share else 0) + (16 if cli.guess else 0))
     cache.topk, cache.wait_share, cache.ram_share, cache.guess = cli.topk, cli.wait_share, cli.ram_share, cli.guess
+    cache.touch = cli.touch
     cache.keep_in_ram(cli.ram_cache)
     core.set_threads(cli.threads)
     decoder = host.Host(net, cache)
@@ -81,10 +84,12 @@ def main() -> None:
         print(json.dumps({k: v for k, v in per_seq[-1].items() if k != "kl_by_position"}), flush=True)
     n = len(per_seq) * cli.tokens
     timed = len(per_seq) * (cli.tokens - cli.tokens // 4)
-    out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "wait_share": cli.wait_share, "ram_share": cli.ram_share, "guess": cli.guess, "ram_cache": cli.ram_cache, "tokens": n,
+    out = {"name": cli.name, "slots": cli.slots, "topk": cli.topk, "wait_share": cli.wait_share, "ram_share": cli.ram_share, "guess": cli.guess, "touch": cli.touch, "ram_cache": cli.ram_cache, "tokens": n,
            "kl_top64": sum(x["kl"] for x in per_seq) / len(per_seq), "top1_agree": sum(x["top1"] for x in per_seq) / len(per_seq),
            "tok_s": timed / seconds, "ms_per_token": 1e3 * seconds / timed,
+           "vram_peak_gib": torch.cuda.max_memory_allocated() / 2**30,
            "per_token": {k: (1e3 * v / n if k.endswith("_s") else v / n) for k, v in stats.items()}, "per_seq": per_seq}
+    out["touch_asked_mb"], out["touch_read_mb"] = (b / 1e6 / (len(per_seq) * cli.tokens) for b in core.touch_bytes())
     with open(os.path.join(DATA, f"hosteval_{cli.name}.json"), "w") as f:
         json.dump(out, f, indent=1)
     print(json.dumps({k: v for k, v in out.items() if k != "per_seq"}), flush=True)

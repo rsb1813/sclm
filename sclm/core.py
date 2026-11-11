@@ -27,6 +27,9 @@ def _dll():
     lib.sclm_layer_forward.argtypes = [C.c_void_p, C.POINTER(Expert), C.c_void_p, C.c_int, C.c_void_p, C.c_void_p]
     lib.sclm_layer_start.argtypes = [C.c_void_p, C.POINTER(Expert), C.c_void_p, C.c_int, C.c_void_p]
     lib.sclm_layer_wait.argtypes = [C.c_void_p, C.c_void_p]
+    lib.sclm_layer_touch.argtypes = [C.c_void_p, C.POINTER(Expert), C.c_int]
+    lib.sclm_touch_bytes.argtypes = [C.c_void_p]
+    lib.sclm_touch_threads.argtypes = [C.c_int]
     lib.sclm_set_threads.argtypes = [C.c_int]
     lib.sclm_reader_new.restype = C.c_void_p
     lib.sclm_reader_new.argtypes = [C.POINTER(C.c_wchar_p), C.c_int, C.c_int]
@@ -55,6 +58,18 @@ def phase_seconds() -> list:
     out = (C.c_double * 7)()
     _dll().sclm_phase_seconds(out)
     return list(out)
+
+
+def touch_threads(threads: int) -> None:
+    """The most threads that read ahead for Layer.touch (1 at start: see engine/core.cpp)."""
+    _dll().sclm_touch_threads(threads)
+
+
+def touch_bytes() -> tuple[float, float]:
+    """Bytes Layer.touch was asked to read ahead so far, and bytes it read before the next call started."""
+    out = (C.c_double * 2)()
+    _dll().sclm_touch_bytes(out)
+    return out[0], out[1]
 
 
 class Layer:
@@ -92,6 +107,13 @@ class Layer:
         x, g = np.ascontiguousarray(x, np.float32), np.asarray(gates, np.float32)
         self.started = (ex, x)  # the engine reads them until wait()
         self.lib.sclm_layer_start(self.handle, ex, g.ctypes.data, len(experts), x.ctypes.data)
+
+    def touch(self, experts: list) -> None:
+        """Starts reading the codes of these experts (the likeliest first) into the CPU's cache on the other threads
+        and returns: for experts the layer's next forward is expected to use, while the threads have nothing to do.
+        The read-ahead ends when the next forward (of any layer) starts, and changes no result."""
+        ex = (Expert * len(experts))(*[self.experts[e] for e in experts])
+        self.lib.sclm_layer_touch(self.handle, ex, len(experts))
 
     def wait(self, out: np.ndarray | None = None) -> np.ndarray:
         """Joins the call started and returns its result, written into `out` (fp32 [dim]) when given."""

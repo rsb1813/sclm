@@ -107,11 +107,16 @@ def test_host_decodes_as_upstream_with_the_same_experts(tmp_path, monkeypatch, d
                 strict += same
                 assert got.dtype == torch.float32 and tc.rel(got, want) < (limit if same else 5e-2), (start, tc.rel(got, want))
                 first.append(got)
-            # the same tokens as a new sequence: the first one left nothing behind in the decode buffers and the caches
+            # the same tokens as a new sequence: the first one left nothing behind in the decode buffers and the caches.
+            # This time a thread reads the codes of each next layer's guessed experts ahead, which changes nothing
+            cache.touch, asked = 3, core.touch_bytes()[0]
+            core.set_threads(2)
             assert all(torch.equal(decoder.logits(x[:, start:end], start), got) for (start, end), got in zip(steps, first))
+            assert (core.touch_bytes()[0] > asked) == decoder.kernels
         assert strict == 25 if dev == "cpu" else strict >= 2, strict
         assert (max(picks, default=0) > args.index_topk) == decoder.kernels  # the engine's index chose within the test
         assert len(set(reads)) < len(reads)  # experts came back after being evicted
         assert len({layer for layer, _ in reads}) == args.n_layers
     finally:
+        core.set_threads(1)
         torch.set_default_dtype(prev)
