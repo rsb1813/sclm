@@ -212,7 +212,8 @@ def reply(line: str, session: Session, opts: dict, console: Console) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=r"C:\models\DeepSeek-V4.1-Flash")
-    ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20v100")
+    ap.add_argument("--codes", default=r"C:\models\sclm-codes\tier20p02",
+                    help=r"the CPU tier's codes (C:\models\sclm-codes\tier20v100: slower, closer to the original)")
     ap.add_argument("--slots", type=int, default=320, help="original experts the VRAM cache keeps")
     ap.add_argument("--lam", type=float, default=0.1, help="cache score decay per token")
     ap.add_argument("--threads", type=int, default=8, help="CPU threads of the RAM tier")
