@@ -30,11 +30,12 @@ def lib():
         _lib.sclm_gpu_hc_pre_norm.argtypes = [C.c_void_p] * 4 + [C.c_int, C.c_int, C.c_float]
         _lib.sclm_gpu_hc_post.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int]
         _lib.sclm_gpu_fp8_expert.argtypes = [C.c_void_p] * 6 + [C.c_int, C.c_int, C.c_float, C.c_void_p, C.c_void_p, C.c_int]
-        _lib.sclm_gpu_gate.argtypes = [C.c_void_p] * 4 + [C.c_int] * 3 + [C.c_float, C.c_float, C.c_int]
+        _lib.sclm_gpu_gate.argtypes = [C.c_void_p] * 4 + [C.c_int] * 3 + [C.c_float, C.c_float, C.c_int, C.c_void_p]
         _lib.sclm_gpu_gate_guess.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float, C.c_float]
         _lib.sclm_gpu_moe_begin.argtypes = ([C.c_void_p] * 5 + [C.c_int] * 3 + [C.c_float] * 2 + [C.c_int] + [C.c_void_p] * 5 +
                                             [C.c_int] * 2 + [C.c_float] * 2 + [C.c_void_p] * 6 + [C.c_int, C.c_float] +
-                                            [C.c_void_p] * 3)
+                                            [C.c_void_p] * 4)
+        _lib.sclm_gpu_pool.argtypes = [C.c_void_p] * 7 + [C.c_int] * 3 + [C.c_void_p] * 2 + [C.c_int] * 3 + [C.c_float, C.c_int]
         _lib.sclm_gpu_moe_guess.argtypes = []
         _lib.sclm_gpu_moe_end.argtypes = [C.c_void_p] * 5 + [C.c_int]
         _lib.sclm_gpu_copy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
@@ -186,6 +187,21 @@ def compress(compressor, indexer, x: torch.Tensor, pos: int, freqs_cis: torch.Te
         indexer.index_head_dim if key else 32, rd, compressor.norm.eps))
 
 
+def pool(compressor, x: torch.Tensor, pos: int, freqs_cis: torch.Tensor, norm_weight: torch.Tensor, out: torch.Tensor) -> None:
+    """One decode token x (bf16 [dim]) at position pos > 0 through a Compressor of V4-Flash-0731: its state takes the
+    token, and when the token completes a group of compress_ratio, out (bf16 [head_dim], the group's row of the cache
+    the compressor fills) gets the group's latent: normed (norm_weight: the norm's weight as bf16), rotated, and
+    rounded as upstream rounds it (FP8 on the unrotated values, or the index's Hadamard-rotated FP4 keys for a
+    compressor made with rotate). freqs_cis: the attention's rotations."""
+    ratio, d, rd = compressor.compress_ratio, compressor.head_dim, compressor.rope_head_dim
+    assert x.dtype == out.dtype == norm_weight.dtype == torch.bfloat16 and x.is_contiguous() and out.numel() == d
+    _check(lib().sclm_gpu_pool(
+        compressor.wkv.weight.data_ptr(), compressor.wgate.weight.data_ptr(), compressor.ape.data_ptr(), norm_weight.data_ptr(),
+        x.data_ptr(), compressor.kv_state.data_ptr(), compressor.score_state.data_ptr(), ratio, compressor.overlap, pos % ratio,
+        freqs_cis.data_ptr() + (pos + 1 - ratio) * rd * 4, out.data_ptr(), x.numel(), d, rd, compressor.norm.eps,
+        compressor.rotate))
+
+
 def index_pick(indexer, qr: torch.Tensor, x: torch.Tensor, freqs: int, keys: torch.Tensor, count: int, out: torch.Tensor,
                offset: int) -> None:
     """One decode token through an upstream Indexer once it has to choose: out (int32 [index_topk]) = the positions
@@ -225,15 +241,26 @@ def attn_out(o: torch.Tensor, freqs: int, wo_a_weight: torch.Tensor, wo_a_scale:
     return out
 
 
-def gate(module, x: torch.Tensor, room: int = 0) -> torch.Tensor:
+def gate_args(module) -> tuple:
+    """(the bias's address or None, the temperature, whether the picks' weights are normalized) of an upstream Gate:
+    V4.1's has all three as attributes; V4-Flash-0731's has no temperature, always normalizes, and has no bias in
+    the layers that route by the token id."""
+    bias = module.bias.data_ptr() if module.bias is not None else None
+    return bias, getattr(module, "gate_temp", 1.0), getattr(module, "norm_topk_prob", True)
+
+
+def gate(module, x: torch.Tensor, room: int = 0, fixed: torch.Tensor | None = None) -> torch.Tensor:
     """upstream Gate.forward ("sqrtsoftplus" scores) for one token x (bf16 [dim]) -> fp32 [2 * topk + dim]: the picked
     experts' indices, their weights, then x as fp32, so that one transfer gives the host all it needs. room: floats
-    left free after them (for gate_guess)."""
+    left free after them (for gate_guess). fixed (int32 [topk]): the experts to weight instead of the gate's choice
+    (V4-Flash-0731's layers that route by the token id)."""
     assert module.score_func == "sqrtsoftplus" and x.dtype == module.weight.dtype == torch.bfloat16 and x.is_contiguous()
+    assert fixed is None or (fixed.dtype == torch.int32 and fixed.numel() == module.topk and fixed.is_contiguous())
     n, dim = module.weight.shape
+    bias, temp, norm = gate_args(module)
     pack = torch.empty(2 * module.topk + dim + room, dtype=torch.float32, device=x.device)
-    _check(lib().sclm_gpu_gate(module.weight.data_ptr(), module.bias.data_ptr(), x.data_ptr(), pack.data_ptr(), n, module.topk,
-                               dim, module.gate_temp, module.route_scale, module.norm_topk_prob))
+    _check(lib().sclm_gpu_gate(module.weight.data_ptr(), bias, x.data_ptr(), pack.data_ptr(), n, module.topk, dim, temp,
+                               module.route_scale, norm, None if fixed is None else fixed.data_ptr()))
     return pack
 
 
@@ -244,9 +271,9 @@ def gate_guess(module, norm_weight: torch.Tensor, h: torch.Tensor, pre: torch.Te
     n, dim = module.weight.shape
     assert module.score_func == "sqrtsoftplus" and h.dtype == torch.bfloat16 and h.is_contiguous() and pre.is_contiguous()
     assert out.dtype == pre.dtype == torch.float32 and out.is_contiguous() and norm_weight.numel() == dim
-    _check(lib().sclm_gpu_gate_guess(module.weight.data_ptr(), module.bias.data_ptr(), h.data_ptr(), pre.data_ptr(),
-                                     norm_weight.data_ptr(), out.data_ptr(), n, out.numel() // 2, dim, pre.numel(),
-                                     module.gate_temp, eps))
+    bias, temp, _ = gate_args(module)
+    _check(lib().sclm_gpu_gate_guess(module.weight.data_ptr(), bias, h.data_ptr(), pre.data_ptr(), norm_weight.data_ptr(),
+                                     out.data_ptr(), n, out.numel() // 2, dim, pre.numel(), temp, eps))
 
 
 @lru_cache(2)
@@ -264,7 +291,7 @@ def moe_buffers(topk: int, dim: int, guess: int, device: torch.device) -> Simple
 
 def moe_begin(module, x: torch.Tensor, expert, limit: float, buf: SimpleNamespace, guess: int = 0, later=None,
               norm_weight: torch.Tensor | None = None, h: torch.Tensor | None = None, pre: torch.Tensor | None = None,
-              eps: float = 0.0) -> None:
+              eps: float = 0.0, fixed: torch.Tensor | None = None) -> None:
     """The start of the two-tier MoE for one token x (bf16 [dim]) in one call, into buf (moe_buffers): gate(module, x)
     into buf.pack; with guess, gate_guess(later, norm_weight, h, pre, eps) for `guess` picks after it; buf.routed = 0,
     buf.xq = act_quant(x) and buf.shared = fp8_expert(expert, limit, xq, store=True). Returns when the gate's part
@@ -276,15 +303,17 @@ def moe_begin(module, x: torch.Tensor, expert, limit: float, buf: SimpleNamespac
     if guess:
         assert later.score_func == "sqrtsoftplus" and later.weight.shape == module.weight.shape and norm_weight.numel() == dim
         assert h.dtype == torch.bfloat16 and h.is_contiguous() and pre.dtype == torch.float32 and pre.is_contiguous()
-        ahead = (later.weight.data_ptr(), later.bias.data_ptr(), h.data_ptr(), pre.data_ptr(), norm_weight.data_ptr(), guess,
-                 pre.numel(), later.gate_temp, eps)
+        later_bias, later_temp, _ = gate_args(later)
+        ahead = (later.weight.data_ptr(), later_bias, h.data_ptr(), pre.data_ptr(), norm_weight.data_ptr(), guess,
+                 pre.numel(), later_temp, eps)
     else:
         ahead = (None, None, None, None, None, 0, 0, 0.0, 0.0)
+    bias, temp, norm = gate_args(module)
     _check(lib().sclm_gpu_moe_begin(
-        module.weight.data_ptr(), module.bias.data_ptr(), x.data_ptr(), buf.pack.data_ptr(), buf.host.data_ptr(), n, module.topk,
-        dim, module.gate_temp, module.route_scale, module.norm_topk_prob, *ahead, w1.data_ptr(), w1.scale.data_ptr(),
+        module.weight.data_ptr(), bias, x.data_ptr(), buf.pack.data_ptr(), buf.host.data_ptr(), n, module.topk,
+        dim, temp, module.route_scale, norm, *ahead, w1.data_ptr(), w1.scale.data_ptr(),
         w2.data_ptr(), w2.scale.data_ptr(), w3.data_ptr(), w3.scale.data_ptr(), w1.size(0), limit, buf.xq.data_ptr(),
-        buf.shared.data_ptr(), buf.routed.data_ptr()))
+        buf.shared.data_ptr(), buf.routed.data_ptr(), None if fixed is None else fixed.data_ptr()))
 
 
 def moe_guess() -> None:

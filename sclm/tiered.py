@@ -36,18 +36,21 @@ class TieredMoE(nn.Module):
             later, norm_weight, eps = self.after
             h, pre = self.stream
             assert later.gate.score_func == "sqrtsoftplus" and later.gate.weight.shape == gate.weight.shape
-            ahead = (later.gate.weight, later.gate.bias, h, pre, norm_weight, guess, pre.numel(), later.gate.gate_temp, eps)
-        begin = gpu.bind("moe_begin", gate.weight, gate.bias, gpu.LATER, buf.pack, buf.host, n, gate.topk, dim, gate.gate_temp,
-                         gate.route_scale, gate.norm_topk_prob, *ahead, w1, w1.scale, w2, w2.scale, w3, w3.scale, w1.size(0),
-                         self.limit, buf.xq, buf.shared, buf.routed)  # the token
+            later_bias, later_temp, _ = gpu.gate_args(later.gate)
+            ahead = (later.gate.weight, later_bias, h, pre, norm_weight, guess, pre.numel(), later_temp, eps)
+        bias, temp, norm = gpu.gate_args(gate)
+        begin = gpu.bind("moe_begin", gate.weight, bias, gpu.LATER, buf.pack, buf.host, n, gate.topk, dim, temp,
+                         gate.route_scale, norm, *ahead, w1, w1.scale, w2, w2.scale, w3, w3.scale, w1.size(0),
+                         self.limit, buf.xq, buf.shared, buf.routed, gpu.LATER)  # the token; the picks, if they are given
         end = gpu.bind("moe_end", buf.routed, self.cache.ram_out, buf.ram, buf.shared, buf.out, dim)
         self.bound = (begin, end, buf, guess)
         return self.bound
 
-    def decode(self, x: torch.Tensor) -> torch.Tensor:
+    def decode(self, x: torch.Tensor, fixed: int | None = None) -> torch.Tensor:
         """forward for one token (bf16 [dim]) on the engine's GPU kernels. The host waits for the device once, to
         learn the routing and take x for the CPU tier; while the CPU computes its tier, the device computes the shared
-        expert (queued before that wait, but not waited for) and the routed experts it already holds."""
+        expert (queued before that wait, but not waited for) and the routed experts it already holds.
+        fixed: the address of the token's experts (int32 [topk]) in a layer that routes by the token id."""
         cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
         ahead = max(cache.guess, cache.touch)
         guess = ahead if self.after else 0
@@ -58,7 +61,7 @@ class TieredMoE(nn.Module):
         bound = self.bound
         begin, end, _, _ = bound if bound is not None and bound[2] is buf and bound[3] == guess else self.bind(buf, guess)
         later = self.after[0] if guess else None
-        begin(x.data_ptr())
+        begin(x.data_ptr(), fixed)
         # the routing was copied after every slot upload queued so far, and after every kernel that read a slot: from
         # here to the next layer's routing, the slot copies run beside the kernels (gpu.copy)
         cache.uploading, cache.beside = False, True
@@ -131,8 +134,11 @@ class TieredMoE(nn.Module):
         """image_mask: the block's second argument, which upstream's gate takes flattened: V4.1's image mask (None
         for text), or the token ids with V4-Flash-0731, whose first layers route by them."""
         shape = x.size()
-        if gpu.active and x.numel() == self.dim and self.gate.score_func == "sqrtsoftplus" and image_mask is None:
-            return self.decode(x.reshape(-1)).view(shape)
+        if gpu.active and x.numel() == self.dim and self.gate.score_func == "sqrtsoftplus" and not isinstance(image_mask, torch.Tensor):
+            fixed = None  # a decode token: the host gives V4-Flash-0731's token id as a number
+            if getattr(self.gate, "hash", False):  # this layer's experts are the token's row of the table
+                fixed = self.gate.tid2eid.data_ptr() + image_mask * self.gate.topk * 4
+            return self.decode(x.reshape(-1), fixed).view(shape)
         x = x.view(-1, self.dim)
         self.cache.beside = False  # several tokens: a slot copy has to wait for the kernels of the token before
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())

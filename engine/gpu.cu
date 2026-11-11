@@ -2,6 +2,7 @@
 // host's CUDA context): the reference's FP8 and FP4 GEMMs computed straight from the stored bytes, with the activation
 // quantization and the SwiGLU between them. The reference widens every weight to bf16 on each call instead.
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdint>
 
 #define API extern "C" __declspec(dllexport)
@@ -538,6 +539,79 @@ __global__ void dots_k(const W* w, const uint16_t* x, float* out, int k) {
     if (threadIdx.x == 0) out[blockIdx.x] = acc;
 }
 
+// out[row] = <w[row], x> + add[row] (add may be null) for an fp32 weight with rows of k values and x in bf16.
+__global__ void dots_add_k(const float* w, const uint16_t* x, float* out, int k, const float* add) {
+    const float acc = dense_dot(w + size_t(blockIdx.x) * k, x, k);
+    if (threadIdx.x == 0) out[blockIdx.x] = add ? acc + add[blockIdx.x] : acc;
+}
+
+// The pooling of DeepSeek-V4-Flash-0731's Compressor.forward when a decode token completes its group, one block of d
+// threads: v[i] = the sum over the group's entries s of kv[s][i] * softmax over s of score[s][i], rounded to bf16;
+// out = RMSNorm of v with weight w (bf16). Without overlap the entries are the `ratio` rows of kv and score
+// ([ratio][d]). With overlap the rows are 2 * d wide and there are 2 * ratio of them: the entries are the first d
+// values of rows 0 .. ratio - 1 (the group before; a score of -inf while there is none) and the last d values of the
+// rows from `ratio` on (this group).
+__global__ void pool_k(const float* kv, const float* score, int ratio, bool overlap, const uint16_t* w, uint16_t* out, int d, float eps) {
+    const int i = threadIdx.x, entries = overlap ? 2 * ratio : ratio;
+    const size_t width = overlap ? 2 * d : d;
+    float mx = -INFINITY, den = 0, v = 0;
+    for (int e = 0; e < entries; ++e) mx = fmaxf(mx, score[e * width + (overlap && e >= ratio ? d : 0) + i]);
+    for (int e = 0; e < entries; ++e) den += expf(score[e * width + (overlap && e >= ratio ? d : 0) + i] - mx);
+    for (int e = 0; e < entries; ++e) {
+        const size_t at = e * width + (overlap && e >= ratio ? d : 0) + i;
+        v += kv[at] * (expf(score[at] - mx) / den);
+    }
+    v = from_bf16(to_bf16(v));
+    const float r = rsqrtf(block_reduce(v * v, false) / float(d) + eps);
+    out[i] = to_bf16(from_bf16(w[i]) * (v * r));
+}
+
+// What DeepSeek-V4-Flash-0731 does to a pooled latent in[n] (bf16) before caching it, one block of n threads:
+// apply_rotary_emb with freqs on the last rd values (rounded to bf16); then either kernel.act_quant over blocks of
+// `block` on the values before them (the attention's compressed key/value), or, with hadamard, the Walsh-Hadamard
+// transform of all n values (a power of two) times `scale`, rounded to bf16, and kernel.fp4_act_quant over groups of
+// 32 with power-of-two scales (the index's keys).
+__global__ void rope_round_k(const uint16_t* in, const float* freqs, uint16_t* out, int n, int rd, int block, bool hadamard,
+                             float scale) {
+    __shared__ float vals[1024];
+    const int i = threadIdx.x;
+    float v = from_bf16(in[i]);
+    vals[i] = v;
+    __syncthreads();
+    if (i >= n - rd) {
+        const int pair = (i - (n - rd)) >> 1, at = n - rd + 2 * pair;
+        const float a = vals[at], b = vals[at + 1], c = freqs[2 * pair], d = freqs[2 * pair + 1];
+        v = from_bf16(to_bf16(i == at ? a * c - b * d : a * d + b * c));
+    }
+    __syncthreads();
+    vals[i] = v;
+    __syncthreads();
+    if (!hadamard) {
+        if (i < n - rd) {
+            float mx = 0;
+            for (int k = 0; k < block; ++k) mx = fmaxf(mx, fabsf(vals[i / block * block + k]));
+            v = fp8_round(v, mx);
+        }
+        out[i] = to_bf16(v);
+        return;
+    }
+    for (int h = 1; h < n; h <<= 1) {  // the pair that is h apart becomes (a + b, a - b)
+        const float a = vals[i & ~h], b = vals[i | h];
+        __syncthreads();
+        vals[i] = i & h ? a - b : a + b;
+        __syncthreads();
+    }
+    v = from_bf16(to_bf16(vals[i] * scale));
+    __syncthreads();
+    vals[i] = v;
+    __syncthreads();
+    float mx = 0;
+    for (int k = 0; k < 32; ++k) mx = fmaxf(mx, fabsf(vals[(i & ~31) + k]));
+    const uint32_t bits = __float_as_uint(fmaxf(mx, scalbnf(6.0f, -126)) * float(1.0 / 6.0));  // 2^ceil(log2(amax / 6))
+    const float s = scalbnf(1.0f, int(bits >> 23 & 255) - 127 + ((bits & 0x7fffff) != 0));
+    out[i] = to_bf16(round_e2m1(fminf(fmaxf(v / s, -6.0f), 6.0f)) * s);
+}
+
 // upstream Compressor.forward for one token, after its projections: v[i] = sum over the group's `ratio` tokens s of
 // kv[s][i] * softmax over s of score[s][i] (ratio 1: kv[i] itself), rounded to bf16; out = RMSNorm of v with
 // weight w. One block of n threads.
@@ -658,10 +732,11 @@ __global__ void topk_list_k(const int* pick, int* out, int n, int offset) {
 // <w[e], x> and copies its share of the first `copy` values of x; the block that finishes last makes the choice:
 // a score becomes sqrt(softplus(score / temp)), the topk largest of score + bias are picked (best first, the lower
 // index of equal ones) and weighted by their unbiased scores, normalized over the picks when norm is set, times
-// route_scale.
+// route_scale. bias may be null (none). With `fixed`, those topk experts are the picks (a layer that routes by the
+// token id) and only their weights are computed.
 // pack = the topk indices (as fp32), their weights, then x as fp32: all the host needs of this layer in one transfer.
 __global__ void gate_k(const uint16_t* w, const float* bias, const uint16_t* x, float* scores, int* count, float* pack, int n,
-                       int topk, int k, int copy, float temp, float route_scale, bool norm) {
+                       int topk, int k, int copy, float temp, float route_scale, bool norm, const int* fixed) {
     extern __shared__ float mem[];  // key[n], score[n]
     __shared__ float best_key[32];
     __shared__ int best_at[32];
@@ -673,12 +748,14 @@ __global__ void gate_k(const uint16_t* w, const float* bias, const uint16_t* x, 
     for (int e = threadIdx.x; e < n; e += blockDim.x) {
         const float v = ((const volatile float*)scores)[e] / temp;
         score[e] = sqrtf(v > 20.0f ? v : log1pf(expf(v)));  // F.softplus and its threshold
-        key[e] = score[e] + bias[e];
+        key[e] = bias ? score[e] + bias[e] : score[e];
     }
     __syncthreads();
+    if (fixed && threadIdx.x == 0)
+        for (int pick = 0; pick < topk; ++pick) pack[pick] = float(fixed[pick]), pack[topk + pick] = score[fixed[pick]];
     float last_key = INFINITY;
     int last_at = -1;
-    for (int pick = 0; pick < topk; ++pick) {  // the first of the experts that come after the last pick
+    for (int pick = 0; !fixed && pick < topk; ++pick) {  // the first of the experts that come after the last pick
         float top = -INFINITY;
         int at = n;
         for (int e = threadIdx.x; e < n; e += blockDim.x)
@@ -946,6 +1023,34 @@ API int sclm_gpu_compress(const void* wkv, const float* wgate, const uint16_t* n
     return cudaGetLastError();
 }
 
+// One decode token x[dim] (bf16) through a Compressor of DeepSeek-V4-Flash-0731 (Compressor.forward with
+// start_pos > 0), `ratio` tokens to a group, the token being the group's number `slot`. Its projections (wkv and
+// wgate, fp32 [width, dim], width = d, or 2 * d with overlap; the score plus ape[slot], fp32 [ratio][width]) go into
+// row `slot` of kv_state and score_state ([ratio][width]; with overlap into row ratio + slot of [2 * ratio][width]).
+// When the token completes its group (slot == ratio - 1): out[d] (bf16) = the group's pooled latent, normed
+// (norm_w, bf16), rotated by freqs (the rotation of the group's first position) and rounded: FP8 over blocks of 64 on
+// the values that are not rotated, or with hadamard the index's rotated FP4 keys; and with overlap this group's rows
+// take the place of the group before.
+API int sclm_gpu_pool(const float* wkv, const float* wgate, const float* ape, const uint16_t* norm_w, const uint16_t* x,
+                      float* kv_state, float* score_state, int ratio, int overlap, int slot, const float* freqs, uint16_t* out,
+                      int dim, int d, int rd, float eps, int hadamard) {
+    const int width = overlap ? 2 * d : d;
+    const size_t row = size_t(overlap ? ratio + slot : slot) * width;
+    if (d > 1024 || d % 32 || rd % 2 || (hadamard ? d & (d - 1) : (d - rd) % 64)) return -1;
+    ensure_scratch();
+    dots_add_k<<<width, 128>>>(wkv, x, kv_state + row, dim, nullptr);
+    dots_add_k<<<width, 128>>>(wgate, x, score_state + row, dim, ape + size_t(slot) * width);
+    if (slot != ratio - 1) return cudaGetLastError();
+    pool_k<<<1, d>>>(kv_state, score_state, ratio, overlap != 0, norm_w, scratch.h, d, eps);
+    rope_round_k<<<1, d>>>(scratch.h, freqs, out, d, rd, 64, hadamard != 0, float(1.0 / sqrt(double(d))));
+    if (overlap) {
+        const size_t bytes = size_t(ratio) * width * sizeof(float);
+        cudaMemcpyAsync(kv_state, kv_state + size_t(ratio) * width, bytes, cudaMemcpyDeviceToDevice, 0);
+        cudaMemcpyAsync(score_state, score_state + size_t(ratio) * width, bytes, cudaMemcpyDeviceToDevice, 0);
+    }
+    return cudaGetLastError();
+}
+
 // One decode token of upstream Indexer.forward once there are more compressed positions than it keeps: out[topk]
 // (int32) = the positions of the topk highest scores among the first `count` of keys[..][d] (bf16), in order, each
 // plus `offset`. wb/sb: the indexer's fp8 wq_b [heads * d, rank]; qr[rank]: attention's normed low-rank query; wp:
@@ -1020,13 +1125,14 @@ API int sclm_gpu_hc_post(const uint16_t* x, const uint16_t* residual, const floa
 }
 
 // pack[2 * topk + dim] (fp32) = upstream Gate.forward of one token x[dim] (bf16) with the "sqrtsoftplus" score: the
-// topk expert indices, their routing weights, then x itself as fp32. weight is bf16 [n, dim], bias fp32 [n].
+// topk expert indices, their routing weights, then x itself as fp32. weight is bf16 [n, dim], bias fp32 [n] or null;
+// fixed (int32 [topk], or null): the experts to weight instead of the gate's own choice.
 API int sclm_gpu_gate(const uint16_t* weight, const float* bias, const uint16_t* x, float* pack, int n, int topk, int dim,
-                      float temp, float route_scale, int norm) {
+                      float temp, float route_scale, int norm, const int* fixed) {
     if (n > 1024) return -1;
     ensure_scratch();
     gate_k<<<n, 128, 2 * n * sizeof(float)>>>(weight, bias, x, scratch.dots, done_counts(), pack, n, topk, dim, dim, temp, route_scale,
-                                              norm != 0);
+                                              norm != 0, fixed);
     return cudaGetLastError();
 }
 
@@ -1038,7 +1144,8 @@ API int sclm_gpu_gate_guess(const uint16_t* weight, const float* bias, const uin
     if (n > 1024 || k > n) return -1;
     ensure_scratch();
     hc_pre_norm_k<<<1, 1024>>>(h, pre, norm_w, scratch.h, dim, hc, eps);
-    gate_k<<<n, 128, 2 * n * sizeof(float)>>>(weight, bias, scratch.h, scratch.dots, done_counts(), out, n, k, dim, 0, temp, 1.0f, false);
+    gate_k<<<n, 128, 2 * n * sizeof(float)>>>(weight, bias, scratch.h, scratch.dots, done_counts(), out, n, k, dim, 0, temp, 1.0f, false,
+                                              nullptr);
     return cudaGetLastError();
 }
 
@@ -1050,16 +1157,17 @@ static cudaEvent_t moe_copied[2];  // reached when the last sclm_gpu_moe_begin's
 // by norm_w) into the 2 * k floats after them and their copy (sclm_gpu_moe_guess waits for it); then what does not
 // depend on the routing: routed[dim] = 0, xq[dim] = sclm_gpu_act_quant(x) and shared[dim] = the shared expert
 // (sclm_gpu_fp8_expert, stored). Only the first copy is waited for: the device goes on while the host works.
+// fixed: as in sclm_gpu_gate.
 API int sclm_gpu_moe_begin(const uint16_t* weight, const float* bias, const uint16_t* x, float* pack, float* host, int n,
                            int topk, int dim, float temp, float route_scale, int norm, const uint16_t* g_weight,
                            const float* g_bias, const uint16_t* h, const float* pre, const uint16_t* norm_w, int k, int hc,
                            float g_temp, float eps, const uint8_t* w1, const uint8_t* s1, const uint8_t* w2,
                            const uint8_t* s2, const uint8_t* w3, const uint8_t* s3, int inter, float limit, float* xq,
-                           float* shared, float* routed) {
+                           float* shared, float* routed, const int* fixed) {
     if (!moe_copied[0])
         for (cudaEvent_t& event : moe_copied) cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     const int head = 2 * topk + dim;
-    int status = sclm_gpu_gate(weight, bias, x, pack, n, topk, dim, temp, route_scale, norm);
+    int status = sclm_gpu_gate(weight, bias, x, pack, n, topk, dim, temp, route_scale, norm, fixed);
     if (status) return status;
     cudaMemcpyAsync(host, pack, head * sizeof(float), cudaMemcpyDeviceToHost, 0);
     cudaEventRecord(moe_copied[0], 0);
