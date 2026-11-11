@@ -1,0 +1,81 @@
+{
+ "name": "q175_ws015",
+ "codes": "C:\\models\\sclm-codes\\v4-q175",
+ "tokens": 1500,
+ "thinking_tokens": 1023,
+ "looped": false,
+ "all": {
+  "kl": 0.017356403172016144,
+  "top1_agree": 0.9620000123977661,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.38372090458869934
+ },
+ "thinking": {
+  "kl": 0.022801250219345093,
+  "top1_agree": 0.9481915831565857,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.508618950843811
+ },
+ "answer": {
+  "kl": 0.00567908538505435,
+  "top1_agree": 0.9916142821311951,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.11585778743028641
+ },
+ "positions_below_2048": {
+  "kl": 0.017356403172016144,
+  "top1_agree": 0.9620000123977661,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -0.38372090458869934
+ },
+ "largest_gaps": [
+  {
+   "at": 197,
+   "token": "u",
+   "runtime_p": 0.755,
+   "original_p": 0.1402
+  },
+  {
+   "at": 110,
+   "token": " quant",
+   "runtime_p": 0.84,
+   "original_p": 0.3833
+  },
+  {
+   "at": 127,
+   "token": "((",
+   "runtime_p": 0.511,
+   "original_p": 0.1895
+  },
+  {
+   "at": 356,
+   "token": " clamp",
+   "runtime_p": 0.443,
+   "original_p": 0.1309
+  },
+  {
+   "at": 85,
+   "token": " neural",
+   "runtime_p": 0.415,
+   "original_p": 0.1044
+  },
+  {
+   "at": 832,
+   "token": "1",
+   "runtime_p": 0.79,
+   "original_p": 0.5359
+  },
+  {
+   "at": 1083,
+   "token": " 방식",
+   "runtime_p": 0.606,
+   "original_p": 0.3531
+  },
+  {
+   "at": 473,
+   "token": " clamp",
+   "runtime_p": 0.308,
+   "original_p": 0.0697
+  }
+ ]
+}

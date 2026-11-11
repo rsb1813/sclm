@@ -18,6 +18,18 @@ FAR = 2048  # from this position on a ratio-4 layer holds more compressed positi
 QUESTION = "Rust로 간단하게 숫자 값을 양자화하는 코드 만들어줄래?"
 
 
+def report_costs(costs: list, first: int) -> None:
+    """Prints what a token cost on average, below and from position FAR. costs[i]: the seconds of the token at position
+    i and the expert cache's counters for it; the positions before `first` are left out (the first tokens also fill
+    the cache)."""
+    for label, part in ((f"positions below {FAR}", costs[first:FAR]), (f"positions from {FAR}", costs[FAR:])):
+        if part:
+            mean = {k: sum(c.get(k, 0.0) for c in part) / len(part) for k in sorted({k for c in part for k in c})}
+            rest = mean["total_s"] - sum(mean.get(k, 0.0) for k in ("device_s", "ram_s", "read_s", "launch_s"))
+            print(f"{label}: {len(part)} tokens, {1 / mean['total_s']:.1f} tok/s; per token: " + ", ".join(
+                f"{k[:-2]} {1e3 * v:.1f} ms" if k.endswith("_s") else f"{k} {v:.1f}" for k, v in mean.items()) + f", rest {1e3 * rest:.1f} ms")
+
+
 def write(cli) -> None:
     from scripts.chat import Session
     from scripts.generate import load_runtime
@@ -45,36 +57,37 @@ def write(cli) -> None:
     path = os.path.join(DATA, f"thinking_{cli.name}.pt")
     torch.save({"ids": [k[0] for k in kept], "top_ids": torch.stack([k[1] for k in kept]), "top_lp": torch.stack([k[2] for k in kept]),
                 "prompt_tokens": stats["prompt_tokens"], "question": cli.question, "codes": cli.codes, "effort": cli.effort,
-                "temperature": cli.temperature, "top_p": cli.top_p, "seed": cli.seed, "looped": stats["looped"]}, path)
+                "temperature": cli.temperature, "top_p": cli.top_p, "seed": cli.seed, "looped": stats["looped"],
+                "wait_share": cli.wait_share}, path)
     print("".join(text)[-600:])
     print(f"{stats['tokens']} tokens written ({stats['tokens'] / stats['seconds']:.1f} tok/s), looped: {stats['looped']} -> {path}")
-    first = stats["prompt_tokens"] + 64  # the first tokens also fill the cache
-    for label, part in ((f"positions below {FAR}", costs[first:FAR]), (f"positions from {FAR}", costs[FAR:])):
-        if part:
-            mean = {k: sum(c.get(k, 0.0) for c in part) / len(part) for k in sorted({k for c in part for k in c})}
-            rest = mean["total_s"] - sum(mean.get(k, 0.0) for k in ("device_s", "ram_s", "read_s", "launch_s"))
-            print(f"{label}: {len(part)} tokens, {1 / mean['total_s']:.1f} tok/s; per token: " + ", ".join(
-                f"{k[:-2]} {1e3 * v:.1f} ms" if k.endswith("_s") else f"{k} {v:.1f}" for k, v in mean.items()) + f", rest {1e3 * rest:.1f} ms")
+    report_costs(costs, stats["prompt_tokens"] + 64)
 
 
-def score(cli) -> None:
+def original(ckpt: str, ids: torch.Tensor) -> tuple:
+    """(the original model's log-probabilities [tokens, vocab] after each of ids [1, tokens], its tokenizer): one
+    pass of the layer-by-layer reference over the whole sequence."""
     from transformers import AutoTokenizer
 
     from sclm.checkpoint import Checkpoint
     from sclm.layerwise import LayerwiseRunner, load_args, load_params_
     from sclm.upstream import model as m
 
-    run = torch.load(os.path.join(DATA, f"thinking_{cli.name}.pt"), weights_only=True)
-    ids = torch.tensor([run["ids"]])
     torch.set_default_dtype(torch.bfloat16)
-    ck = Checkpoint(cli.ckpt)
-    tok = AutoTokenizer.from_pretrained(cli.ckpt)
+    ck = Checkpoint(ckpt)
+    tok = AutoTokenizer.from_pretrained(ckpt)
     runner = LayerwiseRunner(ck, load_args(max_batch_size=1, max_seq_len=max(1024, ids.size(1))), tok)
     with torch.inference_mode():
         x = runner.hidden(ids)
         norm = m.RMSNorm(runner.args.dim, runner.args.norm_eps).to(runner.device)
         load_params_(norm, {"weight": ck.get("norm.weight")}, "norm.")
-        ref = F.log_softmax(F.linear(norm(x)[0].float(), ck.get("head.weight").to(runner.device).float()), dim=-1).cpu()
+        return F.log_softmax(F.linear(norm(x)[0].float(), ck.get("head.weight").to(runner.device).float()), dim=-1).cpu(), tok
+
+
+def score(cli) -> None:
+    run = torch.load(os.path.join(DATA, f"thinking_{cli.name}.pt"), weights_only=True)
+    ids = torch.tensor([run["ids"]])
+    ref, tok = original(cli.ckpt, ids)
     # position i holds the distribution after token i; the positions from the end of the prompt on predicted a token
     # the runtime then wrote (the last one predicted the token after the reply, which was not fed)
     first = run["prompt_tokens"] - 1
@@ -125,9 +138,10 @@ def main() -> None:
     ap.add_argument("--slots", type=int, default=-1)
     ap.add_argument("--ram-cache", type=int, default=-1)
     ap.add_argument("--max-seq-len", type=int, default=4096)
+    ap.add_argument("--wait-share", type=float, default=0.0, help="the chat's lossy speed option /wait-share (0: exact)")
     cli = ap.parse_args()
     # the runtime's other options, as the chat starts with them
-    cli.lam, cli.threads, cli.min_ram_margin, cli.wait_share, cli.ram_share, cli.topk, cli.touch = 0.1, 8, 0.5, 0.0, 0.0, 0, 8
+    cli.lam, cli.threads, cli.min_ram_margin, cli.ram_share, cli.topk, cli.touch = 0.1, 8, 0.5, 0.0, 0, 8
     cli.guess = 3 if MODEL == "v4" else 4
     (write if cli.phase == "write" else score)(cli)
 

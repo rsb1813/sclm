@@ -1,0 +1,81 @@
+{
+ "name": "q175_long_ws015",
+ "codes": "C:\\models\\sclm-codes\\v4-q175",
+ "tokens": 3894,
+ "thinking_tokens": 3894,
+ "looped": false,
+ "all": {
+  "kl": 0.027965733781456947,
+  "top1_agree": 0.9322034120559692,
+  "confident_where_original_below_2pct": 1,
+  "mean_logprob_of_written_token_under_original": -0.8925060033798218
+ },
+ "thinking": {
+  "kl": 0.027965733781456947,
+  "top1_agree": 0.9322034120559692,
+  "confident_where_original_below_2pct": 1,
+  "mean_logprob_of_written_token_under_original": -0.8925060033798218
+ },
+ "positions_below_2048": {
+  "kl": 0.030901910737156868,
+  "top1_agree": 0.9236186146736145,
+  "confident_where_original_below_2pct": 0,
+  "mean_logprob_of_written_token_under_original": -1.0224815607070923
+ },
+ "positions_from_2048": {
+  "kl": 0.025319162756204605,
+  "top1_agree": 0.93994140625,
+  "confident_where_original_below_2pct": 1,
+  "mean_logprob_of_written_token_under_original": -0.7753504514694214
+ },
+ "largest_gaps": [
+  {
+   "at": 3220,
+   "token": "igned",
+   "runtime_p": 0.791,
+   "original_p": 0.0183
+  },
+  {
+   "at": 249,
+   "token": " u",
+   "runtime_p": 0.807,
+   "original_p": 0.1085
+  },
+  {
+   "at": 216,
+   "token": " bits",
+   "runtime_p": 0.896,
+   "original_p": 0.4076
+  },
+  {
+   "at": 3785,
+   "token": "1",
+   "runtime_p": 0.768,
+   "original_p": 0.3055
+  },
+  {
+   "at": 2230,
+   "token": "`",
+   "runtime_p": 0.808,
+   "original_p": 0.3688
+  },
+  {
+   "at": 2,
+   "token": " answer",
+   "runtime_p": 0.808,
+   "original_p": 0.3709
+  },
+  {
+   "at": 271,
+   "token": " u",
+   "runtime_p": 0.957,
+   "original_p": 0.525
+  },
+  {
+   "at": 622,
+   "token": "ize",
+   "runtime_p": 0.545,
+   "original_p": 0.135
+  }
+ ]
+}
