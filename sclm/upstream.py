@@ -1,12 +1,23 @@
-# Imports the vendored upstream inference modules (sclm/reference) under their own top-level names.
+# Imports the vendored upstream inference modules under their own top-level names. SCLM_MODEL picks the model:
+# "v41" (DeepSeek-V4.1-Flash, sclm/reference) or "v4" (DeepSeek-V4-Flash-0731, sclm/reference_v4, which shares the
+# pure-PyTorch kernel.py of sclm/reference). One model per process: both call their module `model`.
 import os
 import sys
 
-_REF = os.path.join(os.path.dirname(__file__), "reference")
+MODEL = os.environ.get("SCLM_MODEL", "v41")
+assert MODEL in ("v41", "v4"), MODEL
+_HERE = os.path.dirname(__file__)
+_REF = os.path.join(_HERE, "reference")
 if _REF not in sys.path:
     sys.path.insert(0, _REF)
+if MODEL == "v4":
+    _REF = os.path.join(_HERE, "reference_v4")
+    sys.path.insert(0, _REF)  # ahead of sclm/reference: `model` is found here, `kernel` there
 
-import engram  # noqa: E402
 import model  # noqa: E402
+
+engram = None  # V4.1 only
+if MODEL == "v41":
+    import engram  # noqa: E402
 
 CONFIG_PATH = os.path.join(_REF, "config.json")

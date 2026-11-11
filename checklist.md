@@ -14,7 +14,9 @@
 - [x] 확인 ① 실제 예산 (헤더를 원격으로 읽음): expert 하나 13.37MB × 11,008개 = 147.2GB, RAM 65GB에 전부 부호면 평균 1.88bpw. 상시 경로 VRAM 약 7.2GiB(어텐션 4.6GB, 공유 expert 1.1GB, 압축기 0.5GB, 인덱서 0.3GB, head 1.06GB), VRAM 슬롯 약 540개. 토큰당 routed 원본 3.45GB(258회). 추정과 일치
 - [x] 확인 ② transformers 5.22.2에 `DeepseekV4ForCausalLM`, 이 체크포인트용 이름 대응표(`conversion_mapping.py`)와 FP8 처리기가 있음. FP8 활성 양자화 흉내 여부는 층 단위 대조에서 확인. 기준은 공식 `inference/`
 - [x] 확인 ③ 토크나이저: vocab·merges·정규화가 V4.1과 같고 공통 특수 토큰의 id도 같음(다른 것은 특수 토큰 9개: V4.1의 `<｜System｜>` 128799가 여기서는 DSpark 잡음 토큰). 일반 글의 토큰 id가 같으므로 calib·eval 토큰 재사용 가능. 채팅 인코딩은 다름: `reasoning_effort` 기본 "low"(접두 없음), high·max는 글머리 접두, 이전 턴의 생각은 지우는 것이 기본(`drop_thinking`). `generation_config.json`은 temperature 1.0, top_p 1.0. 채팅을 옮길 때 `encoding_dsv4.py`의 테스트 벡터로 대조할 것 [남음]
-- [ ] 레퍼런스: 공식 `inference/model.py`를 수정 없이 두고 `kernel.py`만 순수 PyTorch로 (V4.1 것에서 옮김), 층 단위 실행기를 모델 선택이 되게, 체크포인트 이름 대응(`convert.py`)
+- [x] 레퍼런스 코드: 공식 `inference/model.py`를 수정 없이 `sclm/reference_v4/`에 두고, 커널은 `sclm/reference/kernel.py`(순수 PyTorch)를 같이 씀(호출 방식이 같음). `SCLM_MODEL=v4`로 고름(프로세스당 모델 하나). Hadamard 회전은 직접 쓴 `fast_hadamard_transform.py`. 작은 무작위 모델이 프리필과 디코드로 돌아감 (`SCLM_MODEL=v4 pytest tests/test_v4_model_small.py`)
+- [ ] 열린 항목: 비율 4 압축 층에서 앞 16토큰 안에서 디코드를 시작하면 프리필과의 일치도가 0.975 (32 이후 시작은 0.998, 창만 쓰면 0.9996). 주목 위치 집합은 같아 반올림 증폭으로 보지만 첫 어긋남을 추적하지 않았음
+- [ ] 레퍼런스 실행기: 층 단위 실행기와 체크포인트 읽기를 새 모델에 맞춤 (이름은 `layers.N.…` 그대로, expert는 I8로 저장된 FP4, 활성 양자화 묶음 128)
 - [ ] 레퍼런스 검증: 실제 가중치 perplexity, transformers 구현과 층 단위 대조
 - [ ] 무손실 런타임: 모든 expert를 원본(SSD·RAM 수준·VRAM 슬롯)으로 두는 호스트. 새 블록 구조에 맞춤 (앞 3층 해시 라우팅, 층별 압축 어텐션 비율 4·128과 겹치는 창, 층마다의 hyper-connection). 레퍼런스와 logit 대조
 - [ ] 품질 기준 고정 (양자화 전, 사용자 확인): 무손실 런타임이 쓴 긴 thinking 글과 양자화 런타임이 스스로 쓴 글 양쪽에서 KL, 첫 선택 일치, "원본은 2% 미만인데 30% 넘게 확신하는 토큰 수"
