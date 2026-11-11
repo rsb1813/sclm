@@ -83,14 +83,18 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, group
     return y
 
 
+_SLOTS, _WEIGHTS = (C.c_int * 8)(), (C.c_float * 8)()  # fp4_experts' arguments: the engine reads them during the call
+
+
 def fp4_experts(store: torch.Tensor, slots, weights, dim: int, inter: int, limit: float, xq: torch.Tensor, y: torch.Tensor) -> None:
     """y (fp32 [dim]) += the sum, in the order given, of weights[i] * the routed expert in row slots[i] of `store`
     (uint8 [rows, bytes], a row being an expert's checkpoint bytes: three scales, then three packed-FP4 weights)
     applied to the layer input quantized as xq (act_quant). One to eight experts."""
     n = len(slots)
     assert store.dim() == 2 and store.is_contiguous() and xq.dtype == y.dtype == torch.float32 and xq.numel() == y.numel() == dim
-    _check(lib().sclm_gpu_fp4_experts(store.data_ptr(), store.size(1), (C.c_int * n)(*slots), (C.c_float * n)(*weights), n, dim,
-                                      inter, limit, xq.data_ptr(), y.data_ptr()))
+    _SLOTS[:n], _WEIGHTS[:n] = slots, weights
+    _check(lib().sclm_gpu_fp4_experts(store.data_ptr(), store.size(1), _SLOTS, _WEIGHTS, n, dim, inter, limit, xq.data_ptr(),
+                                      y.data_ptr()))
 
 
 def hc_mixes(h: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, hc: int, norm_eps: float,
@@ -241,11 +245,13 @@ def gate_guess(module, norm_weight: torch.Tensor, h: torch.Tensor, pre: torch.Te
 def moe_buffers(topk: int, dim: int, guess: int, device: torch.device) -> SimpleNamespace:
     """What moe_begin and moe_end work in, one set for every layer (their kernels run in order on one stream):
     pack (the gate's output and 2 * guess floats for the guess), host (its page-locked copy on the host), and
-    the fp32 [dim] vectors xq, shared, routed and ram."""
+    the fp32 [dim] vectors xq, shared, routed and ram, and out (bf16 [dim]), the MoE's output until the next
+    moe_end."""
     n = 2 * topk + dim + 2 * guess
     vec = lambda k: torch.empty(k, dtype=torch.float32, device=device)  # noqa: E731
     return SimpleNamespace(pack=vec(n), host=torch.empty(n, dtype=torch.float32, device="cpu", pin_memory=True), xq=vec(dim),
-                           shared=vec(dim), routed=vec(dim), ram=vec(dim))
+                           shared=vec(dim), routed=vec(dim), ram=vec(dim),
+                           out=torch.empty(dim, dtype=torch.bfloat16, device=device))
 
 
 def moe_begin(module, x: torch.Tensor, expert, limit: float, buf: SimpleNamespace, guess: int = 0, later=None,
@@ -279,10 +285,10 @@ def moe_guess() -> None:
 
 
 def moe_end(buf: SimpleNamespace, ram: torch.Tensor) -> torch.Tensor:
-    """bf16 of (buf.routed + ram) + buf.shared: the MoE's output. ram (fp32 [dim], page-locked) is the CPU tier's
-    sum on the host; it is uploaded without waiting, so it has to stay as it is until the device was waited for."""
+    """buf.out = bf16 of (buf.routed + ram) + buf.shared: the MoE's output. ram (fp32 [dim], page-locked) is the CPU
+    tier's sum on the host; it is uploaded without waiting, so it has to stay as it is until the device was waited
+    for."""
     assert ram.dtype == torch.float32 and ram.numel() == buf.ram.numel() and not ram.is_cuda
-    out = torch.empty(ram.numel(), dtype=torch.bfloat16, device=buf.ram.device)
     _check(lib().sclm_gpu_moe_end(buf.routed.data_ptr(), ram.data_ptr(), buf.ram.data_ptr(), buf.shared.data_ptr(),
-                                  out.data_ptr(), ram.numel()))
-    return out
+                                  buf.out.data_ptr(), ram.numel()))
+    return buf.out
