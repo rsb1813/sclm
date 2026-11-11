@@ -11,7 +11,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from sclm import CKPT, CODES, DATA
+from sclm import CKPT, CODES, DATA, MODEL
 
 TOPK = 64
 FAR = 2048  # from this position on a ratio-4 layer holds more compressed positions than its index keeps
@@ -127,7 +127,8 @@ def main() -> None:
     ap.add_argument("--max-seq-len", type=int, default=4096)
     cli = ap.parse_args()
     # the runtime's other options, as the chat starts with them
-    cli.lam, cli.threads, cli.min_ram_margin, cli.wait_share, cli.ram_share, cli.topk, cli.guess, cli.touch = 0.1, 8, 0.5, 0.0, 0.0, 0, 4, 8
+    cli.lam, cli.threads, cli.min_ram_margin, cli.wait_share, cli.ram_share, cli.topk, cli.touch = 0.1, 8, 0.5, 0.0, 0.0, 0, 8
+    cli.guess = 3 if MODEL == "v4" else 4
     (write if cli.phase == "write" else score)(cli)
 
 

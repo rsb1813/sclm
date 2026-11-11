@@ -293,8 +293,8 @@ def main() -> None:
     ap.add_argument("--wait-share", type=float, default=0.0, help="lossy speed option at the start (/wait-share "
                     "changes it; 0: exact). 0.25 leaves the evaluation's KL where it is and is a quarter faster")
     ap.add_argument("--topk", type=int, default=0, help="lossy: routed experts computed per token (0: all six; /topk)")
-    ap.add_argument("--guess", type=int, default=4, help="experts of the next layer each layer guesses, to read those on "
-                    "the SSD a layer early (0: none)")
+    ap.add_argument("--guess", type=int, default=3 if V4 else 4, help="experts of the next layer each layer guesses, to read "
+                    "those on the SSD a layer early (0: none)")
     ap.add_argument("--touch", type=int, default=8, help="guessed experts of the next layer whose CPU-tier codes are read "
                     "into the CPU's cache while the device computes the attention before them (0: none)")
     ap.add_argument("--ram-cache", type=int, default=-1, help="experts kept in RAM after they leave the VRAM cache, "
