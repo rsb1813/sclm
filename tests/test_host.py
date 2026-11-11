@@ -95,14 +95,18 @@ def test_host_decodes_as_upstream_with_the_same_experts(tmp_path, monkeypatch, d
         # agree to 1e-3 only. Up to it they agree to 1e-14, and it must not come before the first decode step is
         # through: a real fault shows from the start (slot uploads racing the next read gave 4e-3 in the prefill).
         limit, same, strict = (1e-6 if dev == "cpu" else 1e-5), True, 0
+        steps, first = [(0, 24)] + [(i, i + 1) for i in range(24, 48)], []  # prefill, then a token at a time
         with torch.device(dev):
-            for start, end in [(0, 24)] + [(i, i + 1) for i in range(24, 48)]:  # prefill, then a token at a time
+            for start, end in steps:
                 streams["ref"].clear(), streams["host"].clear()
                 want = ref(x[:, start:end].to(dev), start)[1]
                 got = decoder.logits(x[:, start:end], start)
                 same = same and all(torch.equal(u, v) for u, v in zip(streams["ref"], streams["host"]))
                 strict += same
                 assert got.dtype == torch.float32 and tc.rel(got, want) < (limit if same else 5e-2), (start, tc.rel(got, want))
+                first.append(got)
+            # the same tokens as a new sequence: the first one left nothing behind in the decode buffers and the caches
+            assert all(torch.equal(decoder.logits(x[:, start:end], start), got) for (start, end), got in zip(steps, first))
         assert strict == 25 if dev == "cpu" else strict >= 2, strict
         assert len(set(reads)) < len(reads)  # experts came back after being evicted
         assert len({layer for layer, _ in reads}) == args.n_layers

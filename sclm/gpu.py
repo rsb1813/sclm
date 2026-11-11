@@ -43,6 +43,27 @@ def _check(status: int) -> None:
     assert status == 0, f"GPU kernel launch failed ({status})"
 
 
+LATER = object()  # in bind(): an argument given at each launch
+
+
+def bind(name: str, *args):
+    """The kernel sclm_gpu_`name` with its arguments (those of engine/gpu.cu) bound once, a tensor as its address
+    (the function keeps the tensor). Returns the function that launches it, taking the LATER arguments in order.
+    For the kernels of a decode token, where a wrapper's checks, address lookups and fresh output tensor cost as
+    much as the launch."""
+    fn = getattr(lib(), "sclm_gpu_" + name)
+    raw = [a.data_ptr() if isinstance(a, torch.Tensor) else a for a in args]
+    later = [i for i, a in enumerate(raw) if a is LATER]
+
+    def launch(*given):
+        for i, value in zip(later, given):
+            raw[i] = value
+        _check(fn(*raw))
+
+    launch.bound = args
+    return launch
+
+
 def act_quant(x: torch.Tensor) -> torch.Tensor:
     """The reference's fp8 fake-quant (blocks of 32, power-of-two scales) of a bf16 vector, as fp32."""
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.numel() % 32 == 0

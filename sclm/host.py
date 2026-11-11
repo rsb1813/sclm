@@ -1,5 +1,6 @@
 # Token-by-token decode on one device: upstream's Transformer with every block resident and its routed experts on two
 # tiers (sclm.tiered). PyTorch hosts the always-on path for now; the engine core computes the RAM tier and reads the SSD tier.
+import copy
 import os
 from functools import lru_cache
 
@@ -88,15 +89,38 @@ class HostAttention(m.Attention):
     def __init__(self, layer_id: int, args: "m.ModelArgs"):
         super().__init__(layer_id, args)
         self.index_topk = args.index_topk
+        self.bound = None
+
+    def bind(self, x: torch.Tensor) -> tuple:
+        """The kernels of a decode token with their weights and output buffers bound (gpu.bind), at the first such
+        token: the weights have to be in place by then."""
+        assert x.dtype == torch.bfloat16
+        rd, win, heads, d, dim, later = self.rope_head_dim, self.window_size, self.n_local_heads, self.head_dim, self.dim, gpu.LATER
+        rank = self.wq_a.weight.size(0)
+        qr, q, o, out = (torch.empty(n, dtype=torch.bfloat16, device=x.device) for n in (rank, heads * d, heads * d, dim))
+        rows = attended(win, self.index_topk, x.device)
+        self.bound = (
+            gpu.bind("attn_q", self.wq_a.weight, self.wq_a.scale, self.q_norm.weight, self.wq_b.weight, self.wq_b.scale,
+                     later, later, qr, q, dim, rank, heads, d, rd, self.eps),  # the token, freqs
+            gpu.bind("attn_kv", self.wkv.weight, self.wkv.scale, self.kv_norm.weight, later, later, later, dim, d, rd,
+                     self.eps),  # the token, freqs, its slot of the window ring
+            gpu.bind("sparse_attn", q, self.window_kv_cache, later, later, self.attn_sink, o, heads, d, later, win,
+                     self.softmax_scale),  # the compressed KV, the attended positions, their count
+            gpu.bind("attn_out", o, later, self.wo_a.fp8, self.wo_a.scale, self.wo_b.weight, self.wo_b.scale, out, heads, d,
+                     rd, self.n_local_groups, self.wo_a.fp8.size(0), dim),  # freqs
+            self.freqs_cis.data_ptr(), self.window_kv_cache.data_ptr(), rows, qr.view(1, 1, -1), out.view(1, 1, -1))
+        return self.bound
 
     def forward(self, x: torch.Tensor, start_pos: int):
         if not (gpu.active and x.size(0) * x.size(1) == 1 and start_pos):  # position 0 is upstream's prefill case
             return super().forward(x, start_pos)
-        rd, win, heads, ratio = self.rope_head_dim, self.window_size, self.n_local_heads, self.compress_ratio
-        freqs = self.freqs_cis.data_ptr() + start_pos * rd * 4  # the position's row: rd / 2 complex64
+        attn_q, attn_kv, sparse_attn, attn_out, freqs, window, rows, qr, out = self.bound or self.bind(x)
+        rd, win, ratio = self.rope_head_dim, self.window_size, self.compress_ratio
+        freqs += start_pos * rd * 4  # the position's row: rd / 2 complex64
         token = x.contiguous()
-        qr, q = gpu.attn_q(self.wq_a, self.q_norm.weight, self.wq_b, token, freqs, heads, self.head_dim, rd, self.eps)
-        gpu.attn_kv(self.wkv, self.kv_norm.weight, token, freqs, self.window_kv_cache[0, start_pos % win], rd, self.eps)
+        at = token.data_ptr()
+        attn_q(at, freqs)
+        attn_kv(at, freqs, window + start_pos % win * self.head_dim * 2)  # bf16 [win, head_dim]
         count = (start_pos + 1) // ratio if ratio else 0
         if count <= self.index_topk:
             if self.is_kv_source:
@@ -106,14 +130,15 @@ class HostAttention(m.Attention):
                 if self.indexer is not None and self.indexer.owns_k:
                     m.shared_attn.index_k = self.indexer.k_cache
             compressed = m.shared_attn.compress_kv if ratio else self.window_kv_cache
-            idxs = attended(win, self.index_topk, x.device)[min(start_pos, win - 1), :win + count]
+            # the start of the position's row of `attended`
+            sparse_attn(compressed.data_ptr(), rows.data_ptr() + min(start_pos, win - 1) * rows.size(1) * 4, win + count)
         else:
             with torch.device(x.device):  # upstream creates index tensors on the default device
-                compressed, compress_idxs = self._compress_kv(x, qr.view(1, 1, -1), start_pos, win)
+                compressed, compress_idxs = self._compress_kv(x, qr, start_pos, win)
                 idxs = torch.cat([m.get_window_topk_idxs(win, 1, 1, start_pos).view(-1), compress_idxs.view(-1)])
-        o = gpu.sparse_attn(q, self.window_kv_cache, compressed, idxs, self.attn_sink, heads, win, self.softmax_scale)
-        out = gpu.attn_out(o, freqs, self.wo_a.fp8, self.wo_a.scale, self.wo_b, heads, rd, self.n_local_groups)
-        return out.view(1, 1, -1)
+            sparse_attn(compressed.data_ptr(), idxs.data_ptr(), idxs.numel())
+        attn_out(freqs)
+        return out
 
 
 class HostBlock(m.Block):
@@ -121,25 +146,51 @@ class HostBlock(m.Block):
     each sublayer run as fused kernels (upstream spends about a hundred small operations on them per sublayer)."""
 
     attention_cls = HostAttention
+    bound = None
+
+    def bind(self, x: torch.Tensor) -> tuple:
+        """As HostAttention.bind. The block keeps its own buffers, so what it hands on (the stream, the mix for the
+        next sublayer, the FFN's `stream`) stays as it is until the block's next token."""
+        assert x.dtype == torch.bfloat16
+        hc, dim, later = self.hc_mult, x.size(-1), gpu.LATER
+        mid, out = (torch.empty(hc, dim, dtype=torch.bfloat16, device=x.device) for _ in range(2))  # the stream after each sublayer
+        a, f = (torch.empty(dim, dtype=torch.bfloat16, device=x.device) for _ in range(2))  # the sublayers' inputs
+        # pre[hc], post[hc], comb[hc][hc]
+        attn_mix, ffn_mix = (torch.empty((2 + hc) * hc, dtype=torch.float32, device=x.device) for _ in range(2))
+
+        def mixes(part, h, mix):
+            return gpu.bind("hc_mixes", h, getattr(self, f"hc_{part}_fn"), getattr(self, f"hc_{part}_scale"),
+                            getattr(self, f"hc_{part}_base"), mix, dim, hc, self.norm_eps, self.hc_eps, self.hc_sinkhorn_iters)
+
+        def post(mix, residual, out):
+            return gpu.bind("hc_post", later, residual, mix[hc:2 * hc], mix[2 * hc:], out, dim, hc)
+
+        self.ffn.stream = (mid, attn_mix[:hc])
+        self.bound = (
+            mixes("attn", later, attn_mix),  # the stream
+            gpu.bind("hc_pre_norm", later, later, self.attn_norm.weight, a, dim, hc, self.attn_norm.eps),  # the stream, its mix
+            post(attn_mix, later, mid),  # the sublayer's output, the stream
+            mixes("ffn", mid, ffn_mix),
+            gpu.bind("hc_pre_norm", mid, attn_mix, self.ffn_norm.weight, f, dim, hc, self.ffn_norm.eps),  # the mix attention computed
+            post(ffn_mix, mid, out),  # the sublayer's output
+            a.view(1, 1, -1), f.view(1, 1, -1), out.view(1, 1, hc, dim), ffn_mix[:hc].view(1, 1, hc))
+        return self.bound
 
     def forward(self, x, start_pos, pre_mix, image_mask, *attn_args):
         if not (gpu.active and x.size(0) * x.size(1) == 1):
             return super().forward(x, start_pos, pre_mix, image_mask, *attn_args)
-        hc, shape = self.hc_mult, x.shape
-        mixes = lambda h, part: gpu.hc_mixes(  # noqa: E731  -> pre[hc], post[hc], comb[hc][hc]
-            h, getattr(self, f"hc_{part}_fn"), getattr(self, f"hc_{part}_scale"), getattr(self, f"hc_{part}_base"), hc,
-            self.norm_eps, self.hc_eps, self.hc_sinkhorn_iters)
-        h = x.contiguous()
-        attn_mix = mixes(h, "attn")
-        a = gpu.hc_pre_norm(h, pre_mix.contiguous(), self.attn_norm.weight, self.attn_norm.eps)
-        a = self.attn(a.view(1, 1, -1), start_pos, *attn_args)
-        h = gpu.hc_post(a.contiguous(), h, attn_mix[hc:2 * hc], attn_mix[2 * hc:])
-        ffn_mix = mixes(h, "ffn")
-        f = gpu.hc_pre_norm(h, attn_mix[:hc], self.ffn_norm.weight, self.ffn_norm.eps)  # the mix attention computed
-        self.ffn.stream = (h, attn_mix[:hc])
-        f = self.ffn(f.view(1, 1, -1), image_mask)
-        h = gpu.hc_post(f.contiguous(), h, ffn_mix[hc:2 * hc], ffn_mix[2 * hc:])
-        return h.view(shape), ffn_mix[:hc].view(1, 1, hc)
+        attn_mix, attn_in, attn_post, ffn_mix, ffn_in, ffn_post, a, f, out, pre = self.bound or self.bind(x)
+        h, pre_mix = x.contiguous(), pre_mix.contiguous()
+        at = h.data_ptr()
+        attn_mix(at)
+        attn_in(at, pre_mix.data_ptr())
+        y = self.attn(a, start_pos, *attn_args).contiguous()
+        attn_post(y.data_ptr(), at)
+        ffn_mix()
+        ffn_in()
+        y = self.ffn(f, image_mask).contiguous()
+        ffn_post(y.data_ptr())
+        return out, pre
 
 
 class _Absent(nn.Module):
@@ -207,6 +258,25 @@ class Host:
         self.origin = self.end = 0  # the cache's clock at the start of this sequence and after its last token
         on_gpu = torch.device(device).type == "cuda"
         self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
+        self.first_mix = None  # upstream's identity pre-mix of the first block, made once
+        # the n-gram hash on the CPU for decode(): the same integers, without some thirty small device operations a
+        # token. It is given every token of the sequence; net.engram_hash sees the ones upstream's forward runs.
+        self.hash = copy.deepcopy(net.engram_hash).cpu() if self.kernels and net.engram_hash is not None else None
+
+    def decode(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """upstream Transformer.forward for one text token (on the CPU) down to its logits: nothing is sampled
+        from them."""
+        net = self.net
+        hashes = self.hash(input_ids, start_pos).to(self.device) if self.hash is not None else None
+        h = net.embed(input_ids).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1)
+        if self.first_mix is None:
+            self.first_mix = m.make_identity_pre_mix(h, net.hc_mult)
+        pre_mix = self.first_mix
+        for layer in net.layers:
+            if layer.engram is not None:
+                h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index, :])
+            h, pre_mix = layer(h, start_pos, pre_mix, None)
+        return net.head(net.norm(layer.hc_pre(h, pre_mix)))
 
     @torch.inference_mode()
     def logits(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
@@ -220,7 +290,9 @@ class Host:
             if self.kernels and start_pos and input_ids.numel() == 1:
                 # the default-device context costs every small tensor call 0.6 us, ten thousand times a token;
                 # the kernel path enters it only around upstream's index code (HostAttention)
-                return self.net(input_ids.to(self.device), start_pos)[1]
+                return self.decode(input_ids.cpu(), start_pos)
+            if self.hash is not None:
+                self.hash(input_ids.cpu(), start_pos)
             with torch.device(self.device):  # upstream creates index tensors on the default device
                 return self.net(input_ids.to(self.device), start_pos)[1]
         finally:
