@@ -9,6 +9,7 @@
 namespace {
 
 const int SCRATCH = 1 << 16;  // widest vector a call handles
+const int NORM_MAX = 8192;  // longest vector norm_quant handles (it keeps it in shared memory)
 
 __device__ __forceinline__ float e4m3(uint32_t b) {
     const uint32_t e = (b >> 3) & 15, m = b & 7;
@@ -76,6 +77,31 @@ __device__ float block_reduce(float v, bool take_max) {
     return part[32];
 }
 
+// Called by every thread of a block when the block's results are in global memory: true in the block that finishes
+// last of the `blocks` blocks that share `count`, which may then read what all of them wrote (through a volatile
+// pointer) and do a step that needs all their results, saving the launch of a kernel for it. `count` counts the
+// blocks that are done and is left at zero.
+__device__ bool last_block(int* count, int blocks) {
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(count, 1) == blocks - 1;
+        if (last) *count = 0;
+    }
+    __syncthreads();
+    return last;
+}
+
+int* done_counts() {  // last_block's counters: SCRATCH / 32 of them, zero between kernels
+    static int* counts = nullptr;
+    if (!counts) {
+        cudaMalloc(&counts, SCRATCH / 32 * sizeof(int));
+        cudaMemset(counts, 0, SCRATCH / 32 * sizeof(int));
+    }
+    return counts;
+}
+
 // One value of kernel.act_quant(x, 32, "ue8m0", inplace), mx being the largest magnitude of its block of 32.
 __device__ __forceinline__ float fp8_round(float v, float mx) {
     const uint32_t bits = __float_as_uint(fmaxf(mx, 1e-4f) * float(1.0 / 448.0));
@@ -101,22 +127,50 @@ __global__ void act_quant_k(const uint16_t* x, Out* xq) {
         xq[i] = Out(r);
 }
 
-// upstream RMSNorm: out = bf16(w * x * rsqrt(mean(x^2) + eps)) over n values, in one block; out may be x.
-__global__ void rmsnorm_k(const uint16_t* x, const uint16_t* w, uint16_t* out, int n, float eps) {
-    float sq = 0;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) sq += from_bf16(x[i]) * from_bf16(x[i]);
-    const float r = rsqrtf(block_reduce(sq, false) / float(n) + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = to_bf16(from_bf16(w[i]) * (from_bf16(x[i]) * r));
-}
-
-// upstream apply_rotary_emb on the last rd values of each of `heads` vectors of head_dim (bf16, in place): adjacent
-// pairs are complex numbers multiplied by freqs[pair] (re, im). A thread per pair.
-__global__ void rope_k(uint16_t* x, const float* freqs, int heads, int head_dim, int rd) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x, pairs = rd / 2;
-    if (i >= heads * pairs) return;
-    uint16_t* v = x + (i / pairs) * head_dim + head_dim - rd + 2 * (i % pairs);
-    const float a = from_bf16(v[0]), b = from_bf16(v[1]), c = freqs[2 * (i % pairs)], d = freqs[2 * (i % pairs) + 1];
-    v[0] = to_bf16(a * c - b * d), v[1] = to_bf16(a * d + b * c);
+// What attention does with a projection's output y[n] (bf16), by one block, a warp taking 32 values at a time:
+// upstream RMSNorm with weight w, normed = bf16(w * y * rsqrt(mean(y^2) + eps)) (stored if asked for); with freqs,
+// upstream apply_rotary_emb on its last rd values (adjacent pairs are complex numbers multiplied by freqs[pair]
+// (re, im), rounded to bf16); then kernel.act_quant -> xq (fp32) or q (bf16). n is a multiple of 32, n - rd even.
+// The squares are added up as one block of 1024 threads would: a thread every 1024th value, its warps by shuffles,
+// then the warps in order.
+__device__ void norm_quant(const volatile uint16_t* y, const uint16_t* w, const float* freqs, uint16_t* normed, float* xq,
+                           uint16_t* q, int n, int rd, float eps) {
+    extern __shared__ float vals[];  // y
+    __shared__ float part[33];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) vals[i] = from_bf16(y[i]);
+    __syncthreads();
+    for (int o = warp; o < 32; o += warps) {  // warp o of the 1024 threads
+        float sq = 0;
+        for (int i = o * 32 + lane; i < n; i += 1024) sq += vals[i] * vals[i];
+        for (int s = 16; s; s >>= 1) sq += __shfl_down_sync(0xffffffff, sq, s);
+        if (lane == 0) part[o] = sq;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = part[0];
+        for (int i = 1; i < 32; ++i) v = v + part[i];
+        part[32] = v;
+    }
+    __syncthreads();
+    const float r = rsqrtf(part[32] / float(n) + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = from_bf16(to_bf16(from_bf16(w[i]) * (vals[i] * r)));
+        if (normed) normed[i] = to_bf16(v);
+        const float other = __shfl_xor_sync(0xffffffff, v, 1);  // the pair's other value
+        const int at = i - (n - rd);
+        if (freqs && at >= 0) {
+            const float c = freqs[at & ~1], d = freqs[(at & ~1) + 1];
+            v = from_bf16(to_bf16(at & 1 ? other * d + v * c : v * c - other * d));
+        }
+        float mx = fabsf(v);
+        for (int s = 16; s; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
+        const float rounded = fp8_round(v, mx);
+        if (xq)
+            xq[i] = rounded;
+        else
+            q[i] = to_bf16(rounded);
+    }
 }
 
 // The start of the output side of upstream Attention.forward for one token: the query's rotation is taken back off
@@ -155,9 +209,12 @@ __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const u
         if (at >= 0) {
             const uint16_t* kv = at < win ? window + size_t(at) * d : compressed + size_t(at - win) * d;
             sc = 0;
-            for (int i = 4 * lane; i < d; i += 128) {
-                const uint64_t a = *(const uint64_t*)(qh + i), b = *(const uint64_t*)(kv + i);
-                for (int k = 0; k < 4; ++k) sc += bf16_at(a, k) * bf16_at(b, k);
+            for (int i = 4 * lane; i < d; i += 512) {  // four reads of each under way at a time
+                uint64_t a[4], b[4];
+                for (int j = 0; j < 4 && i + 128 * j < d; ++j)
+                    a[j] = *(const uint64_t*)(qh + i + 128 * j), b[j] = *(const uint64_t*)(kv + i + 128 * j);
+                for (int j = 0; j < 4 && i + 128 * j < d; ++j)
+                    for (int k = 0; k < 4; ++k) sc += bf16_at(a[j], k) * bf16_at(b[j], k);
             }
             for (int o = 16; o; o >>= 1) sc += __shfl_xor_sync(0xffffffff, sc, o);
             sc *= scale;
@@ -177,12 +234,16 @@ __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const u
     const int groups = d / 4, parts = blockDim.x / groups, g = threadIdx.x % groups, share = threadIdx.x / groups;
     if (share < parts) {
         float o[4] = {0, 0, 0, 0};
-        for (int t = share; t < count; t += parts) {
-            const int at = idx[t];
-            if (at < 0) continue;
-            const uint16_t* kv = at < win ? window + size_t(at) * d : compressed + size_t(at - win) * d;
-            const uint64_t w = *(const uint64_t*)(kv + 4 * g);
-            for (int k = 0; k < 4; ++k) o[k] += p[t] * bf16_at(w, k);
+        for (int t = share; t < count; t += 4 * parts) {  // four positions' reads under way at a time
+            int at[4];
+            uint64_t w[4];
+            for (int j = 0; j < 4; ++j) at[j] = t + j * parts < count ? idx[t + j * parts] : -1;
+            for (int j = 0; j < 4; ++j)
+                if (at[j] >= 0)
+                    w[j] = *(const uint64_t*)((at[j] < win ? window + size_t(at[j]) * d : compressed + size_t(at[j] - win) * d) + 4 * g);
+            for (int j = 0; j < 4; ++j)
+                if (at[j] >= 0)
+                    for (int k = 0; k < 4; ++k) o[k] += p[t + j * parts] * bf16_at(w[j], k);
         }
         for (int k = 0; k < 4; ++k) part[share * d + 4 * g + k] = o[k];
     }
@@ -194,7 +255,7 @@ __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const u
     }
 }
 
-// y[row] = sum over k of w[row][k] * scale[row / 32][k / 32] * xq[k], w in E4M3 and scale in E8M0. One block per row.
+// y[row] = sum over k of w[row][k] * scale[row / 32][k / 32] * xq[k], w in E4M3 and scale in E8M0.
 // Rows come in groups of rows_per_group, group g reading xq[g * k ..] (attention's block-diagonal wo_a; one group
 // otherwise).
 // The sum is rounded to bf16 as the reference's GEMM output is, then stored as bf16 (STORE), added to the fp32 y
@@ -209,19 +270,93 @@ __device__ __forceinline__ void put(void* y, int row, float acc, Mode mode) {
         ((float*)y)[row] = (mode == ADD ? ((float*)y)[row] : 0.0f) + from_bf16(r);
 }
 
-__global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, int rows_per_group, Mode mode) {
-    const int row = blockIdx.x;
+// Four weights of an fp8 row times their x.
+__device__ __forceinline__ float fp8_dot4(uint32_t b, const float* x) {
+    return e4m3(b & 255) * x[0] + e4m3(b >> 8 & 255) * x[1] + e4m3(b >> 16 & 255) * x[2] + e4m3(b >> 24) * x[3];
+}
+
+// A row's sum of the product above, for the first of the row's threads; `row` is set for all of them. A block
+// computes blockDim / per_row rows, per_row threads (32, or 64 for a long row) to a row: 32768 blocks of one short
+// row each took a third longer. The order of the additions is fixed: a thread adds every per_row-th group of four
+// columns in turn, a warp adds its threads up by shuffles, then the row's warps are added in order. Four reads are
+// under way at a time.
+__device__ __forceinline__ float fp8_row(const uint8_t* w, const uint8_t* scale, const float* xq, int k, int rows_per_group,
+                                         int per_row, int& row) {
+    __shared__ float part[32];
+    row = blockIdx.x * (blockDim.x / per_row) + threadIdx.x / per_row;
+    const int step = per_row * 4;
     const uint8_t* wr = w + size_t(row) * k;
     const uint8_t* sr = scale + size_t(row >> 5) * (k >> 5);
     const float* x = xq + size_t(row / rows_per_group) * k;
     float acc = 0;
-    for (int c = threadIdx.x * 4; c < k; c += blockDim.x * 4) {
-        const uint32_t b = *(const uint32_t*)(wr + c);
-        acc += e8m0(sr[c >> 5]) * (e4m3(b & 255) * x[c] + e4m3(b >> 8 & 255) * x[c + 1] + e4m3(b >> 16 & 255) * x[c + 2] +
-                                   e4m3(b >> 24) * x[c + 3]);
+    int c = threadIdx.x % per_row * 4;
+    for (; c + 3 * step < k; c += 4 * step) {
+        uint32_t b[4];
+        for (int i = 0; i < 4; ++i) b[i] = *(const uint32_t*)(wr + c + i * step);
+        for (int i = 0; i < 4; ++i) acc += e8m0(sr[(c + i * step) >> 5]) * fp8_dot4(b[i], x + c + i * step);
     }
-    acc = block_sum(acc);
-    if (threadIdx.x == 0) put(y, row, acc, mode);
+    for (; c < k; c += step) acc += e8m0(sr[c >> 5]) * fp8_dot4(*(const uint32_t*)(wr + c), x + c);
+    for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    acc = 0;
+    if (threadIdx.x % per_row == 0)
+        for (int i = 0; i < per_row >> 5; ++i) acc += part[(threadIdx.x >> 5) + i];
+    return acc;
+}
+
+__global__ void fp8_gemv_k(const uint8_t* w, const uint8_t* scale, const float* xq, void* y, int k, int rows_per_group, Mode mode,
+                           int per_row) {
+    int row;
+    const float acc = fp8_row(w, scale, xq, k, rows_per_group, per_row, row);
+    if (threadIdx.x % per_row == 0) put(y, row, acc, mode);
+}
+
+// fp8_gemv_k for attention's wq_b, with the rotary embedding on its output q[heads][head_dim] (bf16): upstream
+// apply_rotary_emb on the last rd values of each head, as in norm_quant. A block holds an even number of rows, so
+// both values of a pair; head_dim and rd are even.
+__global__ void fp8_gemv_rope_k(const uint8_t* w, const uint8_t* scale, const float* xq, uint16_t* q, int k, int per_row,
+                                const float* freqs, int head_dim, int rd) {
+    __shared__ float vals[32];  // the block's rows
+    int row;
+    float v = from_bf16(to_bf16(fp8_row(w, scale, xq, k, 1 << 30, per_row, row)));
+    const bool first = threadIdx.x % per_row == 0;
+    const int at = row % head_dim - (head_dim - rd), mine = threadIdx.x / per_row;
+    if (first) vals[mine] = v;
+    __syncthreads();
+    if (!first) return;
+    if (at >= 0) {
+        const float other = vals[mine ^ 1], c = freqs[at & ~1], d = freqs[(at & ~1) + 1];
+        v = at & 1 ? other * d + v * c : v * c - other * d;
+    }
+    q[row] = to_bf16(v);
+}
+
+// fp8_gemv_k for a projection that attention normalizes: the rows go to y[n] (bf16), and the block that finishes
+// last does the rest (norm_quant), which saves the launches of three small kernels.
+__global__ void fp8_gemv_norm_k(const uint8_t* w, const uint8_t* scale, const float* xq_in, uint16_t* y, int k, int per_row, int n,
+                                int* count, const uint16_t* norm_w, const float* freqs, uint16_t* normed, float* xq,
+                                uint16_t* q, int rd, float eps) {
+    int row;
+    const float acc = fp8_row(w, scale, xq_in, k, n, per_row, row);
+    if (threadIdx.x % per_row == 0) y[row] = to_bf16(acc);
+    if (last_block(count, gridDim.x)) norm_quant(y, norm_w, freqs, normed, xq, q, n, rd, eps);
+}
+
+// fp8_gemv_k for attention's wo_a: the rows go to y (bf16), and of the blocks that share 32 rows, the one that
+// finishes last quantizes them for wo_b as act_quant_k does -> xq (fp32), which is not xq_in. A block's rows divide 32.
+__global__ void fp8_gemv_quant_k(const uint8_t* w, const uint8_t* scale, const float* xq_in, uint16_t* y, int k, int rows_per_group,
+                                 int per_row, int* counts, float* xq) {
+    int row;
+    const float acc = fp8_row(w, scale, xq_in, k, rows_per_group, per_row, row);
+    if (threadIdx.x % per_row == 0) y[row] = to_bf16(acc);
+    const int blocks = 32 * per_row / blockDim.x, group = blockIdx.x / blocks;
+    if (!last_block(counts + group, blocks) || threadIdx.x >= 32) return;
+    const int i = group * 32 + threadIdx.x;
+    const float v = from_bf16(((const volatile uint16_t*)y)[i]);
+    float mx = fabsf(v);
+    for (int s = 16; s; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
+    xq[i] = fp8_round(v, mx);
 }
 
 // What the expert kernels need of one SwiGLU expert: its weights with their scales, and its routing weight.
@@ -298,14 +433,28 @@ __global__ void expert_out_k(Batch b, const float* hq, float* y, int dim, int in
     if (lane == 0) y[row] = sum;
 }
 
+// <wr, x> over k values for a bf16 or fp32 wr and x in bf16, by one block; thread 0 gets it. A thread adds every
+// blockDim-th product in turn, with four reads under way at a time.
+template <class W>
+__device__ __forceinline__ float dense_dot(const W* wr, const uint16_t* x, int k) {
+    const int step = blockDim.x;
+    float acc = 0;
+    int c = threadIdx.x;
+    for (; c + 3 * step < k; c += 4 * step) {
+        float a[4], b[4];
+        for (int i = 0; i < 4; ++i) a[i] = widen(wr[c + i * step]), b[i] = from_bf16(x[c + i * step]);
+        for (int i = 0; i < 4; ++i) acc += a[i] * b[i];
+    }
+    for (; c < k; c += step) acc += widen(wr[c]) * from_bf16(x[c]);
+    return block_sum(acc);
+}
+
 // out[row] = <w[row], x> for a bf16 or fp32 weight with rows of k values and x in bf16; block `row` computes one.
-// The first half of upstream Gate.forward for one token, and F.linear on unquantized weights.
+// F.linear on unquantized weights.
 template <class W>
 __global__ void dots_k(const W* w, const uint16_t* x, float* out, int k) {
     const W* wr = w + size_t(blockIdx.x) * k;
-    float acc = 0;
-    for (int c = threadIdx.x; c < k; c += blockDim.x) acc += widen(wr[c]) * from_bf16(x[c]);
-    acc = block_sum(acc);
+    const float acc = dense_dot(wr, x, k);
     if (threadIdx.x == 0) out[blockIdx.x] = acc;
 }
 
@@ -364,34 +513,55 @@ __global__ void norm_rope_fp4_k(const In* in, const uint16_t* norm_w, const floa
     out[i] = to_bf16(round_e2m1(fminf(fmaxf(v / s, -6.0f), 6.0f)) * s);
 }
 
-// Second half, one block of 1024 threads (n <= 1024, a thread per expert): a score becomes
-// sqrt(softplus(score / temp)); the topk largest of score + bias are picked (best first) and weighted by their
-// unbiased scores, normalized over the picks when norm is set, times route_scale.
+// upstream Gate.forward for one token x[k] (bf16) with the "sqrtsoftplus" score. Block e computes expert e's score
+// <w[e], x> and copies its share of the first `copy` values of x; the block that finishes last makes the choice:
+// a score becomes sqrt(softplus(score / temp)), the topk largest of score + bias are picked (best first, the lower
+// index of equal ones) and weighted by their unbiased scores, normalized over the picks when norm is set, times
+// route_scale.
 // pack = the topk indices (as fp32), their weights, then x as fp32: all the host needs of this layer in one transfer.
-__global__ void gate_pick_k(const float* scores, const float* bias, const uint16_t* x, float* pack, int n, int topk, int dim,
-                            float temp, float route_scale, bool norm) {
-    __shared__ float key[1024];
-    const int e = threadIdx.x;
-    for (int c = e; c < dim; c += blockDim.x) pack[2 * topk + c] = from_bf16(x[c]);
-    float score = 0;
-    if (e < n) {
-        const float v = scores[e] / temp;
-        score = sqrtf(v > 20.0f ? v : log1pf(expf(v)));  // F.softplus and its threshold
-        key[e] = score + bias[e];
+__global__ void gate_k(const uint16_t* w, const float* bias, const uint16_t* x, float* scores, int* count, float* pack, int n,
+                       int topk, int k, int copy, float temp, float route_scale, bool norm) {
+    extern __shared__ float mem[];  // key[n], score[n]
+    __shared__ float best_key[32];
+    __shared__ int best_at[32];
+    const float dot = dense_dot(w + size_t(blockIdx.x) * k, x, k);
+    if (threadIdx.x == 0) scores[blockIdx.x] = dot;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < copy; c += gridDim.x * blockDim.x) pack[2 * topk + c] = from_bf16(x[c]);
+    if (!last_block(count, gridDim.x)) return;
+    float *key = mem, *score = mem + n;
+    for (int e = threadIdx.x; e < n; e += blockDim.x) {
+        const float v = ((const volatile float*)scores)[e] / temp;
+        score[e] = sqrtf(v > 20.0f ? v : log1pf(expf(v)));  // F.softplus and its threshold
+        key[e] = score[e] + bias[e];
     }
     __syncthreads();
-    if (e < n) {
-        int rank = 0;  // how many experts come before this one
-        for (int j = 0; j < n; ++j) rank += key[j] > key[e] || (key[j] == key[e] && j < e);
-        if (rank < topk) pack[rank] = float(e), pack[topk + rank] = score;
+    float last_key = INFINITY;
+    int last_at = -1;
+    for (int pick = 0; pick < topk; ++pick) {  // the first of the experts that come after the last pick
+        float top = -INFINITY;
+        int at = n;
+        for (int e = threadIdx.x; e < n; e += blockDim.x)
+            if ((key[e] < last_key || (key[e] == last_key && e > last_at)) && (key[e] > top || (key[e] == top && e < at)))
+                top = key[e], at = e;
+        for (int o = 16; o; o >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffff, top, o);
+            const int other_at = __shfl_xor_sync(0xffffffff, at, o);
+            if (other > top || (other == top && other_at < at)) top = other, at = other_at;
+        }
+        if ((threadIdx.x & 31) == 0) best_key[threadIdx.x >> 5] = top, best_at[threadIdx.x >> 5] = at;
+        __syncthreads();
+        for (unsigned i = 0; i < blockDim.x >> 5; ++i)
+            if (best_key[i] > top || (best_key[i] == top && best_at[i] < at)) top = best_key[i], at = best_at[i];
+        __syncthreads();
+        last_key = top, last_at = at;
+        if (threadIdx.x == 0) pack[pick] = float(at), pack[topk + pick] = score[at];
     }
-    __syncthreads();
-    if (e) return;
+    if (threadIdx.x) return;
     float sum = 0;
-    for (int k = 0; k < topk; ++k) sum += pack[topk + k];
-    for (int k = 0; k < topk; ++k) {
-        if (norm && topk > 1) pack[topk + k] /= sum + 1e-20f;
-        pack[topk + k] *= route_scale;
+    for (int i = 0; i < topk; ++i) sum += pack[topk + i];
+    for (int i = 0; i < topk; ++i) {
+        if (norm && topk > 1) pack[topk + i] /= sum + 1e-20f;
+        pack[topk + i] *= route_scale;
     }
 }
 
@@ -401,32 +571,11 @@ __global__ void moe_sum_k(const float* routed, const float* ram, const float* sh
     if (i < n) out[i] = to_bf16((routed[i] + ram[i]) + shared[i]);
 }
 
-// Hyper-connection mixes, first half (Block.hc_mixes): block i < rows computes <fn[i], h> over the n values of the
-// flattened stream h (bf16), block `rows` its sum of squares. The additions keep one order (a thread adds every
-// 256th value in turn; the mixes magnify a changed last bit), but four reads are under way at a time.
-__global__ void hc_dots_k(const uint16_t* h, const float* fn, float* dots, int n, int rows) {
-    const int row = blockIdx.x, step = blockDim.x;
-    const float* f = fn + size_t(row < rows ? row : 0) * n;
-    float acc = 0;
-    int c = threadIdx.x;
-    for (; c + 3 * step < n; c += 4 * step) {
-        float v[4], w[4];
-        for (int k = 0; k < 4; ++k) v[k] = from_bf16(h[c + k * step]), w[k] = row < rows ? f[c + k * step] : v[k];
-        for (int k = 0; k < 4; ++k) acc += w[k] * v[k];
-    }
-    for (; c < n; c += step) {
-        const float v = from_bf16(h[c]);
-        acc += (row < rows ? f[c] : v) * v;
-    }
-    acc = block_reduce(acc, false);
-    if (threadIdx.x == 0) dots[row] = acc;
-}
-
-// Second half (kernel.hc_split_sinkhorn on mixes = dots * rsqrt(mean square + norm_eps)), one warp:
-// out = pre[hc], post[hc], comb[hc][hc] with comb made doubly stochastic by `iters` Sinkhorn rounds. A lane holds
-// one entry of comb (hc * hc <= 32); a single thread took 30 us over the divisions.
-__global__ void hc_split_k(const float* dots, const float* scale, const float* base, float* out, int n, int hc,
-                           float norm_eps, float eps, int iters) {
+// Second half of the hyper-connection mixes (kernel.hc_split_sinkhorn on mixes = dots * rsqrt(mean square +
+// norm_eps)), one warp: out = pre[hc], post[hc], comb[hc][hc] with comb made doubly stochastic by `iters` Sinkhorn
+// rounds. A lane holds one entry of comb (hc * hc <= 32); a single thread took 30 us over the divisions.
+__device__ void hc_split(const volatile float* dots, const float* scale, const float* base, float* out, int n, int hc,
+                         float norm_eps, float eps, int iters) {
     const unsigned all = 0xffffffff;
     const int lane = threadIdx.x, j = min(lane / hc, hc - 1), c = lane % hc;  // lanes past hc * hc repeat the last row
     const float r = rsqrtf(dots[(2 + hc) * hc] / float(n) + norm_eps);
@@ -446,6 +595,30 @@ __global__ void hc_split_k(const float* dots, const float* scale, const float* b
         v /= sum + eps;
     }
     if (lane < hc * hc) out[2 * hc + lane] = v;
+}
+
+// Hyper-connection mixes (Block.hc_mixes). Block i < rows computes <fn[i], h> over the n values of the flattened
+// stream h (bf16), block `rows` its sum of squares. The additions keep one order (a thread adds every 256th value
+// in turn; the mixes magnify a changed last bit), but four reads are under way at a time. The block that finishes
+// last turns the dots into the mixes (hc_split).
+__global__ void hc_mixes_k(const uint16_t* h, const float* fn, float* dots, int n, int rows, int* count, const float* scale,
+                           const float* base, float* out, int hc, float norm_eps, float eps, int iters) {
+    const int row = blockIdx.x, step = blockDim.x;
+    const float* f = fn + size_t(row < rows ? row : 0) * n;
+    float acc = 0;
+    int c = threadIdx.x;
+    for (; c + 3 * step < n; c += 4 * step) {
+        float v[4], w[4];
+        for (int k = 0; k < 4; ++k) v[k] = from_bf16(h[c + k * step]), w[k] = row < rows ? f[c + k * step] : v[k];
+        for (int k = 0; k < 4; ++k) acc += w[k] * v[k];
+    }
+    for (; c < n; c += step) {
+        const float v = from_bf16(h[c]);
+        acc += (row < rows ? f[c] : v) * v;
+    }
+    acc = block_reduce(acc, false);
+    if (threadIdx.x == 0) dots[row] = acc;
+    if (last_block(count, gridDim.x) && threadIdx.x < 32) hc_split(dots, scale, base, out, n, hc, norm_eps, eps, iters);
 }
 
 // Block.hc_pre then RMSNorm: y = bf16(sum over the hc copies of pre[c] * h[c]), out = bf16(w * y * rsqrt(mean(y^2) + eps)).
@@ -493,6 +666,12 @@ void ensure_scratch() {
 
 int threads_for(int k, int per_thread) { return k / per_thread >= 512 ? 64 : 32; }
 
+// How the GEMV kernels are launched over n rows of k columns: the threads a row takes, and four rows to a block.
+struct Rows {
+    int per_row, blocks, threads;
+    Rows(int n, int k) : per_row(threads_for(k, 4)), blocks(n % 4 ? n : n / 4), threads(n % 4 ? per_row : 4 * per_row) {}
+};
+
 template <bool FP4>
 int launch_experts(const Batch& b, int dim, int inter, float limit, const float* xq, float* y, Mode mode) {
     if (dim > SCRATCH || b.n * inter > SCRATCH || inter % 32) return -1;
@@ -516,7 +695,8 @@ API int sclm_gpu_fp8_linear(const uint8_t* w, const uint8_t* scale, int n, int k
     if (groups * k > SCRATCH) return -1;
     ensure_scratch();
     act_quant_k<float><<<groups * k / 32, 32>>>(x, scratch.xq);
-    fp8_gemv_k<<<n, threads_for(k, 4)>>>(w, scale, scratch.xq, y, k, n / groups, STORE);
+    const Rows rows(n, k);
+    fp8_gemv_k<<<rows.blocks, rows.threads>>>(w, scale, scratch.xq, y, k, n / groups, STORE, rows.per_row);
     return cudaGetLastError();
 }
 
@@ -551,13 +731,14 @@ API int sclm_gpu_fp8_expert(const uint8_t* w1, const uint8_t* s1, const uint8_t*
 API int sclm_gpu_attn_q(const uint8_t* wa, const uint8_t* sa, const uint16_t* norm_w, const uint8_t* wb, const uint8_t* sb,
                         const uint16_t* x, const float* freqs, uint16_t* qr, uint16_t* q, int dim, int rank, int heads,
                         int head_dim, int rd, float eps) {
+    if (rank > NORM_MAX || rank % 32 || head_dim % 4 || rd % 2) return -1;
     ensure_scratch();
+    const Rows a(rank, dim), b(heads * head_dim, rank);
     act_quant_k<float><<<dim / 32, 32>>>(x, scratch.xq);
-    fp8_gemv_k<<<rank, threads_for(dim, 4)>>>(wa, sa, scratch.xq, qr, dim, rank, STORE);
-    rmsnorm_k<<<1, 1024>>>(qr, norm_w, qr, rank, eps);
-    act_quant_k<float><<<rank / 32, 32>>>(qr, scratch.xq);
-    fp8_gemv_k<<<heads * head_dim, threads_for(rank, 4)>>>(wb, sb, scratch.xq, q, rank, heads * head_dim, STORE);
-    rope_k<<<(heads * rd / 2 + 255) / 256, 256>>>(q, freqs, heads, head_dim, rd);
+    // the quantized qr takes the place of the quantized x, which the last block no longer needs
+    fp8_gemv_norm_k<<<a.blocks, a.threads, rank * sizeof(float)>>>(wa, sa, scratch.xq, scratch.h, dim, a.per_row, rank, done_counts(),
+                                                                   norm_w, nullptr, qr, scratch.xq, nullptr, 0, eps);
+    fp8_gemv_rope_k<<<b.blocks, b.threads>>>(wb, sb, scratch.xq, q, rank, b.per_row, freqs, head_dim, rd);
     return cudaGetLastError();
 }
 
@@ -565,12 +746,12 @@ API int sclm_gpu_attn_q(const uint8_t* wa, const uint8_t* sa, const uint16_t* no
 // rotary(RMSNorm(wkv x)), written where the caller points (its slot of the window ring).
 API int sclm_gpu_attn_kv(const uint8_t* w, const uint8_t* s, const uint16_t* norm_w, const uint16_t* x, const float* freqs,
                          uint16_t* kv, int dim, int head_dim, int rd, float eps) {
+    if (head_dim > NORM_MAX || head_dim % 32 || rd % 2) return -1;
     ensure_scratch();
+    const Rows rows(head_dim, dim);
     act_quant_k<float><<<dim / 32, 32>>>(x, scratch.xq);
-    fp8_gemv_k<<<head_dim, threads_for(dim, 4)>>>(w, s, scratch.xq, kv, dim, head_dim, STORE);
-    rmsnorm_k<<<1, 1024>>>(kv, norm_w, kv, head_dim, eps);
-    rope_k<<<(rd / 2 + 255) / 256, 256>>>(kv, freqs, 1, head_dim, rd);
-    act_quant_k<uint16_t><<<head_dim / 32, 32>>>(kv, kv);
+    fp8_gemv_norm_k<<<rows.blocks, rows.threads, head_dim * sizeof(float)>>>(w, s, scratch.xq, scratch.h, dim, rows.per_row, head_dim,
+                                                                             done_counts(), norm_w, freqs, nullptr, nullptr, kv, rd, eps);
     return cudaGetLastError();
 }
 
@@ -618,12 +799,13 @@ API int sclm_gpu_sparse_attn(const uint16_t* q, const uint16_t* window, const ui
 API int sclm_gpu_attn_out(const uint16_t* o, const float* freqs, const uint8_t* wa, const uint8_t* sa, const uint8_t* wb,
                           const uint8_t* sb, uint16_t* out, int heads, int head_dim, int rd, int groups, int n_a, int dim) {
     const int width = heads * head_dim;
-    if (width > SCRATCH || n_a > SCRATCH || (head_dim - rd) % 2 || head_dim % 32) return -1;
+    if (width + n_a > SCRATCH || n_a % 32 || (head_dim - rd) % 2 || head_dim % 32) return -1;
     ensure_scratch();
+    const Rows a(n_a, width / groups), b(dim, n_a);
     unrope_quant_k<<<width / 32, 32>>>(o, freqs, scratch.xq, head_dim, rd);
-    fp8_gemv_k<<<n_a, threads_for(width / groups, 4)>>>(wa, sa, scratch.xq, scratch.h, width / groups, n_a / groups, STORE);
-    act_quant_k<float><<<n_a / 32, 32>>>(scratch.h, scratch.xq);
-    fp8_gemv_k<<<dim, threads_for(n_a, 4)>>>(wb, sb, scratch.xq, out, n_a, dim, STORE);
+    float* xq = scratch.xq + width;  // wo_a's output, quantized
+    fp8_gemv_quant_k<<<a.blocks, a.threads>>>(wa, sa, scratch.xq, scratch.h, width / groups, n_a / groups, a.per_row, done_counts(), xq);
+    fp8_gemv_k<<<b.blocks, b.threads>>>(wb, sb, xq, out, n_a, dim, STORE, b.per_row);
     return cudaGetLastError();
 }
 
@@ -631,11 +813,10 @@ API int sclm_gpu_attn_out(const uint16_t* o, const float* freqs, const uint8_t* 
 // fn is [(2 + hc) * hc][hc * dim], scale [3], base [(2 + hc) * hc], all fp32.
 API int sclm_gpu_hc_mixes(const uint16_t* h, const float* fn, const float* scale, const float* base, float* mixes, int dim,
                           int hc, float norm_eps, float eps, int iters) {
-    if (hc > 5) return -1;  // hc_split_k keeps comb in one warp
+    if (hc > 5) return -1;  // hc_split keeps comb in one warp
     ensure_scratch();
     const int rows = (2 + hc) * hc;
-    hc_dots_k<<<rows + 1, 256>>>(h, fn, scratch.dots, hc * dim, rows);
-    hc_split_k<<<1, 32>>>(scratch.dots, scale, base, mixes, hc * dim, hc, norm_eps, eps, iters);
+    hc_mixes_k<<<rows + 1, 256>>>(h, fn, scratch.dots, hc * dim, rows, done_counts(), scale, base, mixes, hc, norm_eps, eps, iters);
     return cudaGetLastError();
 }
 
@@ -657,8 +838,8 @@ API int sclm_gpu_gate(const uint16_t* weight, const float* bias, const uint16_t*
                       float temp, float route_scale, int norm) {
     if (n > 1024) return -1;
     ensure_scratch();
-    dots_k<uint16_t><<<n, 128>>>(weight, x, scratch.dots, dim);
-    gate_pick_k<<<1, 1024>>>(scratch.dots, bias, x, pack, n, topk, dim, temp, route_scale, norm != 0);
+    gate_k<<<n, 128, 2 * n * sizeof(float)>>>(weight, bias, x, scratch.dots, done_counts(), pack, n, topk, dim, dim, temp, route_scale,
+                                              norm != 0);
     return cudaGetLastError();
 }
 
@@ -670,8 +851,7 @@ API int sclm_gpu_gate_guess(const uint16_t* weight, const float* bias, const uin
     if (n > 1024 || k > n) return -1;
     ensure_scratch();
     hc_pre_norm_k<<<1, 1024>>>(h, pre, norm_w, scratch.h, dim, hc, eps);
-    dots_k<uint16_t><<<n, 128>>>(weight, scratch.h, scratch.dots, dim);
-    gate_pick_k<<<1, 1024>>>(scratch.dots, bias, scratch.h, out, n, k, 0, temp, 1.0f, false);
+    gate_k<<<n, 128, 2 * n * sizeof(float)>>>(weight, bias, scratch.h, scratch.dots, done_counts(), out, n, k, dim, 0, temp, 1.0f, false);
     return cudaGetLastError();
 }
 
