@@ -110,14 +110,29 @@ __global__ void rmsnorm_k(const uint16_t* x, const uint16_t* w, uint16_t* out, i
 }
 
 // upstream apply_rotary_emb on the last rd values of each of `heads` vectors of head_dim (bf16, in place): adjacent
-// pairs are complex numbers multiplied by freqs[pair] (re, im), conjugated when inverse. A thread per pair.
-__global__ void rope_k(uint16_t* x, const float* freqs, int heads, int head_dim, int rd, bool inverse) {
+// pairs are complex numbers multiplied by freqs[pair] (re, im). A thread per pair.
+__global__ void rope_k(uint16_t* x, const float* freqs, int heads, int head_dim, int rd) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, pairs = rd / 2;
     if (i >= heads * pairs) return;
     uint16_t* v = x + (i / pairs) * head_dim + head_dim - rd + 2 * (i % pairs);
-    const float a = from_bf16(v[0]), b = from_bf16(v[1]), c = freqs[2 * (i % pairs)];
-    const float d = inverse ? -freqs[2 * (i % pairs) + 1] : freqs[2 * (i % pairs) + 1];
+    const float a = from_bf16(v[0]), b = from_bf16(v[1]), c = freqs[2 * (i % pairs)], d = freqs[2 * (i % pairs) + 1];
     v[0] = to_bf16(a * c - b * d), v[1] = to_bf16(a * d + b * c);
+}
+
+// The start of the output side of upstream Attention.forward for one token: the query's rotation is taken back off
+// o[heads][head_dim] (bf16; apply_rotary_emb's inverse on the last rd values of each head, rounded to bf16) and the
+// result quantized (kernel.act_quant) as fp32. A block of 32 threads per 32 values; head_dim - rd is even.
+__global__ void unrope_quant_k(const uint16_t* o, const float* freqs, float* xq, int head_dim, int rd) {
+    const int i = blockIdx.x * 32 + threadIdx.x, at = i % head_dim - (head_dim - rd);
+    float v = from_bf16(o[i]);
+    const float other = __shfl_xor_sync(0xffffffff, v, 1);  // the pair's other value
+    if (at >= 0) {
+        const float c = freqs[at & ~1], d = -freqs[(at & ~1) + 1];
+        v = from_bf16(to_bf16(at & 1 ? other * d + v * c : v * c - other * d));
+    }
+    float mx = fabsf(v);
+    for (int s = 16; s; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
+    xq[i] = fp8_round(v, mx);
 }
 
 // kernel.sparse_attn for one query token, block h for head h: kv is both key and value, position idx[t] being
@@ -542,7 +557,7 @@ API int sclm_gpu_attn_q(const uint8_t* wa, const uint8_t* sa, const uint16_t* no
     rmsnorm_k<<<1, 1024>>>(qr, norm_w, qr, rank, eps);
     act_quant_k<float><<<rank / 32, 32>>>(qr, scratch.xq);
     fp8_gemv_k<<<heads * head_dim, threads_for(rank, 4)>>>(wb, sb, scratch.xq, q, rank, heads * head_dim, STORE);
-    rope_k<<<(heads * rd / 2 + 255) / 256, 256>>>(q, freqs, heads, head_dim, rd, false);
+    rope_k<<<(heads * rd / 2 + 255) / 256, 256>>>(q, freqs, heads, head_dim, rd);
     return cudaGetLastError();
 }
 
@@ -554,7 +569,7 @@ API int sclm_gpu_attn_kv(const uint8_t* w, const uint8_t* s, const uint16_t* nor
     act_quant_k<float><<<dim / 32, 32>>>(x, scratch.xq);
     fp8_gemv_k<<<head_dim, threads_for(dim, 4)>>>(w, s, scratch.xq, kv, dim, head_dim, STORE);
     rmsnorm_k<<<1, 1024>>>(kv, norm_w, kv, head_dim, eps);
-    rope_k<<<(rd / 2 + 255) / 256, 256>>>(kv, freqs, 1, head_dim, rd, false);
+    rope_k<<<(rd / 2 + 255) / 256, 256>>>(kv, freqs, 1, head_dim, rd);
     act_quant_k<uint16_t><<<head_dim / 32, 32>>>(kv, kv);
     return cudaGetLastError();
 }
@@ -597,16 +612,15 @@ API int sclm_gpu_sparse_attn(const uint16_t* q, const uint16_t* window, const ui
     return cudaGetLastError();
 }
 
-// The output side of upstream Attention.forward for one token: the rotary embedding is taken back off o (in place),
-// then out[dim] = wo_b (wo_a o) with wo_a block-diagonal over `groups` and both fp8 with block scales. n_a is wo_a's
+// The output side of upstream Attention.forward for one token: the rotary embedding is taken back off o, then
+// out[dim] = wo_b (wo_a o) with wo_a block-diagonal over `groups` and both fp8 with block scales. n_a is wo_a's
 // row count.
-API int sclm_gpu_attn_out(uint16_t* o, const float* freqs, const uint8_t* wa, const uint8_t* sa, const uint8_t* wb,
+API int sclm_gpu_attn_out(const uint16_t* o, const float* freqs, const uint8_t* wa, const uint8_t* sa, const uint8_t* wb,
                           const uint8_t* sb, uint16_t* out, int heads, int head_dim, int rd, int groups, int n_a, int dim) {
     const int width = heads * head_dim;
-    if (width > SCRATCH || n_a > SCRATCH) return -1;
+    if (width > SCRATCH || n_a > SCRATCH || (head_dim - rd) % 2 || head_dim % 32) return -1;
     ensure_scratch();
-    rope_k<<<(heads * rd / 2 + 255) / 256, 256>>>(o, freqs, heads, head_dim, rd, true);
-    act_quant_k<float><<<width / 32, 32>>>(o, scratch.xq);
+    unrope_quant_k<<<width / 32, 32>>>(o, freqs, scratch.xq, head_dim, rd);
     fp8_gemv_k<<<n_a, threads_for(width / groups, 4)>>>(wa, sa, scratch.xq, scratch.h, width / groups, n_a / groups, STORE);
     act_quant_k<float><<<n_a / 32, 32>>>(scratch.h, scratch.xq);
     fp8_gemv_k<<<dim, threads_for(n_a, 4)>>>(wb, sb, scratch.xq, out, n_a, dim, STORE);

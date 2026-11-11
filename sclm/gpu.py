@@ -160,8 +160,7 @@ def sparse_attn(q: torch.Tensor, window: torch.Tensor, compressed: torch.Tensor,
 
 def attn_out(o: torch.Tensor, freqs: int, wo_a_weight: torch.Tensor, wo_a_scale: torch.Tensor, wo_b, heads: int, rd: int,
              groups: int) -> torch.Tensor:
-    """The output side of upstream Attention.forward for one token: o (bf16 [heads * head_dim], changed in place)
-    -> bf16 [dim]. wo_a is fp8 with block scales, block-diagonal over `groups`; wo_b an upstream fp8 Linear."""
+    """The output side of upstream Attention.forward for one token: o (bf16 [heads * head_dim]) -> bf16 [dim]. wo_a is fp8 with block scales, block-diagonal over `groups`; wo_b an upstream fp8 Linear."""
     assert o.dtype == torch.bfloat16 and o.is_contiguous()
     dim = wo_b.weight.size(0)
     out = torch.empty(dim, dtype=torch.bfloat16, device=o.device)
