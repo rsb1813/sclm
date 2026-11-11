@@ -1,0 +1,69 @@
+{
+ "config": "none_n4",
+ "tokens": 16384,
+ "ppl": 10366095.341176204,
+ "forward_min": 0.3463096102078756,
+ "kl_top64": NaN,
+ "top1_agree": NaN,
+ "top1_logprob": NaN,
+ "top1_logprob_ref": NaN,
+ "kl_by_logit_scale": {
+  "0.9": NaN,
+  "1.0": NaN,
+  "1.05": NaN,
+  "1.1": NaN,
+  "1.15": NaN,
+  "1.2": NaN,
+  "1.3": NaN
+ },
+ "per_seq": [
+  {
+   "category": "en_web",
+   "ppl": 32859751.75290836,
+   "kl": NaN,
+   "top1": NaN
+  },
+  {
+   "category": "en_web",
+   "ppl": 25989894.152748883,
+   "kl": NaN,
+   "top1": NaN
+  },
+  {
+   "category": "ko_wiki",
+   "ppl": 2883808.2271805056,
+   "kl": NaN,
+   "top1": NaN
+  },
+  {
+   "category": "chat_en",
+   "ppl": 10458438.040820213,
+   "kl": NaN,
+   "top1": NaN
+  },
+  {
+   "category": "chat_ko",
+   "ppl": 987806.6074514092,
+   "kl": NaN,
+   "top1": NaN
+  },
+  {
+   "category": "code_inst",
+   "ppl": 13297161.430920359,
+   "kl": NaN,
+   "top1": NaN
+  },
+  {
+   "category": "code_raw",
+   "ppl": 6645775.699241338,
+   "kl": NaN,
+   "top1": NaN
+  },
+  {
+   "category": "math",
+   "ppl": 59298410.27239535,
+   "kl": NaN,
+   "top1": NaN
+  }
+ ]
+}

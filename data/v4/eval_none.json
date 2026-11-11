@@ -1,0 +1,40 @@
+{
+ "config": "none",
+ "tokens": 16384,
+ "ppl": 4.738771398448725,
+ "forward_min": 3.458976344267527,
+ "per_seq": [
+  {
+   "category": "en_web",
+   "ppl": 7.602433761903413
+  },
+  {
+   "category": "en_web",
+   "ppl": 7.606971112843116
+  },
+  {
+   "category": "ko_wiki",
+   "ppl": 5.9615097409542255
+  },
+  {
+   "category": "chat_en",
+   "ppl": 4.0957941449565185
+  },
+  {
+   "category": "chat_ko",
+   "ppl": 6.223334023292422
+  },
+  {
+   "category": "code_inst",
+   "ppl": 2.1128491895441917
+  },
+  {
+   "category": "code_raw",
+   "ppl": 2.847907382107534
+  },
+  {
+   "category": "math",
+   "ppl": 4.808944951905478
+  }
+ ]
+}

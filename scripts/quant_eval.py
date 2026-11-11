@@ -454,7 +454,8 @@ def hedge_routing_(block, layer: int, sigma: float, hedged: torch.Tensor, p_min:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--config", choices=list(CONFIGS), required=True)
+    ap.add_argument("--config", required=True, help="one of CONFIGS, or the name of an allocation "
+                    "(data/alloc_<name>.json from scripts/allocate_tiers.py): GPTQ by that plan")
     ap.add_argument("--freeze-routing", action="store_true", help="force the reference model's expert choices")
     ap.add_argument("--record-routing", action="store_true", help="with --config none: save the expert choices")
     ap.add_argument("--layers", help="lo:hi, compress only layers lo..hi-1 (per-block configs; layer sensitivity)")
@@ -469,14 +470,19 @@ def main() -> None:
     ap.add_argument("--tables", action="store_true", help="config codes: int8 table sums as the engine computes them")
     ap.add_argument("--save-codes", help="gptq_alloc configs with vector options: directory for each layer's codes "
                     "(sclm/codes.py), the allocation and the evaluation result")
+    ap.add_argument("--n-layers", type=int, help="the model cut to its first N layers (a quick end-to-end check); the "
+                    "reference and the results get their own files")
     cli = ap.parse_args()
     torch.set_default_dtype(torch.bfloat16)
+    cut = {"n_layers": cli.n_layers} if cli.n_layers else {}
+    sfx = f"_n{cli.n_layers}" if cli.n_layers else ""
 
     tokens = torch.from_numpy(np.load(os.path.join(DATA, "calib_v1", "tokens.npz"))["tokens"]).long()
     seqs = tokens[3::6][:8]  # disjoint from the layer probe's tokens[::6], spread over categories
-    runner = LayerwiseRunner(Checkpoint(cli.ckpt), load_args(max_batch_size=2, max_seq_len=tokens.size(1)),
+    runner = LayerwiseRunner(Checkpoint(cli.ckpt), load_args(max_batch_size=2, max_seq_len=tokens.size(1), **cut),
                              AutoTokenizer.from_pretrained(cli.ckpt))
-    cfg = CONFIGS[cli.config]
+    cfg = CONFIGS[cli.config] if cli.config in CONFIGS else ("gptq_alloc", cli.config, False)
+    assert cli.config in CONFIGS or os.path.exists(os.path.join(DATA, f"alloc_{cli.config}.json")), cli.config
     if cfg == "dense":
         before_block = lambda i, block: dense_experts_(block)  # noqa: E731
     elif cfg == "codes":
@@ -499,8 +505,8 @@ def main() -> None:
     t0 = time.time()
     # expert choices of the uncompressed model on the eval batches: [batch][layer] -> [B*S, topk]. routing_v1.npz
     # cannot serve: it was traced before the bf16-operand GEMM change and differs from today's reference path
-    routing_path = os.path.join(DATA, "eval_routing_ref.pt")
-    before_batch, tag, cur = None, cli.config, {"batch": 0}
+    routing_path = os.path.join(DATA, f"eval_routing_ref{sfx}.pt")
+    before_batch, tag, cur = None, cli.config + sfx, {"batch": 0}
     if cfg == "codes":
         tag += "_" + os.path.basename(os.path.normpath(cli.codes)) + ("_tables" if cli.tables else "")
     if cli.layers:
@@ -598,7 +604,7 @@ def main() -> None:
     norm = m.RMSNorm(runner.args.dim, runner.args.norm_eps).to(DEV)
     load_params_(norm, {"weight": runner.ckpt.get("norm.weight")}, "norm.")
     head = runner.ckpt.get("head.weight").to(DEV).float()
-    ref_path = os.path.join(DATA, "eval_ref.pt")
+    ref_path = os.path.join(DATA, f"eval_ref{sfx}.pt")
     # the uncompressed run writes the reference; every other run (incl. "none" with frozen routing) compares to it
     ref = None if cfg is None and not cli.freeze_routing else torch.load(ref_path, weights_only=True)
     out_ids, out_lp = [], []
