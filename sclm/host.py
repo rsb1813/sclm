@@ -136,6 +136,7 @@ class HostBlock(m.Block):
         h = gpu.hc_post(a.contiguous(), h, attn_mix[hc:2 * hc], attn_mix[2 * hc:])
         ffn_mix = mixes(h, "ffn")
         f = gpu.hc_pre_norm(h, attn_mix[:hc], self.ffn_norm.weight, self.ffn_norm.eps)  # the mix attention computed
+        self.ffn.stream = (h, attn_mix[:hc])
         f = self.ffn(f.view(1, 1, -1), image_mask)
         h = gpu.hc_post(f.contiguous(), h, ffn_mix[hc:2 * hc], ffn_mix[2 * hc:])
         return h.view(shape), ffn_mix[:hc].view(1, 1, hc)
@@ -192,6 +193,8 @@ def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, c
         path = os.path.join(codes_dir, f"layer_{i:02d}.safetensors")
         block.ffn.ram = core.Layer(path, args.dim, args.moe_inter_dim, args.swiglu_limit)
         block.ffn.cache = cache
+        if i:  # in a tuple, so that the block before does not register this one's modules as its own
+            net.layers[i - 1].ffn.after = (block.ffn, block.ffn_norm.weight, block.ffn_norm.eps)
     return cache
 
 

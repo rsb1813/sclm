@@ -591,6 +591,19 @@ API int sclm_gpu_gate(const uint16_t* weight, const float* bias, const uint16_t*
     return cudaGetLastError();
 }
 
+// out[2 * k] (fp32) = the k experts a gate (weight, bias) would pick, and their scores, if its layer's input were
+// RMSNorm (weight norm_w) of Block.hc_pre(h, pre): the gate of the next layer applied to this layer's input, a
+// guess at what the next layer will route to. Shares scratch with sclm_gpu_gate, so it is launched after it.
+API int sclm_gpu_gate_guess(const uint16_t* weight, const float* bias, const uint16_t* h, const float* pre,
+                            const uint16_t* norm_w, float* out, int n, int k, int dim, int hc, float temp, float eps) {
+    if (n > 1024 || k > n) return -1;
+    ensure_scratch();
+    hc_pre_norm_k<<<1, 1024>>>(h, pre, norm_w, scratch.h, dim, hc, eps);
+    dots_k<uint16_t><<<n, 128>>>(weight, scratch.h, scratch.dots, dim);
+    gate_pick_k<<<1, 1024>>>(scratch.dots, bias, scratch.h, out, n, k, 0, temp, 1.0f, false);
+    return cudaGetLastError();
+}
+
 // out[n] (bf16) = routed[n] + shared[n] (fp32): the MoE's output from its two sums.
 API int sclm_gpu_moe_finish(const float* routed, const float* shared, uint16_t* out, int n) {
     moe_finish_k<<<(n + 255) / 256, 256>>>(routed, shared, out, n);

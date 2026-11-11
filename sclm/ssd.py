@@ -56,13 +56,16 @@ class ExpertCache:
     """Original FP4 experts held in device memory: `slots` of them chosen by the engine's policy (core.Cache), plus
     `scratch` slots for experts the policy does not keep. A slot is the expert's bytes as they lie in the checkpoint
     (scales, then weights), and the upstream kernels compute from views of them. `background`: staging buffers for
-    experts read without anyone waiting (request's wait argument)."""
+    experts read without anyone waiting (request's wait argument, read_ahead)."""
 
     def __init__(self, reader: ExpertReader, n_layers: int, n_experts: int, dim: int, inter: int, limit: float,
                  slots: int, lam: float, device, scratch: int, background: int = 0):
         self.reader, self.n_experts, self.n_slots = reader, n_experts, slots
         self.loaded = [None] * slots  # slot -> the key whose bytes it holds (or is being given by a waited read)
+        self.held = {}  # the same, key -> slot
         self.loads = {}  # staging buffer -> (slot, key, where the bytes land) of the background read filling it
+        # key -> (staging buffer, where the bytes land) of a read started on a guess (read_ahead), under way or done
+        self.ahead = {}
         self.idle = list(range(scratch, scratch + background))  # staging buffers free for a background read
         self.cooling = []  # buffers whose upload was queued by the last request: idle again at the next one
         self.token = 0  # position of the first token of the forward in progress, set by the host
@@ -74,6 +77,7 @@ class ExpertCache:
         # routing weight; otherwise the token goes on without it and it is read in the background
         self.wait_share = 0.0
         self.ram_share = 0.0  # > 0: a CPU-tier expert with less than this share of the routing weight is left out
+        self.guess = 0  # > 0: a layer's gate guesses this many experts of the next layer, which are read ahead
         self.policy = core.Cache(n_layers * n_experts, slots, lam)
         n_scale, n_weight = reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
@@ -101,9 +105,36 @@ class ExpertCache:
         self.store[slot, n_scale:].copy_(buf[at_w:at_w + n_weight], non_blocking=True)
         self.uploading = self.store.is_cuda
 
+    def _give(self, slot: int, key: int | None) -> None:
+        """The slot holds, or is being given, the bytes of `key` from now on (None: of nobody)."""
+        self.held.pop(self.loaded[slot], None)
+        self.loaded[slot] = key
+        if key is not None:
+            self.held[key] = slot
+
+    def read_ahead(self, layer: int, experts: list) -> None:
+        """Starts reading experts the layer is expected to ask for (a guess made a layer early), unless they are in
+        the cache or being read already. They wait in staging buffers, where request() finds them; a guess that does
+        not come true costs its read and nothing else. Called after the token's request() for the layer before."""
+        loading = {key for _, key, _ in self.loads.values()}
+        for e in experts:
+            key = layer * self.n_experts + e
+            if key in self.held or key in self.ahead or key in loading:
+                continue
+            if not self.idle:  # the oldest guess nobody asked for gives up its buffer, if its read is over
+                self.reader.reader.poll()
+                old = next(iter(self.ahead), None)
+                if old is None or not self.reader.reader.done(self.ahead[old][0]):
+                    return
+                self.idle.append(self.ahead.pop(old)[0])
+            i = self.idle.pop()
+            self.ahead[key] = (i, self.reader.submit(layer, e, self.staging[i].numpy(), i))
+            self.stats["ahead"] += 1
+
     def request(self, layer: int, experts: list, token: int, wait: list | None = None) -> tuple[list, list]:
         """Slots of a layer's SSD-tier experts at a token, with the reads of the missing ones started.
-        Returns (slots, pending); finish(pending) has to run before the slots are used.
+        Returns (slots, pending); finish(pending) has to run before the slots of `pending` (its first field) are used.
+        An expert read ahead is taken from its staging buffer, at once if its read is over.
         wait[i] False (lossy): if the expert's bytes are not in its slot, its slot comes back None; it is read in the
         background when a staging buffer is free, and is there for the tokens after."""
         if self.uploading:  # the reads below go into the buffers those uploads copy from
@@ -117,38 +148,50 @@ class ExpertCache:
                 slot, key, (at_s, at_w) = self.loads.pop(i)
                 if self.loaded[slot] is None:  # else a waited read has given the slot to another expert since
                     self._upload(slot, self.staging[i], at_s, at_w)
-                    self.loaded[slot] = key
+                    self._give(slot, key)
                 self.cooling.append(i)
         keys = [layer * self.n_experts + e for e in experts]
         slots = self.policy.use(keys, token)[0].tolist()
-        out, pending, loading = [], [], {slot for slot, _, _ in self.loads.values()}
+        out, pending, loading, waited = [], [], {slot for slot, _, _ in self.loads.values()}, 0
+        if self.ahead:
+            self.reader.reader.poll()
         for k, (e, key, slot) in enumerate(zip(experts, keys, slots)):
             kept = slot < self.n_slots  # not a scratch slot
             if kept and self.loaded[slot] == key:
                 out.append(slot)
-            elif wait is None or wait[k]:
-                buf = self.staging[len(pending)]
-                pending.append((slot, buf, self.reader.submit(layer, e, buf.numpy())))
+            elif key in self.ahead:
+                i, (at_s, at_w) = self.ahead.pop(key)
+                if self.reader.reader.done(i):
+                    self._upload(slot, self.staging[i], at_s, at_w)
+                else:
+                    pending.append((slot, self.staging[i], (at_s, at_w), i))
+                self.cooling.append(i)
                 if kept:
-                    self.loaded[slot] = key
+                    self._give(slot, key)
+                out.append(slot)
+                self.stats["ahead_used"] += 1
+            elif wait is None or wait[k]:
+                buf, waited = self.staging[waited], waited + 1
+                pending.append((slot, buf, self.reader.submit(layer, e, buf.numpy()), 0))
+                if kept:
+                    self._give(slot, key)
                 out.append(slot)
             else:
                 out.append(None)
                 # a slot whose previous owner is still arriving waits its turn: the expert is asked for again
                 if kept and slot not in loading and self.idle:
                     i = self.idle.pop()
-                    self.loaded[slot] = None
+                    self._give(slot, None)
                     self.loads[i] = (slot, key, self.reader.submit(layer, e, self.staging[i].numpy(), i))
                     loading.add(slot)
                     self.stats["loads"] += 1
         return out, pending
 
     def finish(self, pending: list) -> None:
-        """Waits for the reads and copies each expert into its slot."""
-        if not pending:
-            return
-        self.reader.wait()
-        for slot, buf, (at_s, at_w) in pending:
+        """Waits for the reads (each named by its ticket, the last field) and copies each expert into its slot."""
+        for ticket in {ticket for *_, ticket in pending}:
+            self.reader.reader.wait(ticket)
+        for slot, buf, (at_s, at_w), _ in pending:
             self._upload(slot, buf, at_s, at_w)
 
 

@@ -22,6 +22,7 @@ def lib():
         _lib.sclm_gpu_hc_post.argtypes = [C.c_void_p] * 5 + [C.c_int, C.c_int]
         _lib.sclm_gpu_fp8_expert.argtypes = [C.c_void_p] * 6 + [C.c_int, C.c_int, C.c_float, C.c_void_p, C.c_void_p, C.c_int]
         _lib.sclm_gpu_gate.argtypes = [C.c_void_p] * 4 + [C.c_int] * 3 + [C.c_float, C.c_float, C.c_int]
+        _lib.sclm_gpu_gate_guess.argtypes = [C.c_void_p] * 6 + [C.c_int] * 4 + [C.c_float, C.c_float]
         _lib.sclm_gpu_moe_finish.argtypes = [C.c_void_p] * 3 + [C.c_int]
         _lib.sclm_gpu_attn_q.argtypes = [C.c_void_p] * 9 + [C.c_int] * 5 + [C.c_float]
         _lib.sclm_gpu_attn_kv.argtypes = [C.c_void_p] * 6 + [C.c_int] * 3 + [C.c_float]
@@ -166,15 +167,28 @@ def attn_out(o: torch.Tensor, freqs: int, wo_a_weight: torch.Tensor, wo_a_scale:
     return out
 
 
-def gate(module, x: torch.Tensor) -> torch.Tensor:
+def gate(module, x: torch.Tensor, room: int = 0) -> torch.Tensor:
     """upstream Gate.forward ("sqrtsoftplus" scores) for one token x (bf16 [dim]) -> fp32 [2 * topk + dim]: the picked
-    experts' indices, their weights, then x as fp32, so that one transfer gives the host all it needs."""
+    experts' indices, their weights, then x as fp32, so that one transfer gives the host all it needs. room: floats
+    left free after them (for gate_guess)."""
     assert module.score_func == "sqrtsoftplus" and x.dtype == module.weight.dtype == torch.bfloat16 and x.is_contiguous()
     n, dim = module.weight.shape
-    pack = torch.empty(2 * module.topk + dim, dtype=torch.float32, device=x.device)
+    pack = torch.empty(2 * module.topk + dim + room, dtype=torch.float32, device=x.device)
     _check(lib().sclm_gpu_gate(module.weight.data_ptr(), module.bias.data_ptr(), x.data_ptr(), pack.data_ptr(), n, module.topk,
                                dim, module.gate_temp, module.route_scale, module.norm_topk_prob))
     return pack
+
+
+def gate_guess(module, norm_weight: torch.Tensor, h: torch.Tensor, pre: torch.Tensor, eps: float, out: torch.Tensor) -> None:
+    """out (fp32 [2 * k]) = the k experts the gate `module` would pick, then their scores, if its layer's input were
+    the RMSNorm (bf16 norm_weight) of the stream h mixed by pre (hc_pre_norm): the next layer's gate on this layer's
+    input. Called after gate() for the same token."""
+    n, dim = module.weight.shape
+    assert module.score_func == "sqrtsoftplus" and h.dtype == torch.bfloat16 and h.is_contiguous() and pre.is_contiguous()
+    assert out.dtype == pre.dtype == torch.float32 and out.is_contiguous() and norm_weight.numel() == dim
+    _check(lib().sclm_gpu_gate_guess(module.weight.data_ptr(), module.bias.data_ptr(), h.data_ptr(), pre.data_ptr(),
+                                     norm_weight.data_ptr(), out.data_ptr(), n, out.numel() // 2, dim, pre.numel(),
+                                     module.gate_temp, eps))
 
 
 def moe_finish(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:

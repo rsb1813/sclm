@@ -13,21 +13,28 @@ from sclm.upstream import model as m
 class TieredMoE(nn.Module):
     """Stands in for upstream MoE: the gate and the shared expert keep their parameter names, the routed experts have
     no parameters. `ram` (core.Layer) holds the layer's coded experts; every other expert comes from `cache`
-    (ssd.ExpertCache), whose `token` the host sets to the position of the forward's first token."""
+    (ssd.ExpertCache), whose `token` the host sets to the position of the forward's first token.
+    `after`: (the next block's TieredMoE, its ffn_norm weight and eps), for guessing its routing; the block sets
+    `stream` (its hyper-connection stream and the mix of the FFN input) before each decode."""
 
     def __init__(self, layer_id: int, args: "m.ModelArgs"):
         super().__init__()
         self.layer_id, self.dim, self.inter, self.limit = layer_id, args.dim, args.moe_inter_dim, args.swiglu_limit
         self.gate = m.Gate(layer_id, args)
         self.shared_experts = m.Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
-        self.ram = self.cache = None
+        self.ram = self.cache = self.after = self.stream = None
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """forward for one token (bf16 [dim]) on the engine's GPU kernels. The host waits for the device once, to
         learn the routing and take x for the CPU tier; while the CPU computes its tier, the device computes the shared
         expert and the routed experts it already holds."""
         cache, topk, stats, t0 = self.cache, self.gate.topk, self.cache.stats, perf_counter()
-        host = gpu.gate(self.gate, x).cpu().numpy()
+        guess = cache.guess if self.after else 0
+        pack = gpu.gate(self.gate, x, 2 * guess)
+        if guess:  # what the next layer's gate makes of this layer's input: its SSD experts are read a layer early
+            later, norm_weight, eps = self.after
+            gpu.gate_guess(later.gate, norm_weight, *self.stream, eps, pack[2 * topk + self.dim:])
+        host = pack.cpu().numpy()
         t1 = perf_counter()
         ids, gates = host[:topk].astype(np.int64).tolist(), host[topk:2 * topk].tolist()
         total = sum(gates)
@@ -37,6 +44,9 @@ class TieredMoE(nn.Module):
         ssd = [k for k, e in enumerate(ids) if e not in self.ram.experts]
         wait = [gates[k] >= cache.wait_share * total for k in ssd] if cache.wait_share else None
         slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], cache.token, wait)
+        if guess:
+            picks = host[2 * topk + self.dim:2 * topk + self.dim + guess].astype(np.int64).tolist()
+            cache.read_ahead(later.layer_id, [e for e in picks if e not in later.ram.experts])
         if wait:  # lossy: the token goes on without the light experts that are not in the cache yet
             ssd, slots = [k for k, s in zip(ssd, slots) if s is not None], [s for s in slots if s is not None]
         kept = sum(gates[k] for k in ram + ssd)
@@ -46,11 +56,12 @@ class TieredMoE(nn.Module):
         shared = torch.empty(self.dim, dtype=torch.float32, device=x.device)
         gpu.fp8_expert(self.shared_experts, self.limit, xq, shared, store=True)
         y = torch.zeros(self.dim, dtype=torch.float32, device=x.device)
-        reading = {slot for slot, _, _ in pending}
+        reading = {slot for slot, *_ in pending}
         for k, slot in zip(ssd, slots):
             if slot not in reading:
                 gpu.fp4_expert(cache.store[slot], self.dim, self.inter, self.limit, xq, gates[k], y)
-        self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:], cache.ram_out.numpy())
+        self.ram.forward([ids[k] for k in ram], [gates[k] for k in ram], host[2 * topk:2 * topk + self.dim],
+                         cache.ram_out.numpy())
         t2 = perf_counter()
         cache.finish(pending)
         t3 = perf_counter()
@@ -63,7 +74,8 @@ class TieredMoE(nn.Module):
         out = gpu.moe_finish(y, shared)
         t4 = perf_counter()
         for key, value in (("device_s", t1 - t0), ("ram_s", t2 - t1), ("read_s", t3 - t2), ("launch_s", t4 - t3),
-                           ("ram_calls", len(ram)), ("ssd_calls", len(ssd)), ("reads", len(pending))):
+                           ("ram_calls", len(ram)), ("ssd_calls", len(ssd)),
+                           ("reads", sum(ticket == 0 for *_, ticket in pending))):
             stats[key] += value
         return out
 
@@ -102,7 +114,7 @@ class TieredMoE(nn.Module):
             stats["launch_s"] += t4 - t3  # queueing the device's expert kernels (they run asynchronously)
             stats["ram_calls"] += len(ram)
             stats["ssd_calls"] += len(ssd)
-            stats["reads"] += len(pending)
+            stats["reads"] += sum(ticket == 0 for *_, ticket in pending)
             t1 = t4
         if gpu.active and len(rows) == 1:
             gpu.fp8_expert(self.shared_experts, self.limit, xq, y[0])
