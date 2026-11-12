@@ -180,7 +180,7 @@ class Engine:
     doubled when they hold more, at the expert cache's cost, and brought down again when a quarter would do (None:
     the decoder's memory is left as it is)."""
 
-    def __init__(self, tok, decoder, context: int, slice: int = 8, keep: int = 8, reserve: int | None = None):
+    def __init__(self, tok, decoder, context: int, slice: int = 64, keep: int = 8, reserve: int | None = None):
         self.tok, self.decoder, self.context, self.slice, self.keep = tok, decoder, context, slice, keep
         self.eos = tok.eos_token_id
         self.think_start, self.think_end = tok.convert_tokens_to_ids("<think>"), tok.convert_tokens_to_ids("</think>")
@@ -481,7 +481,7 @@ def main() -> None:
     ap.add_argument("--reserve", type=int, default=32768, help="tokens the VRAM set aside for sequences is for at first "
                     "(6.7 MiB per thousand); it grows with what they hold, and the expert cache gives up slots for it")
     ap.add_argument("--max-tokens", type=int, default=20000, help="the most tokens of a reply, thinking included")
-    ap.add_argument("--slice", type=int, default=8, help="tokens a request is given before the next one's turn (0: requests "
+    ap.add_argument("--slice", type=int, default=64, help="tokens a request is given before the next one's turn (0: requests "
                     "are served one after the other)")
     ap.add_argument("--keep", type=int, default=8, help="conversations kept after their reply, for their next request")
     ap.add_argument("--effort", default="low", choices=["low", "high", "max"], help="thinking depth when a request names none")
