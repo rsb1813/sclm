@@ -38,6 +38,8 @@ def lib():
                                             [C.c_void_p] * 4)
         _lib.sclm_gpu_pool.argtypes = [C.c_void_p] * 7 + [C.c_int] * 3 + [C.c_void_p] * 2 + [C.c_int] * 3 + [C.c_float, C.c_int, C.c_int]
         _lib.sclm_gpu_moe_guess.argtypes = []
+        _lib.sclm_gpu_moe_lane.argtypes = [C.c_int]
+        _lib.sclm_gpu_moe_wait.argtypes = [C.c_int, C.c_int]
         _lib.sclm_gpu_moe_end.argtypes = [C.c_void_p] * 5 + [C.c_int]
         _lib.sclm_gpu_copy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
         _lib.sclm_gpu_copies_wait.argtypes = []
@@ -323,6 +325,18 @@ def moe_begin(module, x: torch.Tensor, expert, limit: float, buf: SimpleNamespac
 def moe_guess() -> None:
     """Waits until the guess of the last moe_begin is on the host."""
     _check(lib().sclm_gpu_moe_guess())
+
+
+def moe_lane(lane: int) -> None:
+    """The lane of the moe_begin calls from now on. 0: a decode token, whose call returns when its routing is on the
+    host. Another lane (up to 64): a token computed together with others; its call returns at once, and moe_wait
+    waits for what it queued."""
+    _check(lib().sclm_gpu_moe_lane(lane))
+
+
+def moe_wait(lane: int, guess: bool = False) -> None:
+    """Waits until the routing of the lane's last moe_begin is on the host, or (guess) its guess."""
+    _check(lib().sclm_gpu_moe_wait(lane, guess))
 
 
 def copy(to: int, source: int, nbytes: int) -> None:

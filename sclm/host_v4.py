@@ -17,6 +17,27 @@ def attended(win: int, more: int, device: torch.device) -> torch.Tensor:
     return torch.cat([ring, (win + torch.arange(more, device=device, dtype=torch.int32)).expand(win, -1)], dim=1).contiguous()
 
 
+class Lane:
+    """What one of several tokens computed together (Host.feed) keeps to itself from one half of a block to the next:
+    the hyper-connection stream after attention (`mid`) and after the block (`out`), the FFN's mix, the MoE's buffers
+    and the CPU tier's sum. The buffers a block's kernels only hand on to each other are shared by all the tokens:
+    the device runs the kernels in the order they were queued. index: the lane's number in the engine (1 and up)."""
+
+    def __init__(self, index: int, hc: int, dim: int, topk: int, device):
+        self.index, self.token = index, 0  # token: the expert cache's clock at the lane's token
+        self.h = None  # the token's embedding as the first block's stream
+        self.mid, self.out = (torch.empty(hc, dim, dtype=torch.bfloat16, device=device) for _ in range(2))
+        self.ffn_mix = torch.empty((2 + hc) * hc, dtype=torch.float32, device=device)  # pre[hc], post[hc], comb[hc][hc]
+        self.buf = gpu.moe_buffers.__wrapped__(topk, dim, 32, device)  # room for a guess of up to 32 experts
+        self.ram_out = torch.empty(dim, dtype=torch.float32, pin_memory=True)
+        self.bound = {}  # a block or (its MoE, the guess) -> their kernels on this lane's buffers
+
+    def moe(self, ffn, guess: int) -> tuple:
+        if (ffn, guess) not in self.bound:
+            self.bound[ffn, guess] = ffn.kernels(self.buf, guess, (self.mid, self.ffn_mix[:self.mid.size(0)]), self.ram_out)
+        return self.bound[ffn, guess]
+
+
 class V4Attention(m.Attention):
     """upstream Attention; decoding one token with the kernels on, the engine computes the query, the token's
     key/value, the compressed key/value and the index's keys when the token completes a group, the attention itself
@@ -127,6 +148,7 @@ class V4Block(m.Block):
             return gpu.bind("hc_post", later, residual, mix[hc:2 * hc], mix[2 * hc:], out, dim, hc)
 
         self.ffn.stream = (mid, ffn_mix[:hc])  # the FFN's input before its norm: what the next layer's gate is guessed from
+        self.shared = (a, f, attn_mix)  # what a lane's kernels read and write of this block's own buffers
         self.bound = (
             mixes("attn", later, attn_mix), sublayer_in(later, attn_mix, self.attn_norm),  # the stream
             post(attn_mix, later, mid),  # the sublayer's output, the stream
@@ -150,3 +172,29 @@ class V4Block(m.Block):
         y = self.ffn(f, input_ids).contiguous()
         ffn_post(y.data_ptr())
         return out
+
+    def start(self, lane: Lane, h: int, start_pos: int, token: int) -> tuple:
+        """The first half of forward for a lane's token whose stream is at address h: attention, and the MoE as far
+        as it goes without the routing (TieredMoE.begin). Nothing is waited for."""
+        attn_mix, attn_in, _, _, _, _, a, f, _ = self.bound or self.bind(lane.out)
+        if self not in lane.bound:
+            hc, dim, mix = self.hc_mult, lane.out.size(-1), self.shared[2]
+            norm = self.ffn_norm.weight.to(torch.bfloat16)
+            lane.bound[self] = (
+                gpu.bind("hc_post", gpu.LATER, gpu.LATER, mix[hc:2 * hc], mix[2 * hc:], lane.mid, dim, hc),  # attention's output, the stream
+                gpu.bind("hc_mixes", lane.mid, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, lane.ffn_mix, dim, hc,
+                         self.norm_eps, self.hc_eps, self.hc_sinkhorn_iters),
+                gpu.bind("hc_pre_norm", lane.mid, lane.ffn_mix[:hc], norm, self.shared[1], dim, hc, self.ffn_norm.eps),
+                gpu.bind("hc_post", gpu.LATER, lane.mid, lane.ffn_mix[hc:2 * hc], lane.ffn_mix[2 * hc:], lane.out, dim, hc))  # the MoE's output
+        attn_post, ffn_mix, ffn_in, _ = lane.bound[self]
+        attn_mix(h)
+        attn_in(h)
+        y = self.attn(a, start_pos).contiguous()
+        attn_post(y.data_ptr(), h)
+        ffn_mix()
+        ffn_in()
+        return self.ffn.begin(f.view(-1), token, lane)
+
+    def end(self, lane: Lane, begun: tuple) -> None:
+        """The second half: the rest of the MoE (TieredMoE.finish) and the stream after the block, into lane.out."""
+        lane.bound[self][3](self.ffn.finish(begun, lane).data_ptr())

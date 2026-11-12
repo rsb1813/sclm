@@ -22,6 +22,7 @@ from scripts.chat import looping, pick
 from sclm import CKPT, CODES
 
 CHUNK = 4096  # a sequence's room is a multiple of this many tokens
+FEED = 16  # tokens of a prompt fed in one step: the decoder takes them through its layers together
 TOOL_CALLS = f"\n\n<{dsml_token}{tool_calls_block_name}"  # what a tool call block begins with in the answer's text
 # OpenAI's reasoning_effort values as the model's (None: no thinking)
 EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
@@ -86,23 +87,24 @@ class Job:
         self.shown, self.calling = 0, False  # how much of the answer was sent; a tool call has begun
         self.times = {"submit": time.perf_counter()}
 
-    def _feed(self, engine, token: int) -> None:
-        self.logits = engine.decoder.logits(torch.tensor([[token]]), len(self.conv.ids))
-        self.conv.ids.append(token)
+    def _feed(self, engine, tokens: list) -> None:
+        self.logits = engine.decoder.feed(tokens, len(self.conv.ids))
+        self.conv.ids += tokens
 
-    def step(self, engine) -> bool:
-        """Feeds one token, of the prompt or sampled. False: the job is over."""
+    def step(self, engine) -> int:
+        """Feeds up to FEED tokens of the prompt, or one sampled token. Returns how many; 0: the job is over."""
         if self.cancelled:
             return self._end("cancelled")
         self.times.setdefault("start", time.perf_counter())
         if self.at < len(self.ids):
-            if self.at == len(self.ids) - 1:
+            last = len(self.ids) - 1  # fed alone, from the mark
+            if self.at == last:
                 self.conv.mark = (self.at, engine.decoder.snapshot())
-            self._feed(engine, self.ids[self.at])
-            self.at += 1
-            if self.at % 64 == 0:
-                self.events.put(("feed", self.at, len(self.ids)))
-            return True
+            tokens = self.ids[self.at:min(last, self.at + FEED)] or self.ids[last:]
+            self._feed(engine, tokens)
+            self.at += len(tokens)
+            self.events.put(("feed", self.at, len(self.ids)))
+            return len(tokens)
         if self.kind is None:  # the reply begins
             self.kind = "think" if self.ids[-1] == engine.think_start else "answer"
             self.pieces = Pieces(engine.tok)
@@ -114,7 +116,7 @@ class Job:
         token = pick(self.logits, self.temperature, self.top_p, self.rng)
         if token == engine.eos:  # not fed: the next turn's prompt has it
             return self._end("stop")
-        self._feed(engine, token)
+        self._feed(engine, [token])
         self.new += 1
         self.said.append(token)
         self.times.setdefault("first", time.perf_counter())
@@ -126,7 +128,7 @@ class Job:
                 piece = self.pieces.add(token)
             if piece and not self._say(piece):
                 return self._end("stop")
-        return True if not looping(self.said) else self._end("length")  # a loop is cut off like a reply that is too long
+        return 1 if not looping(self.said) else self._end("length")  # a loop is cut off like a reply that is too long
 
     def _say(self, piece: str) -> bool:
         """Adds a piece to the text and sends what can be sent. False: a stop string ends the answer."""
@@ -152,7 +154,7 @@ class Job:
             self.shown = end
         return cut < 0
 
-    def _end(self, reason: str) -> bool:
+    def _end(self, reason: str) -> int:
         text, calls = self.text["answer"], []
         if self.calling:
             try:
@@ -170,7 +172,7 @@ class Job:
             "usage": {"prompt_tokens": len(self.ids), "completion_tokens": self.new, "total_tokens": len(self.ids) + self.new,
                       "prompt_tokens_details": {"cached_tokens": self.reused},
                       "completion_tokens_details": {"reasoning_tokens": self.thought}}}))
-        return False
+        return 0
 
 
 class Engine:
@@ -312,10 +314,13 @@ class Engine:
         for job in list(self.active):
             try:
                 self.decoder.switch(job.conv.seq)
-                for _ in range(self.slice or 1 << 62):
-                    if not job.step(self):
+                left = self.slice or 1 << 62
+                while left > 0:
+                    fed = job.step(self)
+                    if not fed:
                         self._finish(job)
                         break
+                    left -= fed
             except Exception as e:  # the sequence's state is unknown: it is not kept
                 job.events.put(("error", 500, f"{type(e).__name__}: {e}"))
                 self._finish(job, keep=False)

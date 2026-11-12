@@ -207,3 +207,28 @@ def test_longer_rotation_tables_let_a_sequence_pass_the_models_own_length(models
     decoder.switch(decoder.sequence(2 * args.max_seq_len))
     got = [decoder.logits(x[:, i:i + 1], i).float().clone() for i in range(x.size(1))]
     assert all(torch.equal(a, b) for a, b in zip(got, want)) and all(bool(t.isfinite().all()) for t in got[len(want):])
+
+
+@pytest.mark.parametrize("start,count", [(0, 40), (1, 2), (7, 16), (30, 53)])
+def test_tokens_fed_together_give_what_they_give_one_by_one(models, start, count):
+    """feed() takes up to 16 tokens through the layers together. Its logits, the state it leaves (window ring,
+    compressed key/values, compressors' groups, index keys) and the logits of the tokens after are those of the same
+    tokens fed one at a time: from the sequence's start, inside a group, across the window ring (16), past what the
+    index keeps, and with more tokens than go together. Five cache slots for six layers of eight experts: the tokens
+    take each other's slots."""
+    args, _, net, cache = models
+    decoder = host.Host(net, cache, device=DEV)
+    x = torch.randint(0, args.vocab_size, (1, start + count + 12), generator=torch.Generator().manual_seed(11))
+
+    def one_by_one(tokens, pos):
+        return [decoder.logits(tokens[:, i:i + 1], pos + i).float().clone() for i in range(tokens.size(1))]
+
+    want = one_by_one(x, 0)
+    state = [t.clone() for _, _, t in decoder.seq.state]
+    one_by_one(x[:, :start], 0)
+    got = decoder.feed(x[0, start:start + count].tolist(), start).float()
+    assert len(decoder.lanes) == decoder.LANES
+    assert torch.equal(got, want[start + count - 1])
+    after = one_by_one(x[:, start + count:], start + count)
+    assert all(torch.equal(a, b) for a, b in zip(after, want[start + count:]))
+    assert all(torch.equal(t, s) for (_, _, t), s in zip(decoder.seq.state, state))

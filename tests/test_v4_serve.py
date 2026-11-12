@@ -47,6 +47,11 @@ class Decoder:
     def restore(self, kept):
         del self.seq.fed[kept:]
 
+    def feed(self, tokens, pos):
+        for i, token in enumerate(tokens):
+            out = self.logits(torch.tensor([[token]]), pos + i)
+        return out
+
     def logits(self, ids, pos):
         fed = self.seq.fed
         assert pos == len(fed) < self.seq.capacity
@@ -144,7 +149,8 @@ def test_requests_open_together_take_turns_and_share_the_room(tok):
         assert job.conv.seq.fed == [10 + n] * (7 + n) + [20 + n] * (6 + 2 * n) and result["finish_reason"] == "stop"
     first, second, third = (job.conv.seq for job in jobs)
     order = decoder.order
-    assert order[:8] == [first, first, second, second, first, first, second, second]
+    # a prompt goes in together up to its last token, whatever the slice; from there the turns are two tokens long
+    assert order[:21] == [first] * 6 + [second] * 7 + [first, first, second, second] * 2
     assert third not in order[:order.index(third)] and first not in order[order.index(third):]  # it began when the first ended
     assert engine.room() == 0 and len(engine.idle) == 2  # the first one's sequence made room for the third
 

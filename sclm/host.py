@@ -430,6 +430,7 @@ class Host:
         self.clock = 0  # the cache's clock: tokens computed so far, over every sequence
         self.seq = Sequence(net) if V4 else None
         self.slots = None  # the expert cache's slots if no sequence had any room (reserve)
+        self.lanes = []  # host_v4.Lane: the buffers of tokens computed together (feed)
         on_gpu = torch.device(device).type == "cuda"
         self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
         self.first_mix = None  # upstream's identity pre-mix of the first block, made once
@@ -512,6 +513,52 @@ class Host:
         for comp in seq.compressors:
             comp.kv_cache = None  # upstream takes the view again from the state now in place
         self.seq = seq
+
+    LANES = 16  # tokens feed() computes together
+
+    @torch.inference_mode()
+    def feed(self, ids: list, start_pos: int) -> torch.Tensor:
+        """logits() for each of the tokens `ids` in turn, which continue the sequence at start_pos; returns the logits
+        after the last. With the kernels (V4-Flash-0731) up to LANES tokens go through the layers together, to the
+        same result: token k leaves a layer before token k + 1 enters its MoE, and enters the next layer's attention
+        after token k - 1 has. While the CPU computes one token's tier, the device computes the next tokens'
+        attention, no token waits for its routing, and a layer's experts are read for all the tokens when the first
+        one enters it."""
+        if not (V4 and self.kernels) or start_pos == 0:
+            out = self.logits(torch.tensor([ids[:1]]), start_pos)
+            ids, start_pos = ids[1:], start_pos + 1
+            if not (V4 and self.kernels):
+                for i, token in enumerate(ids):
+                    out = self.logits(torch.tensor([[token]]), start_pos + i)
+                return out
+        net, layers = self.net, self.net.layers
+        if not self.lanes:
+            from sclm.host_v4 import Lane
+
+            self.lanes = [Lane(k + 1, net.hc_mult, net.embed.weight.size(1), layers[0].ffn.gate.topk, self.device)
+                          for k in range(self.LANES)]
+        gpu.active, m.linear = True, kernel_linear
+        try:
+            for at in range(0, len(ids), self.LANES):
+                part = ids[at:at + self.LANES]
+                lanes, pos = self.lanes[:len(part)], start_pos + at
+                for k, (lane, token) in enumerate(zip(lanes, part)):
+                    lane.token = self.clock + k
+                    lane.h = net.embed(torch.tensor([[token]])).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1).contiguous()
+                self.clock += len(part)
+                begun = [layers[0].start(lane, lane.h.data_ptr(), pos + k, part[k]) for k, lane in enumerate(lanes)]
+                for i, layer in enumerate(layers):
+                    layer.ffn.read_for(lanes)
+                    for k, lane in enumerate(lanes):
+                        layer.end(lane, begun[k])
+                        if i + 1 < len(layers):
+                            begun[k] = layers[i + 1].start(lane, lane.out.data_ptr(), pos + k, part[k])
+                out = lanes[-1].out.view(1, 1, net.hc_mult, -1)
+            if not ids:
+                return out
+            return net.head(net.norm(layers[-1].hc_head(out, net.hc_head_fn, net.hc_head_scale, net.hc_head_base)))
+        finally:
+            gpu.active, m.linear = False, _upstream_linear
 
     def snapshot(self) -> list:
         """The attention state of the sequence at this point (V4-Flash-0731). restore() takes the sequence back to it."""

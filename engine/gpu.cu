@@ -1192,7 +1192,21 @@ API int sclm_gpu_gate_guess(const uint16_t* weight, const float* bias, const uin
     return cudaGetLastError();
 }
 
-static cudaEvent_t moe_copied[2];  // reached when the last sclm_gpu_moe_begin's routing is on the host; when its guess is
+// Lane 0 is a decode token, whose sclm_gpu_moe_begin returns when its routing is on the host. A token in another lane
+// is one of several computed together: its call returns at once, and sclm_gpu_moe_wait waits for what it queued.
+const int LANES = 65;
+static int moe_lane = 0;  // the lane of the next sclm_gpu_moe_begin
+// reached when the routing of a lane's last sclm_gpu_moe_begin is on the host; when its guess is
+static cudaEvent_t moe_copied[LANES][2];
+
+API int sclm_gpu_moe_lane(int lane) {
+    if (lane < 0 || lane >= LANES) return -1;
+    moe_lane = lane;
+    return 0;
+}
+
+// Waits until the routing (guess 0) or the guess (1) of the lane's last sclm_gpu_moe_begin is on the host.
+API int sclm_gpu_moe_wait(int lane, int guess) { return cudaEventSynchronize(moe_copied[lane][guess]); }
 
 // The start of the two-tier MoE for one token x[dim], in one call that returns as soon as the host has the routing.
 // Queued in this order: sclm_gpu_gate into pack and the copy of those 2 * topk + dim floats to `host` (page-locked);
@@ -1207,28 +1221,29 @@ API int sclm_gpu_moe_begin(const uint16_t* weight, const float* bias, const uint
                            float g_temp, float eps, const uint8_t* w1, const uint8_t* s1, const uint8_t* w2,
                            const uint8_t* s2, const uint8_t* w3, const uint8_t* s3, int inter, float limit, float* xq,
                            float* shared, float* routed, const int* fixed) {
-    if (!moe_copied[0])
-        for (cudaEvent_t& event : moe_copied) cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    cudaEvent_t* copied = moe_copied[moe_lane];
+    if (!copied[0])
+        for (int i = 0; i < 2; ++i) cudaEventCreateWithFlags(&copied[i], cudaEventDisableTiming);
     const int head = 2 * topk + dim;
     int status = sclm_gpu_gate(weight, bias, x, pack, n, topk, dim, temp, route_scale, norm, fixed);
     if (status) return status;
     cudaMemcpyAsync(host, pack, head * sizeof(float), cudaMemcpyDeviceToHost, 0);
-    cudaEventRecord(moe_copied[0], 0);
+    cudaEventRecord(copied[0], 0);
     if (g_weight) {
         status = sclm_gpu_gate_guess(g_weight, g_bias, h, pre, norm_w, pack + head, n, k, dim, hc, g_temp, eps);
         if (status) return status;
         cudaMemcpyAsync(host + head, pack + head, 2 * k * sizeof(float), cudaMemcpyDeviceToHost, 0);
-        cudaEventRecord(moe_copied[1], 0);
+        cudaEventRecord(copied[1], 0);
     }
     cudaMemsetAsync(routed, 0, dim * sizeof(float), 0);
     act_quant_k<float><<<dim / model.act, model.act>>>(x, xq);
     status = sclm_gpu_fp8_expert(w1, s1, w2, s2, w3, s3, dim, inter, limit, xq, shared, 1);
     if (status) return status;
-    return cudaEventSynchronize(moe_copied[0]);
+    return moe_lane ? cudaGetLastError() : cudaEventSynchronize(copied[0]);
 }
 
 // Waits until the guess of the last sclm_gpu_moe_begin is on the host.
-API int sclm_gpu_moe_guess() { return cudaEventSynchronize(moe_copied[1]); }
+API int sclm_gpu_moe_guess() { return cudaEventSynchronize(moe_copied[0][1]); }
 
 static cudaStream_t copy_stream;  // the copies of sclm_gpu_copy, in the order they were asked for
 static cudaEvent_t copies_done;
