@@ -13,6 +13,7 @@ import re
 import select
 import shutil
 import socket
+import subprocess
 import threading
 import time
 import uuid
@@ -282,13 +283,24 @@ class Job:
                 pass
         if len(text) > self.shown and not calls:
             self.events.put(("answer", text[self.shown:]))
-        self.times["end"] = time.perf_counter()
+        t = self.times
+        t["end"] = time.perf_counter()
+        start, prompt = t.get("start", t["end"]), t.get("prompt", t["end"])
+        ms, rate = lambda s: round(1e3 * s, 1), lambda n, s: round(n / s, 2) if s > 0 else None  # noqa: E731
+        fed = self.at - self.reused  # tokens of the prompt computed for this request
         self.events.put(("done", {
             "finish_reason": "tool_calls" if calls and reason == "stop" else reason, "content": text,
             "reasoning_content": self.text["think"], "tool_calls": calls,
             "usage": {"prompt_tokens": len(self.ids), "completion_tokens": self.new, "total_tokens": len(self.ids) + self.new,
                       "prompt_tokens_details": {"cached_tokens": self.reused},
-                      "completion_tokens_details": {"reasoning_tokens": self.thought}}}))
+                      "completion_tokens_details": {"reasoning_tokens": self.thought}},
+            # where the time went, under llama.cpp's names: waiting for a turn, the prompt (cache_n tokens of it came
+            # from the prompt cache, prompt_n were computed), the reply
+            "timings": {"queue_ms": ms(start - t["submit"]), "cache_n": self.reused, "prompt_n": fed, "prompt_ms": ms(prompt - start),
+                        "prompt_per_second": rate(fed, prompt - start), "predicted_n": self.new, "predicted_ms": ms(t["end"] - prompt),
+                        "predicted_per_second": rate(self.new, t["end"] - prompt),
+                        "first_token_ms": ms(t["first"] - t["submit"]) if "first" in t else None,
+                        "total_ms": ms(t["end"] - t["submit"])}}))
         return 0
 
 
@@ -311,6 +323,8 @@ class Engine:
         # jobs taking turns, jobs without room yet, conversations kept (the longest unused first)
         self.active, self.waiting, self.idle = [], [], []
         self.stopping, self.long = False, 512
+        # what was served since the start: requests that ended (cancelled ones among them), those that failed, tokens
+        self.totals = {"requests": 0, "failed": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
         os.makedirs(cache, exist_ok=True)
         stamp = lambda entry: os.path.getmtime(os.path.join(entry.path, "meta.json"))  # noqa: E731
         folders = [entry for entry in os.scandir(cache) if entry.is_dir()]
@@ -339,7 +353,7 @@ class Engine:
     def used(self) -> int:
         """Bytes the kept conversations take on disk, a file that several of them link to counted once."""
         files = {}
-        for conv in self.idle:
+        for conv in list(self.idle):  # the HTTP threads ask as well
             try:
                 for entry in os.scandir(conv.home):
                     stat = os.stat(entry.path)
@@ -484,7 +498,11 @@ class Engine:
                 self._forget(self.idle[0])
         else:
             shutil.rmtree(conv.home, ignore_errors=True)
-        t = job.times
+        t, totals = job.times, self.totals
+        totals["requests" if "end" in t else "failed"] += 1
+        totals["prompt_tokens"] += job.at
+        totals["cached_tokens"] += job.reused
+        totals["completion_tokens"] += job.new
         if "end" in t and "prompt" in t:
             print(f"{time.strftime('%H:%M:%S')} prompt {len(job.ids)} tokens ({job.reused} held) in {t['prompt'] - t['start']:.1f}s, "
                   f"reply {job.new} tokens at {job.new / max(t['end'] - t['prompt'], 1e-9):.1f} tok/s, waited "
@@ -573,17 +591,53 @@ def request_job(body: dict, engine: Engine, think: bool, effort: str, max_tokens
                (stop,) if isinstance(stop, str) else tuple(stop), body.get("seed"), bool(tools), turns, pins)
 
 
+class App:
+    """What the HTTP layer serves: the engine, the model's name and what the server tells of itself. codes: the name
+    of the quantization (None: the original weights); runtime: facts of this run for GET / (the expert cache's sizes,
+    lossy settings, the code's revision)."""
+
+    def __init__(self, engine: Engine, model: str, think: bool = True, effort: str = "low", max_tokens: int = 20000,
+                 codes: str | None = None, runtime: dict | None = None):
+        self.engine, self.model, self.think, self.effort, self.max_tokens = engine, model, think, effort, max_tokens
+        self.codes, self.runtime, self.created, self.started = codes or "none", runtime or {}, int(time.time()), time.time()
+        # names what computes the replies: the same request and seed give the same reply while it stays the same
+        self.fingerprint = "sclm-" + "-".join([self.codes] + [f"{k}{v}" for k, v in sorted(self.runtime.get("lossy", {}).items())])
+
+    def card(self) -> dict:
+        """The model as GET /v1/models lists it: OpenAI's fields, the context under the names clients look for
+        (vLLM's max_model_len, OpenRouter's context_length), and what requests may ask for."""
+        return {"id": self.model, "object": "model", "created": self.created, "owned_by": "sclm", "root": self.model, "parent": None,
+                "max_model_len": self.engine.context, "context_length": self.engine.context, "max_output_tokens": self.max_tokens,
+                "quantization": self.codes,
+                "capabilities": {"streaming": True, "reasoning": True, "tools": True, "prompt_cache": True, "vision": False},
+                "defaults": {"temperature": 1.0, "top_p": 1.0, "thinking": self.think, "reasoning_effort": self.effort,
+                             "max_tokens": self.max_tokens}}
+
+    def about(self) -> dict:
+        """The server and how it is doing (GET /)."""
+        engine = self.engine
+        return {"server": "sclm serve", "model": self.model, "system_fingerprint": self.fingerprint, "uptime_s": round(time.time() - self.started),
+                "endpoints": ["GET /", "GET /health", "GET /v1/models", "GET /v1/models/{id}", "POST /v1/chat/completions"],
+                "context_length": engine.context, "max_output_tokens": self.max_tokens, "quantization": self.codes, **self.runtime,
+                "requests": {"open": len(engine.active), "waiting": len(engine.waiting) + engine.inbox.qsize(), **engine.totals},
+                "prompt_cache": {"folder": engine.cache, "conversations": len(engine.idle), "gib": round(engine.used() / 2**30, 2),
+                                 "limit_gib": round(engine.budget / 2**30, 2)}}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    server_version = "sclm"
 
     def log_message(self, *args) -> None:  # the engine prints a line per request
         pass
 
-    def _json(self, status: int, obj: dict) -> None:
+    def _json(self, status: int, obj: dict, headers: dict | None = None) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -602,19 +656,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         app = self.server.app
-        if self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [{"id": app.model, "object": "model", "created": app.created, "owned_by": "sclm"}]})
-        elif self.path == "/health":
+        path = self.path.split("?")[0].rstrip("/")
+        if path == "/v1/models":
+            self._json(200, {"object": "list", "data": [app.card()]})
+        elif path.startswith("/v1/models/"):
+            if path[len("/v1/models/"):] == app.model:
+                self._json(200, app.card())
+            else:
+                self._error(404, f"the model served is {app.model}")
+        elif path == "/health":
             engine = app.engine
-            self._json(200, {"status": "ok", "open": len(engine.active), "waiting": len(engine.waiting) + engine.inbox.qsize(),
-                             "kept": len(engine.idle)})
+            self._json(200, {"status": "ok", "model": app.model, "open": len(engine.active),
+                             "waiting": len(engine.waiting) + engine.inbox.qsize(), "kept": len(engine.idle)})
+        elif path in ("", "/v1"):
+            self._json(200, app.about())
         else:
-            self._error(404, "unknown path")
+            self._error(404, "unknown path: GET / lists the endpoints")
 
     def do_POST(self) -> None:
         app = self.server.app
-        if self.path != "/v1/chat/completions":
-            return self._error(404, "unknown path")
+        if self.path.split("?")[0].rstrip("/") != "/v1/chat/completions":
+            return self._error(404, "unknown path: GET / lists the endpoints")
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             job = request_job(body, app.engine, app.think, app.effort, app.max_tokens)
@@ -623,20 +685,23 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as e:
             return self._error(400, f"the body is not a chat completion request: {e}")
         app.engine.submit(job)
-        head = {"id": "chatcmpl-" + uuid.uuid4().hex, "created": int(time.time()), "model": app.model}
+        # the model is the one served, whatever name the request gave
+        head = {"id": "chatcmpl-" + uuid.uuid4().hex, "created": int(time.time()), "model": app.model, "system_fingerprint": app.fingerprint}
         stream = bool(body.get("stream"))
 
-        def chunk(delta: dict, finish: str | None = None) -> None:
-            data = {**head, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        def chunk(delta: dict, finish: str | None = None, **more) -> None:
+            data = {**head, "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}], **more}
             self.wfile.write(b"data: " + json.dumps(data, ensure_ascii=False).encode() + b"\n\n")
             self.wfile.flush()
 
         try:
             if stream:
                 self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
+                self.send_header("x-request-id", head["id"])
                 self.end_headers()
                 self.close_connection = True
                 chunk({"role": "assistant", "content": ""})
@@ -666,11 +731,13 @@ class Handler(BaseHTTPRequestHandler):
                     message["reasoning_content"] = result["reasoning_content"]
                 if result["tool_calls"]:
                     message["tool_calls"] = result["tool_calls"]
-                return self._json(200, {**head, "object": "chat.completion", "usage": result["usage"],
-                                        "choices": [{"index": 0, "message": message, "finish_reason": result["finish_reason"]}]})
+                choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": result["finish_reason"]}
+                return self._json(200, {**head, "object": "chat.completion", "choices": [choice], "usage": result["usage"],
+                                        "timings": result["timings"]},
+                                  {"x-request-id": head["id"], "openai-processing-ms": str(round(result["timings"]["total_ms"]))})
             if event[0] == "done":
                 calls = [{"index": i, **call} for i, call in enumerate(result["tool_calls"])]
-                chunk({"tool_calls": calls} if calls else {}, result["finish_reason"])
+                chunk({"tool_calls": calls} if calls else {}, result["finish_reason"], timings=result["timings"])
                 if (body.get("stream_options") or {}).get("include_usage"):
                     data = {**head, "object": "chat.completion.chunk", "choices": [], "usage": result["usage"]}
                     self.wfile.write(b"data: " + json.dumps(data).encode() + b"\n\n")
@@ -728,8 +795,15 @@ def main() -> None:
     engine.long = cli.long
     server = ThreadingHTTPServer((cli.host, cli.port), Handler)
     server.daemon_threads = True
-    server.app = argparse.Namespace(engine=engine, model=os.path.basename(cli.ckpt), created=int(time.time()),
-                                    think=not cli.no_think, effort=cli.effort, max_tokens=cli.max_tokens)
+    try:  # the code's revision, if this is a checkout
+        revision = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10,
+                                  cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        revision = None
+    runtime = {"revision": revision, "expert_cache": {"vram_slots": cache.n_slots, "ram_cache": cli.ram_cache},
+               "lossy": {k: v for k, v in (("wait_share", cli.wait_share), ("topk", cli.topk)) if v}}
+    server.app = App(engine, os.path.basename(cli.ckpt), not cli.no_think, cli.effort, cli.max_tokens,
+                     os.path.basename(cli.codes) if cli.codes else None, runtime)
     worker = threading.Thread(target=engine.run, daemon=True)
     worker.start()
     print(f"sclm serve · {server.app.model} · http://{cli.host}:{cli.port}/v1 · 문맥 {cli.context} 토큰, 답 최대 {cli.max_tokens} 토큰 · "

@@ -2,10 +2,10 @@
 # against upstream's encoding, requests taking turns, the room they share, the prompt cache on disk (what a request
 # goes on from, what a folder holds, a restart, the budget), stop strings, tool calls and the responses.
 # Run with SCLM_MODEL=v4 (needs the checkpoint's tokenizer).
-import argparse
 import json
 import os
 import threading
+import time
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -450,13 +450,13 @@ def test_a_tool_call_is_parsed_out_of_the_answer(tok, tmp_path, think):
 
 
 def test_the_http_layer_answers_as_the_openai_api_does(tok, tmp_path):
-    from scripts.serve import Handler, request_job
+    from scripts.serve import App, Handler, request_job
 
     enc = lambda text: tok.encode(text, add_special_tokens=False)  # noqa: E731
     engine, decoder = made(tok, tmp_path)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
-    server.app = argparse.Namespace(engine=engine, model="test-model", created=1, think=True, effort="low", max_tokens=500)
+    server.app = App(engine, "test-model", max_tokens=500, codes="q-test", runtime={"lossy": {"topk": 4}})
     threads = [threading.Thread(target=server.serve_forever, daemon=True), threading.Thread(target=engine.run, daemon=True)]
     for t in threads:
         t.start()
@@ -470,11 +470,17 @@ def test_the_http_layer_answers_as_the_openai_api_does(tok, tmp_path):
             req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(payload).encode(), {"Content-Type": "application/json"})
             return urllib.request.urlopen(req, timeout=30)
 
-        whole = json.load(post(body))
+        response = post(body)
+        whole = json.load(response)
         assert whole["object"] == "chat.completion" and whole["model"] == "test-model" and whole["id"].startswith("chatcmpl-")
-        choice = whole["choices"][0]
+        choice, usage, timings = whole["choices"][0], whole["usage"], whole["timings"]
         assert choice["message"] == {"role": "assistant", "content": "2입니다.", "reasoning_content": "One plus one."}
-        assert choice["finish_reason"] == "stop" and whole["usage"]["total_tokens"] == whole["usage"]["prompt_tokens"] + whole["usage"]["completion_tokens"]
+        assert choice["finish_reason"] == "stop" and usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        # what a client can tell the request and the server by, and where the time went
+        assert response.headers["x-request-id"] == whole["id"] and int(response.headers["openai-processing-ms"]) >= 0
+        assert whole["system_fingerprint"] == "sclm-q-test-topk4" and choice["logprobs"] is None
+        assert (timings["cache_n"], timings["prompt_n"], timings["predicted_n"]) == (0, usage["prompt_tokens"], usage["completion_tokens"])
+        assert timings["total_ms"] >= timings["prompt_ms"] + timings["predicted_ms"] >= 0 and timings["first_token_ms"] >= timings["queue_ms"]
 
         lines = post({**body, "stream": True, "stream_options": {"include_usage": True}}).read().decode().split("\n\n")
         data = [line[6:] for line in lines if line.startswith("data: ")]
@@ -487,8 +493,30 @@ def test_the_http_layer_answers_as_the_openai_api_does(tok, tmp_path):
         assert "".join(d.get("content", "") for d in deltas) == "2입니다."
         assert [c["choices"][0]["finish_reason"] for c in chunks if c["choices"]][-1] == "stop"
         assert chunks[-1]["choices"] == [] and chunks[-1]["usage"]["completion_tokens"] == whole["usage"]["completion_tokens"]
+        assert all(c["system_fingerprint"] == "sclm-q-test-topk4" for c in chunks)
+        # the chunk that ends the reply says where the time went: this time the prompt came from the prompt cache
+        last = [c for c in chunks if c["choices"] and c["choices"][0]["finish_reason"]][0]["timings"]
+        assert (last["cache_n"], last["prompt_n"], last["predicted_n"]) == (usage["prompt_tokens"] - 1, 1, usage["completion_tokens"])
 
-        assert json.load(urllib.request.urlopen(url + "/v1/models", timeout=30))["data"][0]["id"] == "test-model"
+        get = lambda path: json.load(urllib.request.urlopen(url + path, timeout=30))  # noqa: E731
+        card = get("/v1/models")["data"][0]
+        assert card == get("/v1/models/test-model") and card["id"] == "test-model" and card["object"] == "model"
+        assert card["context_length"] == card["max_model_len"] == engine.context and card["max_output_tokens"] == 500
+        assert card["quantization"] == "q-test" and card["capabilities"]["tools"] and card["defaults"]["reasoning_effort"] == "low"
+        for _ in range(200):  # a reply goes out before its request is counted and kept
+            if engine.totals["requests"] == 2 and not engine.active:
+                break
+            time.sleep(0.01)
+        about = get("/")
+        assert about == {**get("/v1/"), "uptime_s": about["uptime_s"]} and about["model"] == "test-model" and "POST /v1/chat/completions" in about["endpoints"]
+        assert about["requests"] == {"open": 0, "waiting": 0, "requests": 2, "failed": 0, "prompt_tokens": 2 * usage["prompt_tokens"],
+                                     "cached_tokens": usage["prompt_tokens"] - 1, "completion_tokens": 2 * usage["completion_tokens"]}
+        assert about["prompt_cache"]["conversations"] == 1 and about["prompt_cache"]["folder"] == engine.cache and about["lossy"] == {"topk": 4}
+        assert get("/health") == {"status": "ok", "model": "test-model", "open": 0, "waiting": 0, "kept": 1}
+        for path, status, word in (("/v1/models/other", 404, "test-model"), ("/nothing", 404, "GET /")):
+            with pytest.raises(urllib.error.HTTPError) as missing:
+                get(path)
+            assert missing.value.code == status and word in json.load(missing.value)["error"]["message"]
         with pytest.raises(urllib.error.HTTPError) as refused:
             post({"messages": []})
         assert refused.value.code == 400 and "messages" in json.load(refused.value)["error"]["message"]
