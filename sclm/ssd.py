@@ -60,9 +60,8 @@ class ExpertCache:
 
     def __init__(self, reader: ExpertReader, n_layers: int, n_experts: int, dim: int, inter: int, limit: float,
                  slots: int, lam: float, device, scratch: int, background: int = 0):
-        self.reader, self.n_experts, self.n_slots = reader, n_experts, slots
-        self.loaded = [None] * slots  # slot -> the key whose bytes it holds (or is being given by a waited read)
-        self.held = {}  # the same, key -> slot
+        self.reader, self.n_experts = reader, n_experts
+        self.shape = (n_layers * n_experts, lam, device, scratch, dim, inter, limit)  # what resize() makes the cache from
         self.loads = {}  # staging buffer -> (slot, key, where the bytes land) of the background read filling it
         # key -> (staging buffer, where the bytes land) of a read started on a guess (read_ahead), under way or done
         self.ahead = {}
@@ -87,9 +86,6 @@ class ExpertCache:
         self.touch = 0
         self.ram_cache = {}  # key -> host buffer holding the expert's bytes (keep_in_ram), the oldest first
         self.ram_free = []  # the host buffers of keep_in_ram that hold nothing
-        self.policy = core.Cache(n_layers * n_experts, slots, lam)
-        n_scale, n_weight = reader.sizes
-        self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
         pin = torch.device(device).type == "cuda"
         self.ram_out = torch.empty(dim, dtype=torch.float32, pin_memory=pin)  # where the CPU tier writes a token's sum
         self.staging = []  # page-aligned host buffers the reader fills, one per expert a call can miss
@@ -97,6 +93,31 @@ class ExpertCache:
             buf = torch.empty(reader.nbytes + core.PAGE, dtype=torch.uint8, pin_memory=pin)
             start = -buf.data_ptr() % core.PAGE
             self.staging.append(buf[start:start + reader.nbytes])
+        self.store = None
+        self.resize(slots)
+
+    def resize(self, slots: int) -> None:
+        """The cache holds `slots` experts from now on, none of them yet: the device memory of the difference is given
+        back or taken. Between tokens. The experts of keep_in_ram stay where they are; those the slots held are read
+        again when they are asked for."""
+        n_keys, lam, device, scratch, dim, inter, limit = self.shape
+        if self.store is not None and self.store.is_cuda:
+            torch.cuda.synchronize()  # the copies into and out of the slots are done
+        for i in self.loads:  # background reads on their way into a slot: their buffers are free once they have landed
+            self.reader.reader.wait(i)
+            self.cooling.append(i)
+        self.loads.clear()
+        self.fresh.clear()
+        self.uploading = False
+        self.n_slots = slots
+        self.loaded = [None] * slots  # slot -> the key whose bytes it holds (or is being given by a waited read)
+        self.held = {}  # the same, key -> slot
+        self.policy = core.Cache(n_keys, slots, lam)
+        self.store = self.experts = None
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()  # the old slots' memory goes back to the device before the new ones are taken
+        n_scale, n_weight = self.reader.sizes
+        self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
         self.experts = []  # slot -> what upstream Expert.forward needs, as views of the slot
         for row in self.store:
             at_s, at_w, mats = 0, n_scale, {}

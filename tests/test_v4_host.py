@@ -156,7 +156,7 @@ def test_sequences_keep_their_own_state(models, kernels):
     got_a, got_b, kept = [], [], None
     for at in range(0, 100, 5):
         if at == 45:  # before position 48, where its room ends
-            first = decoder.resize(first, 128)
+            decoder.resize(first, 128)
         decoder.switch(first)
         got_a += feed(a[:, at:at + 5], at)
         decoder.switch(second)
@@ -167,3 +167,26 @@ def test_sequences_keep_their_own_state(models, kernels):
         got_b += feed(b[:, at:at + 5], at)
     assert all(torch.equal(x, y) for x, y in zip(got_a, want_a)) and len(got_a) == 100
     assert all(torch.equal(x, y) for x, y in zip(got_b, want_b)) and len(got_b) == 70
+
+
+@pytest.mark.parametrize("kernels", [False, True])
+def test_the_expert_cache_gives_up_slots_for_the_sequences(models, kernels):
+    """reserve() between tokens changes how many experts the cache holds and empties it; the logits stay those of a
+    run that never called it."""
+    args, _, net, cache = models
+    decoder = host.Host(net, cache, device=DEV, kernels=kernels)
+    x = torch.randint(0, args.vocab_size, (1, 60), generator=torch.Generator().manual_seed(9))
+
+    def feed(tokens, pos):  # a token at a time
+        return [decoder.logits(tokens[:, i:i + 1], pos + i).float().clone() for i in range(tokens.size(1))]
+
+    want = feed(x, 0)
+    decoder.switch(decoder.sequence(64))  # the state the model was built with (256 tokens) is no longer in use
+    got = feed(x[:, :20], 0)
+    decoder.reserve(1024)
+    fewer = cache.n_slots
+    got += feed(x[:, 20:40], 20)
+    decoder.reserve(64)
+    assert 1 <= fewer < cache.n_slots and cache.store.size(0) == cache.n_slots + args.n_activated_experts
+    got += feed(x[:, 40:], 40)
+    assert all(torch.equal(a, b) for a, b in zip(got, want))

@@ -373,36 +373,36 @@ class Sequence:
         self.state, self.compressors = [], []  # (module, buffer name, tensor); the compressors, which keep a view
         for layer in net.layers:
             attn = layer.attn
-            held = [(attn, "kv_cache", attn.window_size)]
+            held = [(attn, "kv_cache")]
             if attn.compress_ratio:
-                held += [(attn.compressor, "kv_state", None), (attn.compressor, "score_state", None)]
+                held += [(attn.compressor, "kv_state"), (attn.compressor, "score_state")]
                 self.compressors.append(attn.compressor)
                 if attn.indexer is not None:
                     comp = attn.indexer.compressor
-                    held += [(attn.indexer, "kv_cache", 0), (comp, "kv_state", None), (comp, "score_state", None)]
+                    held += [(attn.indexer, "kv_cache"), (comp, "kv_state"), (comp, "score_state")]
                     self.compressors.append(comp)
-            for module, name, rows in held:
+            for module, name in held:
                 t = getattr(module, name)
-                if capacity is not None:
-                    if rows is not None:  # the rows that do not depend on the length, then a row per group of tokens
-                        rows += capacity // attn.compress_ratio if attn.compress_ratio else 0
-                        t = torch.zeros(1, rows, t.size(2), dtype=t.dtype, device=t.device)
-                    else:
-                        t = torch.full_like(t, float("-inf") if name == "score_state" else 0.0)
-                self.state.append((module, name, t))
+                self.state.append((module, name, t if capacity is None else self.room(module, name, t, capacity)))
+
+    @staticmethod
+    def rows(module, capacity: int) -> int:
+        """Rows of a module's key/values for `capacity` tokens: a row per group of tokens, after the rows that do not
+        depend on the length (an attention's window ring)."""
+        fixed = module.window_size if isinstance(module, m.Attention) else 0
+        return fixed + (capacity // module.compress_ratio if module.compress_ratio else 0)
+
+    @staticmethod
+    def room(module, name: str, like: torch.Tensor, capacity: int) -> torch.Tensor:
+        """An empty tensor of the state like `like`, for `capacity` tokens."""
+        if name != "kv_cache":
+            return torch.full_like(like, float("-inf") if name == "score_state" else 0.0)
+        return torch.zeros(1, Sequence.rows(module, capacity), like.size(2), dtype=like.dtype, device=like.device)
 
     def kept(self) -> list:
         """What a snapshot keeps: every layer's window ring and its compressors' groups."""
         return [t[:, :module.window_size] if name == "kv_cache" else t for module, name, t in self.state
                 if name != "kv_cache" or isinstance(module, m.Attention)]
-
-    def resized(self, net: "m.Transformer", capacity: int) -> "Sequence":
-        """A sequence with another capacity that holds what this one holds."""
-        new = Sequence(net, capacity)
-        for (_, _, old), (_, _, t) in zip(self.state, new.state):
-            rows = min(old.size(1), t.size(1))
-            t[:, :rows].copy_(old[:, :rows])
-        return new
 
 
 class Host:
@@ -414,6 +414,7 @@ class Host:
         self.net, self.cache, self.device = net, cache, device
         self.clock = 0  # the cache's clock: tokens computed so far, over every sequence
         self.seq = Sequence(net) if V4 else None
+        self.slots = None  # the expert cache's slots if no sequence had any room (reserve)
         on_gpu = torch.device(device).type == "cuda"
         self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
         self.first_mix = None  # upstream's identity pre-mix of the first block, made once
@@ -450,12 +451,40 @@ class Host:
         """A new, empty sequence with room for `capacity` tokens; switch() to it before its first token."""
         return Sequence(self.net, capacity)
 
-    def resize(self, seq: Sequence, capacity: int) -> Sequence:
-        """A sequence with room for `capacity` tokens that holds what `seq` holds, in its place if `seq` is in use."""
-        new = seq.resized(self.net, capacity)
-        if seq is self.seq:
-            self.switch(new)
-        return new
+    def resize(self, seq: Sequence, capacity: int) -> None:
+        """Gives `seq` room for `capacity` tokens; what it holds stays. A tensor at a time: the device never holds two
+        whole states."""
+        active = seq is self.seq
+        seq.bound = [None] * len(seq.bound)  # the kernels are bound again, to the new addresses
+        if active:
+            for layer in self.net.layers:
+                layer.attn.bound = None
+            for comp in seq.compressors:
+                comp.kv_cache = None
+        for i, (module, name, old) in enumerate(seq.state):
+            if name == "kv_cache":
+                t = Sequence.room(module, name, old, capacity)
+                rows = min(old.size(1), t.size(1))
+                t[:, :rows].copy_(old[:, :rows])
+                seq.state[i] = (module, name, t)
+                if active:
+                    setattr(module, name, t)
+        seq.capacity = capacity
+
+    def reserve(self, tokens: int) -> None:
+        """Sets aside device memory for sequences that hold `tokens` tokens in all; the expert cache keeps the slots
+        that leaves (and starts empty). The first call counts from the cache's slots as they are and the state the
+        model was built with, room for net.max_seq_len tokens: it comes once that state is no longer in use."""
+        per = self.cache.store.size(1)
+
+        def nbytes(capacity: int) -> int:  # of the key/values, which are all that grows with the length
+            return sum(Sequence.rows(mod, capacity) * t.size(2) * t.element_size() for mod, name, t in self.seq.state if name == "kv_cache")
+
+        if self.slots is None:
+            self.slots = self.cache.n_slots + nbytes(self.net.max_seq_len) // per
+        slots = self.slots - -(-nbytes(tokens) // per)
+        assert slots > 0, f"no device memory is left for the expert cache with sequences of {tokens} tokens"
+        self.cache.resize(slots)
 
     def switch(self, seq: Sequence) -> None:
         """The model computes on `seq` from now on: its state takes the place of the last sequence's in the modules."""
