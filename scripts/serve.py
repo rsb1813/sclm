@@ -16,10 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
 
+import sclm.upstream  # noqa: F401  (puts the model's folder on sys.path)
+from encoding_dsv4 import dsml_token, encode_messages, eos_token, parse_message_from_completion_text, tool_calls_block_name
 from scripts.chat import looping, pick
 from sclm import CKPT, CODES
 
 CHUNK = 4096  # a sequence's room is a multiple of this many tokens
+TOOL_CALLS = f"\n\n<{dsml_token}{tool_calls_block_name}"  # what a tool call block begins with in the answer's text
 # OpenAI's reasoning_effort values as the model's (None: no thinking)
 EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
 
@@ -153,9 +156,6 @@ class Job:
         text, calls = self.text["answer"], []
         if self.calling:
             try:
-                import sclm.upstream  # noqa: F401
-                from encoding_dsv4 import eos_token, parse_message_from_completion_text
-
                 parsed = parse_message_from_completion_text(text + eos_token, "chat")
                 text = parsed["content"]
                 calls = [{"id": "call_" + uuid.uuid4().hex[:24], **call} for call in parsed["tool_calls"]]
@@ -163,8 +163,7 @@ class Job:
                 pass
         if len(text) > self.shown and not calls:
             self.events.put(("answer", text[self.shown:]))
-        now = time.perf_counter()
-        self.times["end"] = now
+        self.times["end"] = time.perf_counter()
         self.events.put(("done", {
             "finish_reason": "tool_calls" if calls and reason == "stop" else reason, "content": text,
             "reasoning_content": self.text["think"], "tool_calls": calls,
@@ -174,22 +173,14 @@ class Job:
         return False
 
 
-TOOL_CALLS = None  # the text a tool call block begins with: upstream's, set by Engine
-
-
 class Engine:
     """The thread that computes. context: tokens the open and the kept sequences can hold together; slice: tokens a
     job is given before the next job's turn (0: a job runs to its end); keep: sequences kept after their request for
     the conversation's next one. reserve: tokens the device memory set aside for sequences is for at first; it is
-    doubled when they hold more, at the expert cache's cost, and halved again when a quarter would do (None: the
-    decoder's memory is left as it is)."""
+    doubled when they hold more, at the expert cache's cost, and brought down again when a quarter would do (None:
+    the decoder's memory is left as it is)."""
 
     def __init__(self, tok, decoder, context: int, slice: int = 8, keep: int = 8, reserve: int | None = None):
-        global TOOL_CALLS
-        import sclm.upstream  # noqa: F401  (puts the model's folder on sys.path)
-        from encoding_dsv4 import dsml_token, tool_calls_block_name
-
-        TOOL_CALLS = f"\n\n<{dsml_token}{tool_calls_block_name}"
         self.tok, self.decoder, self.context, self.slice, self.keep = tok, decoder, context, slice, keep
         self.eos = tok.eos_token_id
         self.think_start, self.think_end = tok.convert_tokens_to_ids("<think>"), tok.convert_tokens_to_ids("</think>")
@@ -314,7 +305,7 @@ class Engine:
         every open job its slice."""
         try:
             while True:
-                self.waiting.append(self.inbox.get(timeout=0.0 if self.active else wait))
+                self.waiting.append(self.inbox.get(timeout=0.0 if self.active or self.waiting else wait))
         except queue.Empty:
             pass
         self.waiting = [job for job in self.waiting if not self._start(job)]
@@ -336,9 +327,6 @@ class Engine:
 
 def request_job(body: dict, engine: Engine, think: bool, effort: str, max_tokens: int) -> Job:
     """The job of a chat completion request (its JSON body), or Refused."""
-    import sclm.upstream  # noqa: F401
-    from encoding_dsv4 import encode_messages
-
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise Refused(400, "messages: a non-empty list is required")
     if body.get("n", 1) != 1:
