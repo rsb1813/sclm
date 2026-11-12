@@ -28,6 +28,7 @@ class Decoder:
     def __init__(self, vocab: int, eos: int):
         self.vocab, self.eos, self.scripts, self.order, self.seq = vocab, eos, [], [], Seq(0)
         self.reserved = []  # what the device memory for sequences was set to, in turn
+        self.runs = []  # the lengths of the runs fed with prefill()
 
     def reserve(self, tokens):
         self.reserved.append(tokens)
@@ -51,6 +52,10 @@ class Decoder:
         for i, token in enumerate(tokens):
             out = self.logits(torch.tensor([[token]]), pos + i)
         return out
+
+    def prefill(self, tokens, pos):
+        self.runs.append(len(tokens))
+        return self.feed(tokens, pos)
 
     def logits(self, ids, pos):
         fed = self.seq.fed
@@ -172,6 +177,17 @@ def test_a_reply_makes_room_as_it_grows_up_to_the_context(tok):
     serve(engine, small)
     # nothing is kept: each request starts from the least again
     assert decoder.reserved == [CHUNK, 2 * CHUNK, 4 * CHUNK] * 2 + [CHUNK] and engine.room() == 4 * CHUNK
+
+
+def test_a_long_prompt_goes_in_as_runs_up_to_its_last_token(tok):
+    from scripts.serve import RUN, Job
+
+    engine, decoder = made(tok, context=4 * RUN)
+    long, short = [11] * (RUN + 700) + [12], [13] * 300 + [14]
+    decoder.scripts += [(long, [21, 22]), (short, [23])]
+    (_, _, first), (_, _, second) = serve(engine, Job(long, 10, temperature=0.0), Job(short, 10, temperature=0.0))
+    assert decoder.runs == [RUN, 700] and first["usage"]["completion_tokens"] == 2 and second["usage"]["completion_tokens"] == 1
+    assert engine.idle[0].seq.fed == long + [21, 22] and engine.idle[0].mark[0] == RUN + 700
 
 
 def test_stop_strings_and_the_token_limit_end_a_reply(tok):

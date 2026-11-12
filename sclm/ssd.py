@@ -94,6 +94,7 @@ class ExpertCache:
             start = -buf.data_ptr() % core.PAGE
             self.staging.append(buf[start:start + reader.nbytes])
         self.store = None
+        self.lent = None  # originals()'s own rows on the device, their views and its staging buffers
         self.resize(slots)
 
     def resize(self, slots: int) -> None:
@@ -118,8 +119,14 @@ class ExpertCache:
             torch.cuda.empty_cache()  # the old slots' memory goes back to the device before the new ones are taken
         n_scale, n_weight = self.reader.sizes
         self.store = torch.empty(slots + scratch, n_scale + n_weight, dtype=torch.uint8, device=device)
-        self.experts = []  # slot -> what upstream Expert.forward needs, as views of the slot
-        for row in self.store:
+        self.experts = self._views(self.store)  # slot -> what upstream Expert.forward needs, as views of the slot
+
+    def _views(self, store: torch.Tensor) -> list:
+        """What upstream Expert.forward needs of each row of `store` (an expert's checkpoint bytes), as views of it."""
+        _, _, _, _, dim, inter, limit = self.shape
+        n_scale, n_weight = self.reader.sizes
+        views = []
+        for row in store:
             at_s, at_w, mats = 0, n_scale, {}
             for name, (out, k) in (("w1", (inter, dim)), ("w2", (dim, inter)), ("w3", (inter, dim))):
                 weight = row[at_w:at_w + out * k // 2].view(torch.float4_e2m1fn_x2).view(out, k // 2)
@@ -127,7 +134,54 @@ class ExpertCache:
                 mats[name] = lambda v, w=weight: m.linear(v, w)
                 at_s, at_w = at_s + out * k // m.fp4_block_size, at_w + out * k // 2
             assert (at_s, at_w) == (n_scale, n_scale + n_weight)
-            self.experts.append(SimpleNamespace(**mats, swiglu_limit=limit))
+            views.append(SimpleNamespace(**mats, swiglu_limit=limit))
+        return views
+
+    def originals(self, layer: int, experts: list, wave: int = 16):
+        """Yields (expert, what upstream Expert.forward needs of its original weights) for each of a layer's experts,
+        in the order given: from the slot that holds it, or read from the checkpoint (or copied from the level in RAM)
+        into rows of its own, a wave at a time, the next wave's reads under way while this one is used. What the cache
+        holds stays as it is. Between tokens; an expert's weights are valid until the wave after its own begins."""
+        n_scale, n_weight = self.reader.sizes
+        if self.lent is None:
+            store = torch.empty(wave, n_scale + n_weight, dtype=torch.uint8, device=self.shape[2])
+            staging = []
+            for _ in range(2 * wave):
+                buf = torch.empty(self.reader.nbytes + core.PAGE, dtype=torch.uint8, device="cpu", pin_memory=store.is_cuda)
+                start = -buf.data_ptr() % core.PAGE
+                staging.append(buf[start:start + self.reader.nbytes])
+            self.lent = (store, self._views(store), staging)
+        store, views, staging = self.lent
+
+        def begin(group: list, half: int) -> list:  # where each expert's bytes are, its read started if it has to be read
+            found = []
+            for j, e in enumerate(group):
+                key = layer * self.n_experts + e
+                if self.held.get(key) is not None:
+                    found.append((self.held[key], None, None, None))
+                elif key in self.ram_cache:
+                    found.append((None, self.ram_cache[key], None, None))
+                else:
+                    buf, ticket = staging[half * wave + j], 64 + half * wave + j
+                    found.append((None, buf, self.reader.submit(layer, e, buf.numpy(), ticket), ticket))
+            return found
+
+        groups = [experts[i:i + wave] for i in range(0, len(experts), wave)]
+        coming = begin(groups[0], 0) if groups else None
+        for g, group in enumerate(groups):
+            found = coming
+            for j, (slot, buf, at, ticket) in enumerate(found):
+                if ticket is not None:
+                    self.reader.reader.wait(ticket)
+                    store[j, :n_scale].copy_(buf[at[0]:at[0] + n_scale], non_blocking=True)
+                    store[j, n_scale:].copy_(buf[at[1]:at[1] + n_weight], non_blocking=True)
+                elif buf is not None:
+                    store[j].copy_(buf, non_blocking=True)
+            if store.is_cuda:
+                torch.cuda.synchronize()  # the other half's buffers were copied a wave ago: they can be read into
+            coming = begin(groups[g + 1], (g + 1) % 2) if g + 1 < len(groups) else None
+            for j, (e, (slot, _, _, _)) in enumerate(zip(group, found)):
+                yield e, views[j] if slot is None else self.experts[slot]
 
     def _upload(self, slot: int, buf: torch.Tensor, at_s: int, at_w: int) -> None:
         n_scale, n_weight = self.reader.sizes

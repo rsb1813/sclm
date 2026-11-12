@@ -195,6 +195,8 @@ class TieredMoE(nn.Module):
         """image_mask: the block's second argument, which upstream's gate takes flattened: V4.1's image mask (None
         for text), or the token ids with V4-Flash-0731, whose first layers route by them."""
         shape = x.size()
+        if gpu.together:
+            return self.together(x, image_mask)
         if gpu.active and x.numel() == self.dim and self.gate.score_func == "sqrtsoftplus" and not isinstance(image_mask, torch.Tensor):
             return self.decode(x.reshape(-1), image_mask).view(shape)  # a decode token: V4-Flash-0731's token id comes as a number
         x = x.view(-1, self.dim)
@@ -235,4 +237,20 @@ class TieredMoE(nn.Module):
             gpu.fp8_expert(self.shared_experts, self.limit, xq, y[0])
         else:
             y += self.shared_experts(x)
+        return y.type_as(x).view(shape)
+
+    def together(self, x: torch.Tensor, input_ids: torch.Tensor | None) -> torch.Tensor:
+        """upstream MoE.forward for many tokens with every routed expert an original one: each expert the tokens are
+        routed to is applied to all its tokens at once on the device, its weights from the cache's slot or read from
+        the checkpoint for this call (ssd.ExpertCache.originals). The CPU tier is not used, and the cache is left as
+        it is. A layer's 256 experts take about half a second, however many tokens there are."""
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x, None if input_ids is None else input_ids.flatten())
+        y = torch.zeros_like(x, dtype=torch.float32)
+        counts = torch.bincount(indices.flatten(), minlength=self.gate.weight.size(0)).tolist()
+        for i, expert in self.cache.originals(self.layer_id, [i for i, count in enumerate(counts) if count]):
+            idx, top = torch.where(indices == i)
+            y[idx] += m.Expert.forward(expert, x[idx], weights[idx, top, None])
+        y += self.shared_experts(x)
         return y.type_as(x).view(shape)

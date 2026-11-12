@@ -6,6 +6,10 @@ import torch
 from sclm import gpu
 from sclm.upstream import model as m
 
+import kernel  # noqa: E402  (sclm.upstream puts it on the path)
+
+ROWS = 256  # tokens of a long run whose own steps (query, hyper-connection) are computed at a time
+
 
 @lru_cache(4)
 def attended(win: int, more: int, device: torch.device) -> torch.Tensor:
@@ -91,7 +95,101 @@ class V4Attention(m.Attention):
             pick if index is not None else None, out.view(1, 1, -1))
         return self.bound
 
+    def squeeze(self, comp, x: torch.Tensor, start_pos: int, cache: torch.Tensor) -> None:
+        """upstream Compressor.forward for the tokens x [1, n, dim] that continue the sequence at start_pos, as its
+        one-token form computes them: the groups these tokens complete go into their rows of `cache`, and the state
+        (the group under way, and with overlapping groups the one before it) is left as they leave it."""
+        n, ratio, d, rd = x.size(1), comp.compress_ratio, comp.head_dim, comp.rope_head_dim
+        at = start_pos + torch.arange(n, device=x.device)
+        kv, score = comp.wkv(x.float())[0], comp.wgate(x.float())[0] + comp.ape[at % ratio]
+        held = start_pos % ratio + (ratio if comp.overlap else 0)  # rows of the state these tokens' groups pool
+        kv, score = torch.cat([comp.kv_state[0, :held], kv]), torch.cat([comp.score_state[0, :held], score])
+        full = kv.size(0) // ratio * ratio  # rows in whole groups
+        groups = full // ratio - comp.overlap  # groups completed (with overlap, the first whole one is the one before)
+        if groups > 0:
+            k, s = kv[:full].unflatten(0, (-1, ratio)), score[:full].unflatten(0, (-1, ratio))
+            if comp.overlap:  # a group pools the first half of the group before and its own second half
+                comp.kv_state[0, :ratio], comp.score_state[0, :ratio] = k[-1], s[-1]
+                k, s = torch.cat([k[:-1, :, :d], k[1:, :, d:]], dim=1), torch.cat([s[:-1, :, :d], s[1:, :, d:]], dim=1)
+            out = comp.norm((k * s.softmax(dim=1)).sum(dim=1).to(x.dtype)).unsqueeze(0)  # [1, groups, d]
+            first = start_pos // ratio
+            m.apply_rotary_emb(out[..., -rd:], self.freqs_cis[first * ratio:(first + groups) * ratio:ratio])
+            if comp.rotate:
+                out = m.rotate_activation(out)
+                m.fp4_act_quant(out, m.fp4_block_size, True)
+            else:
+                m.act_quant(out[..., :-rd], 64, m.scale_fmt, m.scale_dtype, True)
+            cache[first:first + groups] = out[0]
+        under = slice(ratio if comp.overlap else 0, (ratio if comp.overlap else 0) + kv.size(0) - full)  # the group under way
+        comp.kv_state[0, under], comp.score_state[0, under] = kv[full:], score[full:]
+
+    def choose(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, count: torch.Tensor) -> torch.Tensor:
+        """upstream Indexer.forward's choice for each of the tokens x [1, n, dim]: the index_topk compressed positions
+        that score highest among the count[i] the token sees, -1 where it sees fewer ([n, at most index_topk])."""
+        index, n, rd, most = self.indexer, x.size(1), self.rope_head_dim, int(count[-1])
+        self.squeeze(index.compressor, x, start_pos, index.kv_cache[0])  # the keys of the groups these tokens complete
+        weights = index.weights_proj(x) * (index.softmax_scale * index.n_heads ** -0.5)
+        keys, k, picked = index.kv_cache[:, :most], min(index.index_topk, most), []
+        if not k:
+            return torch.empty(n, 0, dtype=torch.long, device=x.device)
+        hidden = torch.arange(most, device=x.device) >= count[:, None]  # the positions a token does not see yet
+        step = max(1, (1 << 27) // (index.n_local_heads * most))  # the scores of so many tokens at a time
+        for s0 in range(0, n, step):
+            rows = slice(s0, s0 + step)
+            q = index.wq_b(qr[:, rows]).unflatten(-1, (index.n_local_heads, index.head_dim))
+            m.apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos + s0:start_pos + s0 + q.size(1)])
+            q = m.rotate_activation(q)
+            m.fp4_act_quant(q, m.fp4_block_size, True)
+            score = (torch.einsum("bshd,btd->bsht", q, keys).relu_() * weights[:, rows].unsqueeze(-1)).sum(dim=2)[0]
+            top = score.masked_fill_(hidden[rows], float("-inf")).topk(k, dim=-1)[1]
+            picked.append(torch.where(top >= count[rows, None], -1, top))
+        return torch.cat(picked)
+
+    def together(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """upstream Attention.forward for the tokens x [1, n, dim] that continue the sequence at start_pos, each
+        attending to what upstream's one-token form lets it: its window, and the compressed positions completed up to
+        it, those these tokens complete among them (all of them, or the index's choice). The state is left as the
+        tokens one by one leave it, for whichever form comes next. (upstream's own form for several tokens only starts
+        a sequence, and holds every token's scores of every position at once.)"""
+        n, win, ratio, rd, dev = x.size(1), self.window_size, self.compress_ratio, self.rope_head_dim, x.device
+        pos, cache = start_pos + torch.arange(n, device=dev), self.kv_cache[0]
+        freqs = self.freqs_cis[start_pos:start_pos + n]
+        qr = self.q_norm(self.wq_a(x))
+        kv = self.kv_norm(self.wkv(x))
+        m.apply_rotary_emb(kv[..., -rd:], freqs)
+        m.act_quant(kv[..., :-rd], 64, m.scale_fmt, m.scale_dtype, True)
+        # the window: the positions before these tokens that one of them still sees, oldest first, then the tokens
+        seen = min(start_pos, win - 1)
+        rows = torch.cat([cache[(start_pos - seen + torch.arange(seen, device=dev)) % win], kv[0]])
+        idxs = seen + torch.arange(n, device=dev)[:, None] - torch.arange(win - 1, -1, -1, device=dev)
+        idxs = torch.where(idxs < 0, -1, idxs)
+        if ratio:
+            self.squeeze(self.compressor, x, start_pos, cache[win:])
+            count = (pos + 1) // ratio  # the compressed positions each token sees
+            if self.indexer is None:
+                picked = torch.arange(int(count[-1]), device=dev).expand(n, -1)
+                picked = torch.where(picked < count[:, None], picked, -1)
+            else:
+                picked = self.choose(x, qr, start_pos, count)
+            idxs = torch.cat([idxs, torch.where(picked < 0, -1, picked + rows.size(0))], dim=1)
+            rows = torch.cat([rows, cache[win:win + int(count[-1])]])
+        cache[pos[-win:] % win] = kv[0, -win:]  # the window ring keeps the last `win` positions
+        wo_a, out = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1), []
+        for s0 in range(0, n, ROWS):  # a token's query is sixty-four times its key/value
+            part = slice(s0, s0 + ROWS)
+            q = self.wq_b(qr[:, part]).unflatten(-1, (self.n_local_heads, self.head_dim))
+            q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+            m.apply_rotary_emb(q[..., -rd:], freqs[part])
+            o = kernel.sparse_attn(q, rows[None], self.attn_sink, idxs[None, part], self.softmax_scale,
+                                   chunk=max(8, (1 << 16) // idxs.size(1)))
+            m.apply_rotary_emb(o[..., -rd:], freqs[part], True)
+            o = torch.einsum("bsgd,grd->bsgr", o.view(1, q.size(1), self.n_local_groups, -1), wo_a)
+            out.append(self.wo_b(o.flatten(2)))
+        return torch.cat(out, dim=1)
+
     def forward(self, x: torch.Tensor, start_pos: int):
+        if gpu.together:
+            return self.together(x, start_pos)
         if not (gpu.active and x.size(0) * x.size(1) == 1 and start_pos):  # position 0 is upstream's prefill case
             return super().forward(x, start_pos)
         attn_q, attn_kv, sparse_attn, attn_out, pool, index_pool, freqs, cache, rows, pick, out = self.bound or self.bind(x)
@@ -198,3 +296,17 @@ class V4Block(m.Block):
     def end(self, lane: Lane, begun: tuple) -> None:
         """The second half: the rest of the MoE (TieredMoE.finish) and the stream after the block, into lane.out."""
         lane.bound[self][3](self.ffn.finish(begun, lane).data_ptr())
+
+    def together(self, h: torch.Tensor, start_pos: int, input_ids: torch.Tensor) -> torch.Tensor:
+        """upstream Block.forward for a long run of tokens (the stream h [1, n, hc, dim]). The hyper-connection steps
+        are each token's own, and upstream's take sixteen times the stream's memory: ROWS tokens at a time."""
+        parts = [slice(s0, s0 + ROWS) for s0 in range(0, h.size(1), ROWS)]
+
+        def sublayer(name: str, norm, run) -> torch.Tensor:
+            fn, scale, base = (getattr(self, f"hc_{name}_{part}") for part in ("fn", "scale", "base"))
+            mixed = [self.hc_pre(h[:, part], fn, scale, base) for part in parts]
+            y = run(norm(torch.cat([x for x, _, _ in mixed], dim=1)))
+            return torch.cat([self.hc_post(y[:, part], h[:, part], post, comb) for part, (_, post, comb) in zip(parts, mixed)], dim=1)
+
+        h = sublayer("attn", self.attn_norm, lambda x: self.attn(x, start_pos))
+        return sublayer("ffn", self.ffn_norm, lambda x: self.ffn(x, input_ids))

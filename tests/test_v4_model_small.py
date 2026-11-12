@@ -110,3 +110,64 @@ def test_decode_continues_a_prefill_as_upstream_computes(split):
     # way is magnified by this random model: 0.99-0.9999 here, against exact agreement without the rounding (above).
     for over in CASES:
         assert agreement(split, **over)[0] > 0.97, over
+
+
+@pytest.mark.parametrize("parts", [(0, 120), (0, 1, 38, 39, 97, 120), (0, 33, 34, 98)])
+def test_tokens_computed_together_continue_a_sequence_exactly_without_rounding(parts):
+    """host_v4.V4Attention.together computes a run of tokens that continues a sequence as tensors. In fp32 with no
+    rounding, the logits after each run, the logits of the tokens decoded after the runs and the state they leave
+    (window ring, compressed key/values, index keys, the compressors' groups) are those of the tokens one at a
+    time. The runs begin and end inside groups of 4 and of 16, cross the window ring (16) and what the index keeps
+    (8), start the sequence, follow each other and are followed by single tokens."""
+    from sclm import gpu
+    from sclm.host_v4 import V4Attention
+
+    args = m.ModelArgs(**SMALL)
+    for cached in (m.get_window_topk_idxs, m.get_compress_topk_idxs, m.precompute_freqs_cis):
+        cached.cache_clear()
+    prev, patched = torch.get_default_dtype(), (m.linear, m.act_quant, m.fp4_act_quant, m.rotate_activation)
+    torch.set_default_dtype(torch.float32)
+    m.linear, m.rotate_activation = exact_linear, rotate_any
+    m.act_quant = m.fp4_act_quant = lambda x, *a, **k: x
+    upstream_attention, m.Block.attention_cls = m.Block.attention_cls, V4Attention
+    n = 120
+
+    def make():
+        net = build(args)
+        for p in net.parameters():
+            if p.dtype == torch.bfloat16:
+                p.data = p.data.float()
+        return net
+
+    try:
+        with torch.device(DEV), torch.no_grad():
+            x = torch.randint(0, args.vocab_size, (1, n), generator=torch.Generator(device=DEV).manual_seed(3))
+            one, two = make(), make()
+            want = [one(x[:, i:i + 1], i)[1].float() for i in range(n)]
+            for start, end in zip(parts, parts[1:]):
+                gpu.together = True
+                try:
+                    got = two(x[:, start:end], start)[1].float()
+                finally:
+                    gpu.together = False
+                assert float(F.cosine_similarity(got.flatten(), want[end - 1].flatten(), dim=0)) > 0.999999, (start, end)
+            for i in range(parts[-1], n):  # upstream's one-token form goes on from the state the runs left
+                got = two(x[:, i:i + 1], i)[1].float()
+                assert float(F.cosine_similarity(got.flatten(), want[i].flatten(), dim=0)) > 0.999999, i
+            theirs, held = dict(one.named_modules()), 0
+            for name, mod in two.named_modules():
+                rows = {}  # the rows of each buffer that hold something: a compressor's are the groups not yet pooled
+                if isinstance(mod, m.Compressor):
+                    live = n % mod.compress_ratio + (mod.compress_ratio if mod.overlap else 0)
+                    rows = {"kv_state": live, "score_state": live}
+                elif isinstance(mod, (m.Attention, m.Indexer)):
+                    rows = {"kv_cache": mod.kv_cache.size(1)}
+                for buf, live in rows.items():
+                    a, b = (getattr(net, buf)[:, :live].nan_to_num(neginf=-1e9) for net in (theirs[name], mod))
+                    assert torch.allclose(a, b, rtol=1e-3, atol=1e-3 * float(a.abs().max())), (name, buf)
+                    held += 1
+            assert held > 12
+    finally:
+        torch.set_default_dtype(prev)
+        m.linear, m.act_quant, m.fp4_act_quant, m.rotate_activation = patched
+        m.Block.attention_cls = upstream_attention

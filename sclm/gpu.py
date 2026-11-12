@@ -12,6 +12,9 @@ from . import ACT_BLOCK, MODEL
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclm_gpu.dll")
 ATTENDED = 2304  # the most positions sparse_attn takes (engine/gpu.cu)
 active = False  # the host turns this on around a forward whose single-token steps should use the kernels
+# the host turns this on around a forward of many tokens that continue a sequence (Host.prefill): attention computes
+# them as tensors (host_v4.V4Attention.together), and the MoE with the original experts (TieredMoE.together)
+together = False
 _lib = None
 
 

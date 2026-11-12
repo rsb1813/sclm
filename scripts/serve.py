@@ -23,6 +23,7 @@ from sclm import CKPT, CODES
 
 CHUNK = 4096  # a sequence's room is a multiple of this many tokens
 FEED = 16  # tokens of a prompt fed in one step: the decoder takes them through its layers together
+RUN = 4096  # tokens of a long prompt fed in one step, as a run computed with the original experts (Host.prefill)
 TOOL_CALLS = f"\n\n<{dsml_token}{tool_calls_block_name}"  # what a tool call block begins with in the answer's text
 # OpenAI's reasoning_effort values as the model's (None: no thinking)
 EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
@@ -100,8 +101,13 @@ class Job:
             last = len(self.ids) - 1  # fed alone, from the mark
             if self.at == last:
                 self.conv.mark = (self.at, engine.decoder.snapshot())
-            tokens = self.ids[self.at:min(last, self.at + FEED)] or self.ids[last:]
-            self._feed(engine, tokens)
+            if engine.long and last - self.at >= engine.long:  # a run takes the time of reading every expert once
+                tokens = self.ids[self.at:min(last, self.at + RUN)]
+                self.logits = engine.decoder.prefill(tokens, len(self.conv.ids))
+                self.conv.ids += tokens
+            else:
+                tokens = self.ids[self.at:min(last, self.at + FEED)] or self.ids[last:]
+                self._feed(engine, tokens)
             self.at += len(tokens)
             self.events.put(("feed", self.at, len(self.ids)))
             return len(tokens)
@@ -180,7 +186,8 @@ class Engine:
     job is given before the next job's turn (0: a job runs to its end); keep: sequences kept after their request for
     the conversation's next one. reserve: tokens the device memory set aside for sequences is for at first; it is
     doubled when they hold more, at the expert cache's cost, and brought down again when a quarter would do (None:
-    the decoder's memory is left as it is)."""
+    the decoder's memory is left as it is). long: a prompt with at least this many tokens still to feed goes in as
+    runs of up to RUN tokens (0: never), which no other request's turn interrupts."""
 
     def __init__(self, tok, decoder, context: int, slice: int = 64, keep: int = 8, reserve: int | None = None):
         self.tok, self.decoder, self.context, self.slice, self.keep = tok, decoder, context, slice, keep
@@ -188,7 +195,7 @@ class Engine:
         self.think_start, self.think_end = tok.convert_tokens_to_ids("<think>"), tok.convert_tokens_to_ids("</think>")
         self.inbox, self.lock = queue.Queue(), threading.Lock()  # the lock: the tokenizer is used by every thread
         self.active, self.waiting, self.idle = [], [], []  # jobs taking turns, jobs without room yet, conversations kept
-        self.stopping = False
+        self.stopping, self.long = False, 512
         # the sequence in use while nothing is served, in place of the state the model was built with
         self.blank = decoder.sequence(128)
         decoder.switch(self.blank)
@@ -489,6 +496,8 @@ def main() -> None:
     ap.add_argument("--slice", type=int, default=64, help="tokens a request is given before the next one's turn (0: requests "
                     "are served one after the other)")
     ap.add_argument("--keep", type=int, default=8, help="conversations kept after their reply, for their next request")
+    ap.add_argument("--long", type=int, default=512, help="a prompt with this many tokens to feed or more goes in as runs "
+                    "of 4096 tokens computed with the original weights, about 30 s a run (0: never)")
     ap.add_argument("--effort", default="low", choices=["low", "high", "max"], help="thinking depth when a request names none")
     ap.add_argument("--no-think", action="store_true", help="no thinking unless a request asks for it")
     ap.add_argument("--ckpt", default=CKPT)
@@ -514,6 +523,7 @@ def main() -> None:
     with contextlib.redirect_stdout(io.StringIO()):  # the loader's own progress lines
         tok, cache, decoder, info = load_runtime(cli, background=28)
     engine = Engine(tok, decoder, cli.context, cli.slice, cli.keep, min(cli.reserve, cli.context))
+    engine.long = cli.long
     server = ThreadingHTTPServer((cli.host, cli.port), Handler)
     server.daemon_threads = True
     server.app = argparse.Namespace(engine=engine, model=os.path.basename(cli.ckpt), created=int(time.time()),

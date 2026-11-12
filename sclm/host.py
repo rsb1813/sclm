@@ -500,7 +500,18 @@ class Host:
             self.slots = self.cache.n_slots + nbytes(self.net.max_seq_len) // per
         slots = self.slots - -(-nbytes(tokens) // per)
         assert slots > 0, f"no device memory is left for the expert cache with sequences of {tokens} tokens"
-        self.cache.resize(slots)
+        self._resize(slots)
+
+    def _resize(self, slots: int) -> None:
+        """cache.resize(slots), or the most slots below that the device has one piece of memory for: what was given
+        back to the allocator in the meantime may not come back whole."""
+        while True:
+            try:
+                return self.cache.resize(slots)
+            except torch.OutOfMemoryError:
+                if slots <= 16:
+                    raise
+                slots -= 16
 
     def switch(self, seq: Sequence) -> None:
         """The model computes on `seq` from now on: its state takes the place of the last sequence's in the modules."""
@@ -559,6 +570,48 @@ class Host:
             return net.head(net.norm(layers[-1].hc_head(out, net.hc_head_fn, net.hc_head_scale, net.hc_head_base)))
         finally:
             gpu.active, m.linear = False, _upstream_linear
+
+    PART = 4096  # tokens prefill() takes through the layers at a time
+    WORK = 5 << 29  # device memory a part of that length works in (2.5 GiB), lent by the expert cache meanwhile
+
+    @torch.inference_mode()
+    def prefill(self, ids: list, start_pos: int) -> torch.Tensor:
+        """The logits after the tokens `ids`, which continue the sequence at start_pos (V4-Flash-0731), for a long run
+        of them: PART tokens at a time go through each layer as tensors, as upstream computes a prompt, and the MoE
+        with the original experts, each read from the checkpoint once for all the tokens routed to it
+        (TieredMoE.together). A part takes the time of reading the model's experts, about 22 s, whatever its length;
+        below a few hundred tokens feed() is faster. The numbers are upstream's for these tokens, not the tiered
+        model's: the prompt is computed with the original weights. The state is left for any form to go on from."""
+        assert V4 and ids
+        net, out = self.net, None
+        if start_pos == 0:  # as logits(): the last sequence's groups are not this one's
+            for module in net.modules():
+                if isinstance(module, m.Compressor):
+                    module.kv_state.zero_()
+                    module.score_state.fill_(float("-inf"))
+        slots = self.cache.n_slots
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize()  # what the tokens before queued is done: the slots and the state are read here
+            short = self.WORK - torch.cuda.mem_get_info()[0]
+            if short > 0:  # the expert cache gives up slots for the working memory, and starts empty afterwards
+                self.cache.resize(max(1, slots - -(-short // self.cache.store.size(1))))
+        gpu.together = True
+        try:
+            with torch.device(self.device):  # upstream creates index tensors on the default device
+                for at in range(0, len(ids), self.PART):
+                    part = torch.tensor([ids[at:at + self.PART]])
+                    h = net.embed(part).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1)
+                    part = part.to(self.device)
+                    for layer in net.layers:
+                        h = layer.together(h, start_pos + at, part)
+                    self.clock += part.size(1)
+                h = layer.hc_head(h[:, -1:], net.hc_head_fn, net.hc_head_scale, net.hc_head_base)
+                return net.head(net.norm(h))
+        finally:
+            gpu.together = False
+            if self.cache.n_slots != slots:
+                del h
+                self._resize(slots)
 
     def snapshot(self) -> list:
         """The attention state of the sequence at this point (V4-Flash-0731). restore() takes the sequence back to it."""

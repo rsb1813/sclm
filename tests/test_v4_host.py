@@ -232,3 +232,25 @@ def test_tokens_fed_together_give_what_they_give_one_by_one(models, start, count
     after = one_by_one(x[:, start + count:], start + count)
     assert all(torch.equal(a, b) for a, b in zip(after, want[start + count:]))
     assert all(torch.equal(t, s) for (_, _, t), s in zip(decoder.seq.state, state))
+
+
+def test_a_long_run_is_computed_with_the_original_experts_as_upstream_computes_it(models):
+    """prefill() takes runs of tokens through the layers as tensors, its experts read from the checkpoint for the
+    run: upstream's logits for the same tokens (it one at a time), from the sequence's start and from inside it, in
+    one part and in several, and the kernels' tokens go on from the state it leaves. What the cache holds is not
+    touched."""
+    args, ref, net, cache = models
+    decoder = host.Host(net, cache, device=DEV)
+    x = torch.randint(0, args.vocab_size, (1, 110), generator=torch.Generator().manual_seed(13))
+    with torch.device(DEV):
+        want = [ref(x[:, i:i + 1].to(DEV), i)[1].float() for i in range(110)]
+    cos = lambda a, b: float(F.cosine_similarity(a.float().flatten(), b.flatten(), dim=0))  # noqa: E731
+    held = dict(cache.held)
+    first = cos(decoder.prefill(x[0, :37].tolist(), 0), want[36])
+    decoder.PART = 16  # the next run goes in four parts
+    second = cos(decoder.prefill(x[0, 37:98].tolist(), 37), want[97])
+    assert cache.held == held
+    after = [cos(decoder.logits(x[:, i:i + 1], i), want[i]) for i in range(98, 110)]
+    print("runs:", first, second, "| tokens after: min", min(after), "median", sorted(after)[len(after) // 2])
+    # as where a prefill is followed by decoding: the same numbers but for rounding, which the random model magnifies
+    assert first > 0.97 and second > 0.97 and min(after) > 0.9 and sorted(after)[len(after) // 2] > 0.99
