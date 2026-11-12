@@ -7,6 +7,7 @@
 import argparse
 import json
 import os
+import tempfile
 import time
 
 import numpy as np
@@ -38,7 +39,7 @@ def main() -> None:
 
     cli.max_seq_len, cli.positions = CHUNK, cli.context
     tok, cache, decoder, _ = load_runtime(cli, background=28)
-    engine = Engine(tok, decoder, cli.context, keep=0, reserve=min(cli.reserve, cli.context))  # nothing is kept
+    engine = Engine(tok, decoder, cli.context, tempfile.mkdtemp(), cache_gb=0, reserve=min(cli.reserve, cli.context))  # nothing is kept
     engine.long = 0  # the texts go in a few tokens at a time: what is measured is the tiered model's tokens
     held = np.load(os.path.join(DATA, cli.set, "tokens.npz"))
     # a text of each category in turn, so that every setting gets a like mix

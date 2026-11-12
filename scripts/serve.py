@@ -1,6 +1,7 @@
 # An OpenAI-compatible HTTP server for the tiered model (DeepSeek-V4-Flash-0731): chat completions, streamed or whole.
 # One thread computes. Requests that are open together take turns, a few tokens at a time, each in a token sequence of
-# its own; a conversation that comes back with more messages finds its sequence still there and feeds only what is new.
+# its own. What a request's sequence held is kept on disk (the prompt cache): a request whose prompt begins the same way
+# feeds only what is new, after a restart of the server as well.
 import argparse
 import bisect
 import contextlib
@@ -10,6 +11,7 @@ import os
 import queue
 import re
 import select
+import shutil
 import socket
 import threading
 import time
@@ -26,8 +28,9 @@ from sclm import CKPT, CODES
 CHUNK = 4096  # a sequence's room is a multiple of this many tokens
 FEED = 16  # tokens of a prompt fed in one step: the decoder takes them through its layers together
 RUN = 4096  # tokens of a long prompt fed in one step, as a run computed with the original experts (Host.prefill)
-MARKS = 40  # the most positions a conversation can be taken back to (17 MiB of RAM each)
-TAIL = 2048  # a conversation that would lose more tokens than this by being taken back is copied instead, if there is room
+MARKS = 40  # the most positions a conversation can be taken back to (a file of 17 MiB each)
+TAIL = 2048  # a kept conversation with at most this many tokens after the mark a request goes on from is replaced by it
+FORMAT = 1  # of what a conversation's folder holds: in the cache folder's name
 WAIT = 1024  # tokens an open request has yet to feed of what a new prompt begins with that are worth waiting for
 PIN = re.compile("\ue000\\d+\ue001")  # stands in a message's text where the request asks for a mark (cache_control)
 TOOL_CALLS = f"\n\n<{dsml_token}{tool_calls_block_name}"  # what a tool call block begins with in the answer's text
@@ -68,34 +71,102 @@ class Pieces:
         return text[len(before):]
 
 
-class Conversation:
-    """A token sequence the decoder holds (`seq`), the tokens fed to it, and `marks`: position -> the decoder's
-    snapshot after so many tokens, kept in RAM. The sequence can be taken back to any of them, and a request whose
-    prompt parts from this one's goes on from the last mark before that: this is the prompt cache. Marks are kept
-    where prompts tend to part: where each user turn begins (the first: after the system prompt and the tools), at
-    the end of each run of a long prompt, before the last prompt token (the reply's thinking leaves the context
-    there), and where a request asks for one (`pinned`, with the first turn's)."""
+def save(what, path: str) -> None:
+    """Writes a file whole or not at all, and never through another folder's link to it."""
+    try:
+        torch.save(what, path + ".tmp")
+        os.replace(path + ".tmp", path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(path + ".tmp")
+        raise
 
-    def __init__(self, seq):
-        self.seq, self.ids, self.marks, self.pinned = seq, [], {}, set()
+
+class Conversation:
+    """A token sequence, the tokens fed to it, and the positions it can be taken back to. An open request's lives in
+    the decoder (`seq`). All else is in its folder `home`, and a kept conversation is nothing but that: the tokens,
+    the key/values the layers compressed (6.7 KiB a token) and its marks, each the decoder's snapshot after so many
+    tokens. A request whose prompt begins as this conversation does goes on from the last mark before the two part:
+    this is the prompt cache. Marks are kept where prompts tend to part: where each user turn begins (the first: after
+    the system prompt and the tools), at the end of each run of a long prompt, before the last prompt token (the
+    reply's thinking leaves the context there), after a reply without thinking, and where a request asks for one
+    (`pinned`, with the first turn's).
+    A folder is written while its request is open and is whole once it has meta.json, written last; from then on
+    nothing in it changes. A request that goes on from it gets a folder of its own that links to its files."""
+
+    def __init__(self, home: str, seq=None):
+        self.home, self.seq, self.ids, self.marks, self.pinned = home, seq, [], set(), set()
+        self.chunks, self.saved = [], 0  # [first token, end, file] of the rows on disk, as written; how far they reach
+        os.makedirs(home, exist_ok=True)
+
+    @classmethod
+    def kept(cls, home: str) -> "Conversation":
+        """The conversation a folder holds."""
+        with open(os.path.join(home, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        conv = cls(home)
+        conv.ids = torch.load(os.path.join(home, "ids.pt"), weights_only=True).tolist()
+        conv.marks, conv.pinned, conv.chunks, conv.saved = set(meta["marks"]), set(meta["pinned"]), meta["chunks"], meta["saved"]
+        return conv
+
+    def _mark(self, at: int) -> str:
+        return os.path.join(self.home, f"mark_{at}.pt")
 
     def keep(self, marks: dict, pins=()) -> None:
-        """Adds marks. Beyond MARKS, the one that leaves the smallest gap goes, but for the first, the last eight
-        and the pinned ones."""
-        self.marks.update(marks)
-        self.pinned |= {at for at in marks if at in pins}
+        """Adds marks (position -> snapshot). Beyond MARKS, the one that leaves the smallest gap goes, but for the
+        first, the last eight and the pinned ones. A mark that cannot be written is not kept."""
+        for at, kept in marks.items():
+            try:
+                save(kept, self._mark(at))
+            except (OSError, RuntimeError) as e:  # torch.save's own error for a full disk or a folder that is gone
+                print(f"{time.strftime('%H:%M:%S')} prompt cache: no mark at {at} ({type(e).__name__}: {e})", flush=True)
+                continue
+            self.marks.add(at)
+            if at in pins:
+                self.pinned.add(at)
         while len(self.marks) > MARKS:
             at = sorted(self.marks)
             free = [i for i in range(1, len(at) - 8) if at[i] not in self.pinned]
             if not free:
                 break
-            del self.marks[at[min(free, key=lambda i: at[i + 1] - at[i - 1])]]
+            gone = at[min(free, key=lambda i: at[i + 1] - at[i - 1])]
+            self.marks.remove(gone)
+            os.remove(self._mark(gone))
 
-    def back(self, at: int) -> None:
-        """Forgets what came after the mark at `at`."""
-        del self.ids[at:]
-        self.marks = {p: kept for p, kept in self.marks.items() if p <= at}
-        self.pinned = {p for p in self.pinned if p <= at}
+    def mark(self, at: int):
+        return torch.load(self._mark(at), weights_only=True)
+
+    def load(self, decoder, seq, at: int) -> None:
+        """Gives `seq` what the conversation's first `at` tokens left in the layers; the mark at `at` has the rest."""
+        for first, _, name in self.chunks:  # in the order written: a later one is right where two overlap
+            if first < at:
+                decoder.put(seq, first, torch.load(os.path.join(self.home, name), weights_only=True))
+
+    def share(self, other: "Conversation", at: int) -> None:
+        """Begins as `other` does up to its mark at `at`: its marks up to there, and its rows if they are on disk
+        (as links to its files: nothing is written twice)."""
+        files = [(p, f"mark_{p}.pt") for p in other.marks if p <= at]
+        chunks = [c for c in other.chunks if c[0] < at] if other.saved >= at else []
+        for name in [name for _, name in files] + [name for _, _, name in chunks]:
+            try:
+                os.link(os.path.join(other.home, name), os.path.join(self.home, name))
+            except OSError:  # a file system without links
+                shutil.copyfile(os.path.join(other.home, name), os.path.join(self.home, name))
+        self.ids, self.marks, self.pinned = other.ids[:at], {p for p, _ in files}, {p for p in other.pinned if p <= at}
+        if chunks:
+            self.chunks, self.saved = chunks, at
+
+    def flush(self, decoder) -> None:
+        """Writes what is not on disk yet: the rows of the tokens since `saved`, the tokens, and last the list."""
+        if len(self.ids) > self.saved:
+            name = f"rows_{self.saved}_{len(self.ids)}_{uuid.uuid4().hex[:8]}.pt"
+            save(decoder.rows(self.seq, self.saved, len(self.ids)), os.path.join(self.home, name))
+            self.chunks.append([self.saved, len(self.ids), name])
+            self.saved = len(self.ids)
+        save(torch.tensor(self.ids, dtype=torch.int32), os.path.join(self.home, "ids.pt"))
+        with open(os.path.join(self.home, "meta.tmp"), "w", encoding="utf-8") as f:
+            json.dump({"marks": sorted(self.marks), "pinned": sorted(self.pinned), "chunks": self.chunks, "saved": self.saved}, f)
+        os.replace(os.path.join(self.home, "meta.tmp"), os.path.join(self.home, "meta.json"))
 
 
 class Job:
@@ -112,6 +183,7 @@ class Job:
         self.stops, self.tools = [s for s in stop if s], tools
         self.events, self.cancelled = queue.Queue(), False
         self.conv, self.at, self.reused = None, 0, 0  # set when the engine gives the job a sequence
+        self.old = None  # the kept conversation this one replaces once it is kept itself
         self.logits = self.rng = self.kind = self.pieces = None
         self.new, self.thought, self.said = 0, 0, []  # tokens of the reply, of its thinking, and the reply's tokens
         self.text = {"think": "", "answer": ""}
@@ -219,21 +291,36 @@ class Job:
 
 
 class Engine:
-    """The thread that computes. context: tokens the open and the kept sequences can hold together; slice: tokens a
-    job is given before the next job's turn (0: a job runs to its end); keep: sequences kept after their request for
-    the conversation's next one. reserve: tokens the device memory set aside for sequences is for at first; it is
-    doubled when they hold more, at the expert cache's cost, and brought down again when a quarter would do (None:
-    the decoder's memory is left as it is). long: a prompt with at least this many tokens still to feed goes in as
-    runs of up to RUN tokens (0: never), which no other request's turn interrupts."""
+    """The thread that computes. context: tokens the open requests' sequences can hold together; slice: tokens a job is
+    given before the next job's turn (0: a job runs to its end). cache: the folder of the kept conversations
+    (Conversation), which hold no memory and outlive the server; cache_gb: the most they take on disk, the longest
+    unused going first (0: none is kept). reserve: tokens the device memory set aside for sequences is for at first;
+    it is doubled when they hold more, at the expert cache's cost, and brought down again when a quarter would do
+    (None: the decoder's memory is left as it is). long: a prompt with at least this many tokens still to feed goes in
+    as runs of up to RUN tokens (0: never), which no other request's turn interrupts."""
 
-    def __init__(self, tok, decoder, context: int, slice: int = 64, keep: int = 8, reserve: int | None = None):
-        self.tok, self.decoder, self.context, self.slice, self.keep = tok, decoder, context, slice, keep
+    def __init__(self, tok, decoder, context: int, cache: str, slice: int = 64, cache_gb: float = 50.0, reserve: int | None = None):
+        self.tok, self.decoder, self.context, self.slice = tok, decoder, context, slice
+        self.cache, self.budget = cache, int(cache_gb * 2**30)
         self.eos = tok.eos_token_id
         self.think_start, self.think_end = tok.convert_tokens_to_ids("<think>"), tok.convert_tokens_to_ids("</think>")
         self.user = tok.convert_tokens_to_ids("<｜User｜>")  # where a user turn begins
         self.inbox, self.lock = queue.Queue(), threading.Lock()  # the lock: the tokenizer is used by every thread
-        self.active, self.waiting, self.idle = [], [], []  # jobs taking turns, jobs without room yet, conversations kept
+        # jobs taking turns, jobs without room yet, conversations kept (the longest unused first)
+        self.active, self.waiting, self.idle = [], [], []
         self.stopping, self.long = False, 512
+        os.makedirs(cache, exist_ok=True)
+        stamp = lambda entry: os.path.getmtime(os.path.join(entry.path, "meta.json"))  # noqa: E731
+        folders = [entry for entry in os.scandir(cache) if entry.is_dir()]
+        whole = [entry for entry in folders if os.path.exists(os.path.join(entry.path, "meta.json"))]
+        for entry in folders:
+            if entry not in whole:  # of a request that did not end
+                shutil.rmtree(entry.path, ignore_errors=True)
+        for entry in sorted(whole, key=stamp):
+            try:
+                self.idle.append(Conversation.kept(entry.path))
+            except Exception:  # not a conversation that can be read
+                shutil.rmtree(entry.path, ignore_errors=True)
         # the sequence in use while nothing is served, in place of the state the model was built with
         self.blank = decoder.sequence(128)
         decoder.switch(self.blank)
@@ -245,22 +332,30 @@ class Engine:
         self.inbox.put(job)
 
     def room(self) -> int:
-        return self.context - sum(c.seq.capacity for c in [job.conv for job in self.active] + self.idle)
+        return self.context - sum(job.conv.seq.capacity for job in self.active)
 
-    def _drop(self, conv: Conversation) -> None:
-        if conv.seq is self.decoder.seq:
-            self.decoder.switch(self.blank)
+    def used(self) -> int:
+        """Bytes the kept conversations take on disk, a file that several of them link to counted once."""
+        files = {}
+        for conv in self.idle:
+            try:
+                for entry in os.scandir(conv.home):
+                    stat = os.stat(entry.path)
+                    files[stat.st_ino or entry.path] = stat.st_size
+            except OSError:  # a folder that is gone takes nothing
+                pass
+        return sum(files.values())
+
+    def _forget(self, conv: Conversation) -> None:
         if conv in self.idle:
             self.idle.remove(conv)
+        shutil.rmtree(conv.home, ignore_errors=True)
 
-    def _fit(self, extra: int, spare: Conversation | None = None) -> bool:
-        """Room for `extra` more tokens: kept conversations other than `spare` go, the oldest first, and the device
-        memory set aside follows what the sequences then hold. False: the open requests hold the rest."""
-        while self.room() < extra:
-            other = next((conv for conv in self.idle if conv is not spare), None)
-            if other is None:
-                return False
-            self._drop(other)
+    def _fit(self, extra: int) -> bool:
+        """Room for `extra` more tokens in the open sequences, the device memory set aside following what they then
+        hold. False: the open requests hold the rest."""
+        if self.room() < extra:
+            return False
         if self.reserve is not None:
             want = self.base
             while want < self.context - self.room() + extra:
@@ -284,19 +379,16 @@ class Engine:
         return True
 
     def _place(self, job: Job) -> bool:
-        """Gives the job a sequence. The conversation, kept or open, that holds the longest beginning of its prompt up
-        to one of its marks is found: the job goes on in it (a kept one whose tokens the prompt continues, or which
-        loses little by being taken back to the mark), or in a copy of it up to the mark (an open one, or one with
-        much after the mark: another session with the same system prompt), or in a new sequence. It has room for the
-        prompt; the reply makes more as it grows (fits). False: not yet (no room until a job ends, or an open request
-        is still feeding what this prompt begins with)."""
+        """Gives the job a sequence and a folder. The conversation, kept or open, that holds the longest beginning of
+        its prompt up to one of its marks is found, and the job's sequence begins as that one was at the mark: read
+        from its folder, or copied from the open request's sequence. The job's folder links to that one's files up to
+        the mark. A kept conversation with little after the mark (the conversation this request continues) is replaced
+        by the job's once that is kept; one with much after it (another session with the same system prompt) stays.
+        The sequence has room for the prompt; the reply makes more as it grows (fits). False: not yet (no room until
+        a job ends, or an open request is still feeding what this prompt begins with)."""
         ids, best, at, used = job.ids, None, 0, False
         for conv, busy in [(conv, False) for conv in self.idle] + [(other.conv, True) for other in self.active]:
-            n = common(conv.ids, ids)
-            if not busy and n == len(conv.ids) and n < len(ids):
-                reach = n
-            else:
-                reach = max((p for p in conv.marks if p <= min(n, len(ids) - 1)), default=0)
+            reach = max((p for p in conv.marks if p <= min(common(conv.ids, ids), len(ids) - 1)), default=0)
             if reach > at:
                 best, at, used = conv, reach, busy
         for other in self.active:
@@ -304,28 +396,45 @@ class Engine:
             if shared >= at + WAIT and other.at < min(shared, len(other.ids)):
                 return False
         need = min(self.context, -(-(len(ids) + 1) // CHUNK) * CHUNK)
-        if best is not None and (used or len(best.ids) - at > TAIL) and self.room() >= need and self._fit(need):
-            source, best = best, Conversation(self.decoder.clone(best.seq, need))
-            best.ids = source.ids[:at]
-            best.keep({p: kept for p, kept in source.marks.items() if p <= at}, source.pinned)
-            self.decoder.switch(best.seq)
-            self.decoder.restore(best.marks[at])
-        elif best is not None and not used:
-            extra = need - best.seq.capacity
-            if extra > 0 and not self._fit(extra, best):
-                return False
-            self.idle.remove(best)
-            self.decoder.switch(best.seq)
-            if at < len(best.ids):
-                self.decoder.restore(best.marks[at])
-                best.back(at)
-            if extra > 0:
-                self.decoder.resize(best.seq, need)
-        else:
-            if not self._fit(need):
-                return False
-            best, at = Conversation(self.decoder.sequence(need)), 0
-        job.conv, job.at, job.reused = best, at, at
+        if not self._fit(need):
+            return False
+        conv = Conversation(os.path.join(self.cache, uuid.uuid4().hex))
+        try:
+            if best is not None:
+                try:
+                    kept = best.mark(at)
+                    if used:
+                        conv.seq = self.decoder.clone(best.seq, need)
+                    else:
+                        conv.seq = self.decoder.sequence(need)
+                        best.load(self.decoder, conv.seq, at)
+                    self.decoder.switch(conv.seq)
+                    self.decoder.restore(kept)
+                    conv.share(best, at)
+                except torch.OutOfMemoryError:
+                    raise
+                except Exception as e:  # what the folder holds cannot be read: it is no cache
+                    print(f"{time.strftime('%H:%M:%S')} prompt cache: {type(e).__name__}: {e}", flush=True)
+                    self.decoder.switch(self.blank)
+                    shutil.rmtree(conv.home, ignore_errors=True)
+                    if not used:
+                        self._forget(best)
+                    conv, best, at = Conversation(os.path.join(self.cache, uuid.uuid4().hex)), None, 0
+            if best is None:
+                conv.seq = self.decoder.sequence(need)
+                self.decoder.switch(conv.seq)
+        except Exception:
+            self.decoder.switch(self.blank)
+            shutil.rmtree(conv.home, ignore_errors=True)
+            raise
+        if best is not None and not used:
+            self.idle.remove(best)  # used last, and in that order after a restart as well
+            self.idle.append(best)
+            with contextlib.suppress(OSError):
+                os.utime(os.path.join(best.home, "meta.json"))
+            if len(best.ids) - at <= TAIL:
+                job.old = best
+        job.conv, job.at, job.reused = conv, at, at
         return True
 
     def _start(self, job: Job) -> bool:
@@ -333,29 +442,45 @@ class Engine:
             return True
         try:
             placed = self._place(job)
-        except torch.OutOfMemoryError:  # the device has less room than the budget counts on: nothing is kept, and
-            for conv in list(self.idle):  # the job waits for the open ones, or is refused if there are none
-                self._drop(conv)
-            torch.cuda.empty_cache()
+        except torch.OutOfMemoryError:  # the device has less room than the budget counts on: the job waits for the
+            torch.cuda.empty_cache()  # open ones, or is refused if there are none
             placed = False
             if not self.active:
                 job.events.put(("error", 503, "not enough device memory for this context"))
                 return True
+        except Exception as e:
+            job.events.put(("error", 500, f"{type(e).__name__}: {e}"))
+            return True
         if placed:
             self.active.append(job)
         return placed
 
     def _finish(self, job: Job, keep: bool = True) -> None:
+        """The job's conversation goes to disk, if it holds more than the one it began from, and leaves the decoder;
+        the kept ones stay within their budget."""
+        if job not in self.active:  # it was finished, and what came after that failed
+            return
         self.active.remove(job)
-        if keep:
-            used = min(self.context, -(-(len(job.conv.ids) + 1) // CHUNK) * CHUNK)
-            if used < job.conv.seq.capacity:  # kept with the room it uses
-                self.decoder.resize(job.conv.seq, used)
-            self.idle.append(job.conv)
-            while len(self.idle) > self.keep:
-                self._drop(self.idle[0])
+        conv, kept = job.conv, False
+        if keep and self.budget and len(conv.ids) > job.reused:
+            try:
+                self.decoder.switch(conv.seq)
+                if job.kind is not None and job.ids[-1] != self.think_start and len(conv.ids) not in conv.marks:
+                    conv.keep({len(conv.ids): self.decoder.snapshot("cpu")})  # a reply without thinking: the next turn goes on here
+                conv.flush(self.decoder)
+                kept = True
+            except Exception as e:
+                print(f"{time.strftime('%H:%M:%S')} prompt cache: not kept ({type(e).__name__}: {e})", flush=True)
+        self.decoder.switch(self.blank)
+        conv.seq = None
+        if kept:
+            self.idle.append(conv)
+            if job.old is not None:
+                self._forget(job.old)
+            while len(self.idle) > 1 and self.used() > self.budget:
+                self._forget(self.idle[0])
         else:
-            self._drop(job.conv)
+            shutil.rmtree(conv.home, ignore_errors=True)
         t = job.times
         if "end" in t and "prompt" in t:
             print(f"{time.strftime('%H:%M:%S')} prompt {len(job.ids)} tokens ({job.reused} held) in {t['prompt'] - t['start']:.1f}s, "
@@ -564,7 +689,9 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=20000, help="the most tokens of a reply, thinking included")
     ap.add_argument("--slice", type=int, default=64, help="tokens a request is given before the next one's turn (0: requests "
                     "are served one after the other)")
-    ap.add_argument("--keep", type=int, default=8, help="conversations kept after their reply, for their next request")
+    ap.add_argument("--cache-dir", default=r"C:\models\sclm-cache", help="the folder of the prompt cache: the conversations "
+                    "kept after their reply, which a request that begins the same way goes on from")
+    ap.add_argument("--cache-gb", type=float, default=50.0, help="the most the prompt cache takes on disk (0: nothing is kept)")
     ap.add_argument("--long", type=int, default=512, help="a prompt with this many tokens to feed or more goes in as runs "
                     "of 4096 tokens computed with the original weights, about 30 s a run (0: never)")
     ap.add_argument("--effort", default="low", choices=["low", "high", "max"], help="thinking depth when a request names none")
@@ -591,7 +718,8 @@ def main() -> None:
     transformers.logging.set_verbosity_error()  # the tokenizer's note about a model type it does not know
     with contextlib.redirect_stdout(io.StringIO()):  # the loader's own progress lines
         tok, cache, decoder, info = load_runtime(cli, background=28)
-    engine = Engine(tok, decoder, cli.context, cli.slice, cli.keep, min(cli.reserve, cli.context))
+    engine = Engine(tok, decoder, cli.context, os.path.join(cli.cache_dir, f"{os.path.basename(cli.ckpt)}-{os.path.basename(cli.codes or 'none')}-{FORMAT}"),
+                    cli.slice, cli.cache_gb, min(cli.reserve, cli.context))
     engine.long = cli.long
     server = ThreadingHTTPServer((cli.host, cli.port), Handler)
     server.daemon_threads = True
@@ -600,7 +728,8 @@ def main() -> None:
     worker = threading.Thread(target=engine.run, daemon=True)
     worker.start()
     print(f"sclm serve · {server.app.model} · http://{cli.host}:{cli.port}/v1 · 문맥 {cli.context} 토큰, 답 최대 {cli.max_tokens} 토큰 · "
-          f"VRAM 슬롯 {cache.n_slots}개, RAM 캐시 {cli.ram_cache}개 · Ctrl+C로 끝냄", flush=True)
+          f"VRAM 슬롯 {cache.n_slots}개, RAM 캐시 {cli.ram_cache}개 · 프롬프트 캐시 {len(engine.idle)}개 대화, "
+          f"{engine.used() / 2**30:.1f} / {cli.cache_gb:g} GiB ({engine.cache}) · Ctrl+C로 끝냄", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

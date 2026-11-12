@@ -1,6 +1,8 @@
 # The tiered host for DeepSeek-V4-Flash-0731 with every routed expert original (no codes) against upstream's code with
 # the same weights: upstream's path with the experts taken from the SSD cache, and a decode token on the engine's GPU
 # kernels. Run with SCLM_MODEL=v4.
+import io
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -169,6 +171,61 @@ def test_sequences_keep_their_own_state(models, kernels):
         got_b += feed(b[:, at:at + 5], at)
     assert all(torch.equal(x, y) for x, y in zip(got_a, want_a)) and len(got_a) == 100
     assert all(torch.equal(x, y) for x, y in zip(got_b, want_b)) and len(got_b) == 70
+
+
+@pytest.mark.parametrize("kernels", [False, True])
+def test_a_sequence_comes_back_from_its_rows_and_a_snapshot(models, kernels):
+    """rows() and a snapshot("cpu"), written to a file and read back, give a new sequence what the first one held at
+    the snapshot: the tokens after it give the logits of a sequence fed all of them. The rows are written in parts
+    that end inside a group of 4 and of 16 (27, 70) and the snapshot is inside both (38), with the older part reaching
+    past it. The second sequence, smaller than those rows, parts from the first there and writes its own rows from 38
+    on; a third begins as the second does (to 61) and reads the first one's parts, then the second's over them."""
+    args, _, net, cache = models
+    decoder = host.Host(net, cache, device=DEV, kernels=kernels)
+    g = torch.Generator().manual_seed(11)
+    x, y, z = (torch.randint(0, args.vocab_size, (1, n), generator=g) for n in (70, 52, 30))
+
+    def feed(tokens, pos):  # a token at a time
+        return [decoder.logits(tokens[:, i:i + 1], pos + i).float().clone() for i in range(tokens.size(1))]
+
+    def filed(what):
+        file = io.BytesIO()
+        torch.save(what, file)
+        file.seek(0)
+        return torch.load(file, weights_only=True)
+
+    first = decoder.sequence(128)
+    decoder.switch(first)
+    feed(x[:, :27], 0)
+    parts = [(0, filed(decoder.rows(first, 0, 27)))]
+    feed(x[:, 27:38], 27)
+    mark = filed(decoder.snapshot("cpu"))
+    feed(x[:, 38:], 38)
+    parts.append((27, filed(decoder.rows(first, 27, 70))))
+
+    second = decoder.sequence(64)  # 16 groups of 4: the first one's rows reach the 17th
+    for start, rows in parts:
+        decoder.put(second, start, rows)
+    decoder.switch(second)
+    decoder.restore(mark)
+    got = feed(y[:, :23], 38)
+    later = filed(decoder.snapshot("cpu"))
+    decoder.resize(second, 128)
+    got += feed(y[:, 23:], 61)
+    parts.append((38, filed(decoder.rows(second, 38, 90))))
+
+    third = decoder.sequence(128)
+    for start, rows in parts:
+        decoder.put(third, start, rows)
+    decoder.switch(third)
+    decoder.restore(later)
+    last = feed(z, 61)
+
+    decoder.switch(decoder.sequence(128))
+    want = feed(torch.cat([x[:, :38], y], dim=1), 0)[38:]
+    assert len(got) == len(want) == 52 and all(torch.equal(a, b) for a, b in zip(got, want))
+    want = feed(torch.cat([x[:, :38], y[:, :23], z], dim=1), 0)[61:]
+    assert len(last) == len(want) == 30 and all(torch.equal(a, b) for a, b in zip(last, want))
 
 
 @pytest.mark.parametrize("kernels", [False, True])

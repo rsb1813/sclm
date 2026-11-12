@@ -468,6 +468,21 @@ class Host:
         """A new, empty sequence with room for `capacity` tokens; switch() to it before its first token."""
         return Sequence(self.net, capacity)
 
+    def rows(self, seq: Sequence, start: int, end: int) -> list:
+        """What `seq` holds of the tokens start .. end - 1 beyond a snapshot, in RAM: of every layer that compresses,
+        the key/values and the index keys of the groups those tokens complete. put() gives them back to a sequence."""
+        return [t[0, Sequence.rows(module, 0) + start // module.compress_ratio:Sequence.rows(module, 0) + end // module.compress_ratio].cpu()
+                for module, name, t in seq.state if name == "kv_cache" and module.compress_ratio]
+
+    def put(self, seq: Sequence, start: int, rows: list) -> None:
+        """Writes the rows rows() gave for tokens from `start` on into `seq`, as far as it has room."""
+        held = iter(rows)
+        for module, name, t in seq.state:
+            if name == "kv_cache" and module.compress_ratio:
+                first = Sequence.rows(module, 0) + start // module.compress_ratio
+                part = next(held)[:max(0, t.size(1) - first)]
+                t[0, first:first + part.size(0)].copy_(part)
+
     def clone(self, seq: Sequence, capacity: int) -> Sequence:
         """A new sequence with room for `capacity` tokens that holds what `seq` holds, as far as it has room."""
         new = Sequence(self.net, capacity)
