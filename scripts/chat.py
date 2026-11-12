@@ -120,7 +120,7 @@ class Session:
         is left is done by the next call."""
         if self.redo is not None:
             pos, state = self.redo
-            self.decoder.restore(state, self.pos - pos)
+            self.decoder.restore(state)
             self.pos, self.redo = pos, None
         while self.owed and not stop():
             self._feed(self.owed.pop(0))

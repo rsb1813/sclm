@@ -22,8 +22,7 @@ class Decoder:
     def snapshot(self):
         return len(self.fed)
 
-    def restore(self, kept, back):
-        assert kept == len(self.fed) - back
+    def restore(self, kept):
         del self.fed[kept:]
 
     def logits(self, ids, pos):

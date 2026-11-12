@@ -1,14 +1,17 @@
 # DeepSeek-V4-Flash-0731's attention and block for the tiered host: a decode token runs on the engine's GPU kernels.
+from functools import lru_cache
+
 import torch
 
 from sclm import gpu
 from sclm.upstream import model as m
 
 
+@lru_cache(4)
 def attended(win: int, more: int, device: torch.device) -> torch.Tensor:
-    """[win, win + more] int32. The start of row p lists what a decode token at position p attends to while every
-    compressed position is kept (the last row: any later position): the window slots filled so far, -1 for the
-    others, then the compressed positions in order."""
+    """[win, win + more] int32, one table for every layer and sequence. The start of row p lists what a decode token
+    at position p attends to while every compressed position is kept (the last row: any later position): the window
+    slots filled so far, -1 for the others, then the compressed positions in order."""
     slots = torch.arange(win, device=device, dtype=torch.int32)
     ring = torch.where(slots[None] > slots[:, None], -1, slots[None])
     return torch.cat([ring, (win + torch.arange(more, device=device, dtype=torch.int32)).expand(win, -1)], dim=1).contiguous()

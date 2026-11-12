@@ -132,7 +132,38 @@ def test_restore_takes_the_sequence_back(models, kernels, prefix):
     feed(x[:, :prefix], 0)
     kept = decoder.snapshot()
     feed(x[:, prefix:prefix + dropped], prefix)
-    decoder.restore(kept, dropped)
+    decoder.restore(kept)
     got = feed(x[:, prefix + dropped:], prefix)
     want = feed(torch.cat([x[:, :prefix], x[:, prefix + dropped:]], dim=1), 0)[prefix:]
     assert len(got) == len(want) == more and all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+@pytest.mark.parametrize("kernels", [False, True])
+def test_sequences_keep_their_own_state(models, kernels):
+    """Two sequences fed a few tokens in turn give the logits each gives alone: one of them smaller than the model was
+    built for and made larger half way, the other taken back to a snapshot while the first goes on."""
+    args, _, net, cache = models
+    decoder = host.Host(net, cache, device=DEV, kernels=kernels)
+    g = torch.Generator().manual_seed(7)
+    a, b = (torch.randint(0, args.vocab_size, (1, n), generator=g) for n in (100, 70))
+    dropped = torch.randint(0, args.vocab_size, (1, 21), generator=g)
+
+    def feed(tokens, pos):  # a token at a time
+        return [decoder.logits(tokens[:, i:i + 1], pos + i).float().clone() for i in range(tokens.size(1))]
+
+    want_a, want_b = feed(a, 0), feed(b, 0)
+    first, second = decoder.sequence(48), decoder.sequence(96)
+    got_a, got_b, kept = [], [], None
+    for at in range(0, 100, 5):
+        if at == 45:  # before position 48, where its room ends
+            first = decoder.resize(first, 128)
+        decoder.switch(first)
+        got_a += feed(a[:, at:at + 5], at)
+        decoder.switch(second)
+        if at == 30:
+            kept = decoder.snapshot()
+            feed(dropped, 30)
+            decoder.restore(kept)
+        got_b += feed(b[:, at:at + 5], at)
+    assert all(torch.equal(x, y) for x, y in zip(got_a, want_a)) and len(got_a) == 100
+    assert all(torch.equal(x, y) for x, y in zip(got_b, want_b)) and len(got_b) == 70

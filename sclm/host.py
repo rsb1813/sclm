@@ -362,13 +362,58 @@ def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, c
     return cache
 
 
+class Sequence:
+    """The attention state of one token sequence (V4-Flash-0731), with room for `capacity` tokens: every layer's
+    window ring and compressed key/values, its compressors' groups and the index's keys. Host.switch makes it the
+    sequence the model computes on. Without a capacity: the state the model was built with."""
+
+    def __init__(self, net: "m.Transformer", capacity: int | None = None):
+        self.capacity = capacity or net.max_seq_len
+        self.bound = [None] * len(net.layers)  # each layer's V4Attention.bound: its kernels hold this state's addresses
+        self.state, self.compressors = [], []  # (module, buffer name, tensor); the compressors, which keep a view
+        for layer in net.layers:
+            attn = layer.attn
+            held = [(attn, "kv_cache", attn.window_size)]
+            if attn.compress_ratio:
+                held += [(attn.compressor, "kv_state", None), (attn.compressor, "score_state", None)]
+                self.compressors.append(attn.compressor)
+                if attn.indexer is not None:
+                    comp = attn.indexer.compressor
+                    held += [(attn.indexer, "kv_cache", 0), (comp, "kv_state", None), (comp, "score_state", None)]
+                    self.compressors.append(comp)
+            for module, name, rows in held:
+                t = getattr(module, name)
+                if capacity is not None:
+                    if rows is not None:  # the rows that do not depend on the length, then a row per group of tokens
+                        rows += capacity // attn.compress_ratio if attn.compress_ratio else 0
+                        t = torch.zeros(1, rows, t.size(2), dtype=t.dtype, device=t.device)
+                    else:
+                        t = torch.full_like(t, float("-inf") if name == "score_state" else 0.0)
+                self.state.append((module, name, t))
+
+    def kept(self) -> list:
+        """What a snapshot keeps: every layer's window ring and its compressors' groups."""
+        return [t[:, :module.window_size] if name == "kv_cache" else t for module, name, t in self.state
+                if name != "kv_cache" or isinstance(module, m.Attention)]
+
+    def resized(self, net: "m.Transformer", capacity: int) -> "Sequence":
+        """A sequence with another capacity that holds what this one holds."""
+        new = Sequence(net, capacity)
+        for (_, _, old), (_, _, t) in zip(self.state, new.state):
+            rows = min(old.size(1), t.size(1))
+            t[:, :rows].copy_(old[:, :rows])
+        return new
+
+
 class Host:
     """The tiered model as a decoder: prefill with start_pos 0, then one token per call. kernels: single-token
-    steps use the engine's GPU kernels (by default when the model is on a GPU and they are built)."""
+    steps use the engine's GPU kernels (by default when the model is on a GPU and they are built).
+    V4-Flash-0731: the model computes on one token sequence at a time (`seq`), and switch() changes which."""
 
     def __init__(self, net: "m.Transformer", cache: ssd.ExpertCache, device: str = "cuda", kernels: bool | None = None):
         self.net, self.cache, self.device = net, cache, device
-        self.origin = self.end = 0  # the cache's clock at the start of this sequence and after its last token
+        self.clock = 0  # the cache's clock: tokens computed so far, over every sequence
+        self.seq = Sequence(net) if V4 else None
         on_gpu = torch.device(device).type == "cuda"
         self.kernels = on_gpu and os.path.exists(gpu.DLL) if kernels is None else kernels
         self.first_mix = None  # upstream's identity pre-mix of the first block, made once
@@ -401,41 +446,52 @@ class Host:
             h, pre_mix = layer(h, start_pos, pre_mix, None)
         return net.head(net.norm(layer.hc_pre(h, pre_mix)))
 
-    def snapshot(self) -> list:
-        """The attention state of the sequence at this point (V4-Flash-0731): every layer's window ring and its
-        compressors' groups. restore() takes the sequence back to it."""
-        assert V4
-        kept = []
-        for layer in self.net.layers:
-            attn = layer.attn
-            state = [attn.kv_cache[:, :attn.window_size]]
-            state += [t for mod in attn.modules() if isinstance(mod, m.Compressor) for t in (mod.kv_state, mod.score_state)]
-            kept += [(t, t.clone()) for t in state]
-        return kept
+    def sequence(self, capacity: int) -> Sequence:
+        """A new, empty sequence with room for `capacity` tokens; switch() to it before its first token."""
+        return Sequence(self.net, capacity)
 
-    def restore(self, kept: list, back: int) -> None:
-        """Takes the sequence back to a snapshot() made `back` tokens ago: the next token continues from that
-        position. The compressed positions written since are overwritten as the sequence passes them again; the
-        expert cache's clock keeps running."""
+    def resize(self, seq: Sequence, capacity: int) -> Sequence:
+        """A sequence with room for `capacity` tokens that holds what `seq` holds, in its place if `seq` is in use."""
+        new = seq.resized(self.net, capacity)
+        if seq is self.seq:
+            self.switch(new)
+        return new
+
+    def switch(self, seq: Sequence) -> None:
+        """The model computes on `seq` from now on: its state takes the place of the last sequence's in the modules."""
+        if seq is self.seq:
+            return
+        for i, layer in enumerate(self.net.layers):
+            self.seq.bound[i], layer.attn.bound = layer.attn.bound, seq.bound[i]
+        for module, name, t in seq.state:
+            setattr(module, name, t)
+        for comp in seq.compressors:
+            comp.kv_cache = None  # upstream takes the view again from the state now in place
+        self.seq = seq
+
+    def snapshot(self) -> list:
+        """The attention state of the sequence at this point (V4-Flash-0731). restore() takes the sequence back to it."""
+        return [t.clone() for t in self.seq.kept()]
+
+    def restore(self, kept: list) -> None:
+        """Takes the sequence back to a snapshot(): the next token continues from that position. The compressed
+        positions written since are overwritten as the sequence passes them again."""
         with torch.no_grad():
-            for t, saved in kept:
+            for t, saved in zip(self.seq.kept(), kept):
                 t.copy_(saved)
-        self.origin += back
 
     @torch.inference_mode()
     def logits(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         """Next-token logits [batch, vocab] (fp32) after input_ids, which continue the sequence at start_pos."""
-        if start_pos == 0:  # a new sequence: the cache's clock goes on, its experts are still there
-            self.origin = self.end
-            if V4:
-                # A compressor with overlapping windows keeps the group before the current one, and a prefill shorter
-                # than a group leaves that part as it is: the last sequence's would join the first group's pooling.
-                for module in self.net.modules():
-                    if isinstance(module, m.Compressor):
-                        module.kv_state.zero_()
-                        module.score_state.fill_(float("-inf"))
-        self.cache.token = self.origin + start_pos
-        self.end = self.cache.token + input_ids.size(-1)
+        if start_pos == 0 and V4:
+            # A compressor with overlapping windows keeps the group before the current one, and a prefill shorter
+            # than a group leaves that part as it is: the last sequence's would join the first group's pooling.
+            for module in self.net.modules():
+                if isinstance(module, m.Compressor):
+                    module.kv_state.zero_()
+                    module.score_state.fill_(float("-inf"))
+        self.cache.token = self.clock  # a new sequence finds the cache's experts still there
+        self.clock += input_ids.size(-1)
         gpu.active, m.linear = self.kernels, kernel_linear if self.kernels else _upstream_linear
         try:
             if self.kernels and start_pos and input_ids.numel() == 1:
