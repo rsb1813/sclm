@@ -45,16 +45,16 @@ class ContextFull(Exception):
     """The turn does not fit in what is left of the sequence."""
 
 
-def pick(logits: torch.Tensor, temperature: float, top_p: float) -> int:
+def pick(logits: torch.Tensor, temperature: float, top_p: float, generator: torch.Generator | None = None) -> int:
     """The next token from logits [1, vocab]: the most likely one at temperature 0, else a sample from the smallest
-    set of most likely tokens whose probability reaches top_p."""
+    set of most likely tokens whose probability reaches top_p (drawn from `generator`, if one is given)."""
     if temperature <= 0:
         return int(logits.argmax(-1))
     probs = torch.softmax(logits[0].float() / temperature, dim=-1)
     order = probs.argsort(descending=True)
     kept = probs[order]
     kept[kept.cumsum(0) - kept >= top_p] = 0
-    return int(order[torch.multinomial(kept, 1)])
+    return int(order[torch.multinomial(kept, 1, generator=generator)])
 
 
 def looping(tokens: list, repeats: int = 6, span: int = 96) -> bool:
