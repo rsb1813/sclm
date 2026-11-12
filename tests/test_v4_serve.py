@@ -42,7 +42,12 @@ class Decoder:
     def resize(self, seq, capacity):
         seq.capacity = capacity
 
-    def snapshot(self):
+    def clone(self, seq, capacity):
+        new = Seq(capacity)
+        new.fed = list(seq.fed)
+        return new
+
+    def snapshot(self, device=None):
         return len(self.seq.fed)
 
     def restore(self, kept):
@@ -53,9 +58,9 @@ class Decoder:
             out = self.logits(torch.tensor([[token]]), pos + i)
         return out
 
-    def prefill(self, tokens, pos):
+    def prefill(self, tokens, pos, marks=()):
         self.runs.append(len(tokens))
-        return self.feed(tokens, pos)
+        return self.feed(tokens, pos), {at: at for at in marks}
 
     def logits(self, ids, pos):
         fed = self.seq.fed
@@ -187,7 +192,65 @@ def test_a_long_prompt_goes_in_as_runs_up_to_its_last_token(tok):
     decoder.scripts += [(long, [21, 22]), (short, [23])]
     (_, _, first), (_, _, second) = serve(engine, Job(long, 10, temperature=0.0), Job(short, 10, temperature=0.0))
     assert decoder.runs == [RUN, 700] and first["usage"]["completion_tokens"] == 2 and second["usage"]["completion_tokens"] == 1
-    assert engine.idle[0].seq.fed == long + [21, 22] and engine.idle[0].mark[0] == RUN + 700
+    assert engine.idle[0].seq.fed == long + [21, 22] and sorted(engine.idle[0].marks) == [RUN, RUN + 700]
+
+
+def test_another_question_on_the_same_document_goes_on_from_the_documents_last_run(tok):
+    from scripts.serve import RUN, Job
+
+    engine, decoder = made(tok, context=4 * RUN)
+    document = [11] * (2 * RUN + 700)
+    first, second = document + [12] * 5 + [13], document + [14] * 9 + [15]
+    decoder.scripts += [(first, [21, 22]), (second, [23])]
+    (_, _, one), = serve(engine, Job(first, 10, temperature=0.0))
+    assert decoder.runs == [RUN, RUN, 705] and one["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    (_, _, two), = serve(engine, Job(second, 10, temperature=0.0))
+    # the two prompts part inside the third run: the sequence goes back to the end of the second
+    assert two["usage"]["prompt_tokens_details"]["cached_tokens"] == 2 * RUN and decoder.runs[3:] == [709]
+    assert len(engine.idle) == 1 and engine.idle[0].seq.fed == second + [23]
+    assert sorted(engine.idle[0].marks) == [RUN, 2 * RUN, 2 * RUN + 709]
+
+
+def test_sessions_with_the_same_system_prompt_each_go_on_from_a_copy_of_it(tok):
+    from scripts.serve import RUN, TAIL, Job
+
+    engine, decoder = made(tok, context=8 * RUN)
+    system = [31] * 900
+    one, two, three = (system + [40 + k] * n + [50 + k] for k, n in enumerate((TAIL + 500, 60, 700)))
+    decoder.scripts += [(one, [61]), (two, [62]), (three, [63])]
+    serve(engine, Job(one, 10, temperature=0.0, marks=[900], pins=[900]))
+    first = engine.idle[0]
+    # the second session parts from the first after the system prompt, where the first has a long way behind it
+    (_, _, result), = serve(engine, Job(two, 10, temperature=0.0, marks=[900], pins=[900]))
+    assert result["usage"]["prompt_tokens_details"]["cached_tokens"] == 900
+    assert len(engine.idle) == 2 and first.seq.fed == one + [61] and engine.idle[1].seq.fed == two + [62]
+    # two requests that come together: the second waits for the first to feed what they share, then copies it
+    again = system + [47] * (RUN + 600)
+    a, b = again + [48] * 30 + [58], again + [49] * 30 + [59]
+    decoder.scripts += [(a, [64]), (b, [65])]
+    before = len(decoder.runs)
+    (_, _, ra), (_, _, rb) = serve(engine, Job(a, 10, temperature=0.0, marks=[900], pins=[900]),
+                                   Job(b, 10, temperature=0.0, marks=[900], pins=[900]))
+    assert ra["usage"]["prompt_tokens_details"]["cached_tokens"] == 900
+    assert rb["usage"]["prompt_tokens_details"]["cached_tokens"] == 900 + RUN  # the end of the first one's first run
+    assert decoder.runs[before:] == [RUN, 630, 630] and first.seq.fed == one + [61]
+
+
+def test_a_request_can_ask_for_a_mark_after_a_part_of_a_message(tok):
+    from scripts.serve import request_job
+
+    engine, _ = made(tok)
+    document = "def area(w, h):\n    return w * h\n" * 20
+    body = {"messages": [{"role": "system", "content": "You review code, one finding a line. " * 8},
+                         {"role": "user", "content": [{"type": "text", "text": document, "cache_control": {"type": "ephemeral"}},
+                                                      {"type": "text", "text": "이 함수의 문제를 한 줄로 말해 줘."}]}], "temperature": 0}
+    job = request_job(body, engine, True, "low", 500)
+    plain = request_job({**body, "messages": [body["messages"][0], {"role": "user", "content": document + "이 함수의 문제를 한 줄로 말해 줘."}]},
+                        engine, True, "low", 500)
+    assert job.ids == plain.ids  # the same prompt as without the request for a mark
+    after, turn = sorted(job.pins, reverse=True)  # after the document, and where the user's turn begins
+    assert tok.decode(job.ids[:after]).endswith(document) and tok.decode(job.ids[after:]).startswith("이 함수")
+    assert job.ids[turn] == engine.user and job.marks == sorted(job.pins)
 
 
 def test_stop_strings_and_the_token_limit_end_a_reply(tok):

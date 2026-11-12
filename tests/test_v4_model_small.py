@@ -87,6 +87,9 @@ def agreement(split: int, n: int = 120, change: int | None = None, exact: bool =
         m.linear, m.act_quant, m.fp4_act_quant, m.rotate_activation = patched
 
 
+MARKS = (13, 33, 39, 64, 97, 111)  # positions inside runs: in groups of 4 and 16, on their ends, past the window
+
+
 CASES = [dict(compress_ratios=(0,) * 6), dict(compress_ratios=(0, 0, 4, 4, 4, 0), index_topk=64), dict(compress_ratios=(0, 0, 4, 4, 4, 0)),
          dict(compress_ratios=(0, 0, 16, 16, 16, 0)), {}]
 
@@ -119,6 +122,8 @@ def test_tokens_computed_together_continue_a_sequence_exactly_without_rounding(p
     (window ring, compressed key/values, index keys, the compressors' groups) are those of the tokens one at a
     time. The runs begin and end inside groups of 4 and of 16, cross the window ring (16) and what the index keeps
     (8), start the sequence, follow each other and are followed by single tokens."""
+    from collections import defaultdict
+
     from sclm import gpu
     from sclm.host_v4 import V4Attention
 
@@ -143,18 +148,40 @@ def test_tokens_computed_together_continue_a_sequence_exactly_without_rounding(p
         with torch.device(DEV), torch.no_grad():
             x = torch.randint(0, args.vocab_size, (1, n), generator=torch.Generator(device=DEV).manual_seed(3))
             one, two = make(), make()
-            want = [one(x[:, i:i + 1], i)[1].float() for i in range(n)]
+            theirs, held = dict(one.named_modules()), 0
+
+            def live(mod, after: int) -> dict:  # the rows of each buffer that hold something after so many tokens
+                if isinstance(mod, m.Compressor):  # the groups not yet pooled
+                    rows = after % mod.compress_ratio + (mod.compress_ratio if mod.overlap else 0)
+                    return {"kv_state": rows, "score_state": rows} if rows else {}
+                return {"kv_cache": min(after, mod.window_size)} if isinstance(mod, m.Attention) else {}
+
+            want, states = [], {}
+            for i in range(n):
+                want.append(one(x[:, i:i + 1], i)[1].float())
+                if i + 1 in MARKS:  # the state after i + 1 tokens
+                    states[i + 1] = {(name, buf): getattr(mod, buf)[:, :rows].clone() for name, mod in theirs.items()
+                                     for buf, rows in live(mod, i + 1).items()}
             for start, end in zip(parts, parts[1:]):
-                gpu.together = True
+                gpu.together, gpu.marks = True, ([p for p in MARKS if start < p <= end], defaultdict(dict))
                 try:
                     got = two(x[:, start:end], start)[1].float()
+                    marks = gpu.marks[1]
                 finally:
-                    gpu.together = False
+                    gpu.together, gpu.marks = False, None
                 assert float(F.cosine_similarity(got.flatten(), want[end - 1].flatten(), dim=0)) > 0.999999, (start, end)
+                # the states kept on the way, inside the run, are those the tokens one at a time pass through
+                for at, kept in marks.items():
+                    for name, mod in two.named_modules():
+                        for buf, rows in live(mod, at).items():
+                            a, b = (t.nan_to_num(neginf=-1e9) for t in (states[at][name, buf], kept[mod, buf][:, :rows].to(DEV)))
+                            assert torch.allclose(a, b, rtol=1e-3, atol=1e-3 * float(a.abs().max())), (at, name, buf)
+                            held += 1
+            assert held >= 3 * 14
             for i in range(parts[-1], n):  # upstream's one-token form goes on from the state the runs left
                 got = two(x[:, i:i + 1], i)[1].float()
                 assert float(F.cosine_similarity(got.flatten(), want[i].flatten(), dim=0)) > 0.999999, i
-            theirs, held = dict(one.named_modules()), 0
+            held = 0
             for name, mod in two.named_modules():
                 rows = {}  # the rows of each buffer that hold something: a compressor's are the groups not yet pooled
                 if isinstance(mod, m.Compressor):

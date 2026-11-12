@@ -246,9 +246,9 @@ def test_a_long_run_is_computed_with_the_original_experts_as_upstream_computes_i
         want = [ref(x[:, i:i + 1].to(DEV), i)[1].float() for i in range(110)]
     cos = lambda a, b: float(F.cosine_similarity(a.float().flatten(), b.flatten(), dim=0))  # noqa: E731
     held = dict(cache.held)
-    first = cos(decoder.prefill(x[0, :37].tolist(), 0), want[36])
+    first = cos(decoder.prefill(x[0, :37].tolist(), 0)[0], want[36])
     decoder.PART = 16  # the next run goes in four parts
-    second = cos(decoder.prefill(x[0, 37:98].tolist(), 37), want[97])
+    second = cos(decoder.prefill(x[0, 37:98].tolist(), 37)[0], want[97])
     assert cache.held == held
     after = [cos(decoder.logits(x[:, i:i + 1], i), want[i]) for i in range(98, 110)]
     print("runs:", first, second, "| tokens after: min", min(after), "median", sorted(after)[len(after) // 2])

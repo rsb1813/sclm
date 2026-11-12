@@ -2,11 +2,13 @@
 # One thread computes. Requests that are open together take turns, a few tokens at a time, each in a token sequence of
 # its own; a conversation that comes back with more messages finds its sequence still there and feeds only what is new.
 import argparse
+import bisect
 import contextlib
 import io
 import json
 import os
 import queue
+import re
 import select
 import socket
 import threading
@@ -24,6 +26,10 @@ from sclm import CKPT, CODES
 CHUNK = 4096  # a sequence's room is a multiple of this many tokens
 FEED = 16  # tokens of a prompt fed in one step: the decoder takes them through its layers together
 RUN = 4096  # tokens of a long prompt fed in one step, as a run computed with the original experts (Host.prefill)
+MARKS = 40  # the most positions a conversation can be taken back to (17 MiB of RAM each)
+TAIL = 2048  # a conversation that would lose more tokens than this by being taken back is copied instead, if there is room
+WAIT = 1024  # tokens an open request has yet to feed of what a new prompt begins with that are worth waiting for
+PIN = re.compile("\ue000\\d+\ue001")  # stands in a message's text where the request asks for a mark (cache_control)
 TOOL_CALLS = f"\n\n<{dsml_token}{tool_calls_block_name}"  # what a tool call block begins with in the answer's text
 # OpenAI's reasoning_effort values as the model's (None: no thinking)
 EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
@@ -63,22 +69,46 @@ class Pieces:
 
 
 class Conversation:
-    """A token sequence the decoder holds (`seq`), the tokens fed to it, and `mark`: (position, the decoder's
-    snapshot there) of the state before the last prompt token, where the sequence can be taken back to."""
+    """A token sequence the decoder holds (`seq`), the tokens fed to it, and `marks`: position -> the decoder's
+    snapshot after so many tokens, kept in RAM. The sequence can be taken back to any of them, and a request whose
+    prompt parts from this one's goes on from the last mark before that: this is the prompt cache. Marks are kept
+    where prompts tend to part: where each user turn begins (the first: after the system prompt and the tools), at
+    the end of each run of a long prompt, before the last prompt token (the reply's thinking leaves the context
+    there), and where a request asks for one (`pinned`, with the first turn's)."""
 
     def __init__(self, seq):
-        self.seq, self.ids, self.mark = seq, [], None
+        self.seq, self.ids, self.marks, self.pinned = seq, [], {}, set()
+
+    def keep(self, marks: dict, pins=()) -> None:
+        """Adds marks. Beyond MARKS, the one that leaves the smallest gap goes, but for the first, the last eight
+        and the pinned ones."""
+        self.marks.update(marks)
+        self.pinned |= {at for at in marks if at in pins}
+        while len(self.marks) > MARKS:
+            at = sorted(self.marks)
+            free = [i for i in range(1, len(at) - 8) if at[i] not in self.pinned]
+            if not free:
+                break
+            del self.marks[at[min(free, key=lambda i: at[i + 1] - at[i - 1])]]
+
+    def back(self, at: int) -> None:
+        """Forgets what came after the mark at `at`."""
+        del self.ids[at:]
+        self.marks = {p: kept for p, kept in self.marks.items() if p <= at}
+        self.pinned = {p for p in self.pinned if p <= at}
 
 
 class Job:
     """One request: the prompt's tokens `ids`, then up to max_new tokens of reply, sampled. The engine calls step()
     in turn with the other jobs. What the job produces goes to `events`: ("think" | "answer", text), ("feed", tokens of
     the prompt fed, of how many), and last ("done", result) or ("error", status, message). stop: strings that end the
-    answer; tools: the answer's tool calls are parsed out of it."""
+    answer; tools: the answer's tool calls are parsed out of it. marks: positions of the prompt after which the
+    conversation keeps a mark; pins: those of them it does not give up."""
 
     def __init__(self, ids: list, max_new: int, temperature: float = 1.0, top_p: float = 1.0, stop: tuple = (),
-                 seed: int | None = None, tools: bool = False):
+                 seed: int | None = None, tools: bool = False, marks: tuple = (), pins: tuple = ()):
         self.ids, self.max_new, self.temperature, self.top_p, self.seed = ids, max_new, temperature, top_p, seed
+        self.marks, self.pins = sorted(set(marks) | set(pins)), set(pins)
         self.stops, self.tools = [s for s in stop if s], tools
         self.events, self.cancelled = queue.Queue(), False
         self.conv, self.at, self.reused = None, 0, 0  # set when the engine gives the job a sequence
@@ -98,16 +128,23 @@ class Job:
             return self._end("cancelled")
         self.times.setdefault("start", time.perf_counter())
         if self.at < len(self.ids):
-            last = len(self.ids) - 1  # fed alone, from the mark
-            if self.at == last:
-                self.conv.mark = (self.at, engine.decoder.snapshot())
+            conv, last = self.conv, len(self.ids) - 1  # the last token is fed alone, from a mark
+            if self.at == last and last not in conv.marks:
+                conv.keep({last: engine.decoder.snapshot("cpu")}, self.pins)
             if engine.long and last - self.at >= engine.long:  # a run takes the time of reading every expert once
                 tokens = self.ids[self.at:min(last, self.at + RUN)]
-                self.logits = engine.decoder.prefill(tokens, len(self.conv.ids))
-                self.conv.ids += tokens
+                end = self.at + len(tokens)
+                inside = [at for at in self.marks if self.at < at < end]  # the pinned ones, the last few and the end
+                wanted = [at for at in inside if at in self.pins] + [at for at in inside if at not in self.pins][-6:] + [end]
+                self.logits, kept = engine.decoder.prefill(tokens, self.at, wanted)
+                conv.ids += tokens
+                conv.keep(kept, self.pins)
             else:
-                tokens = self.ids[self.at:min(last, self.at + FEED)] or self.ids[last:]
+                ahead = self.marks[bisect.bisect_right(self.marks, self.at):][:1]  # the next mark: fed up to it
+                tokens = self.ids[self.at:min([last, self.at + FEED] + ahead)] or self.ids[last:]
                 self._feed(engine, tokens)
+                if ahead and len(conv.ids) == ahead[0] < last:
+                    conv.keep({ahead[0]: engine.decoder.snapshot("cpu")}, self.pins)
             self.at += len(tokens)
             self.events.put(("feed", self.at, len(self.ids)))
             return len(tokens)
@@ -193,6 +230,7 @@ class Engine:
         self.tok, self.decoder, self.context, self.slice, self.keep = tok, decoder, context, slice, keep
         self.eos = tok.eos_token_id
         self.think_start, self.think_end = tok.convert_tokens_to_ids("<think>"), tok.convert_tokens_to_ids("</think>")
+        self.user = tok.convert_tokens_to_ids("<｜User｜>")  # where a user turn begins
         self.inbox, self.lock = queue.Queue(), threading.Lock()  # the lock: the tokenizer is used by every thread
         self.active, self.waiting, self.idle = [], [], []  # jobs taking turns, jobs without room yet, conversations kept
         self.stopping, self.long = False, 512
@@ -246,32 +284,47 @@ class Engine:
         return True
 
     def _place(self, job: Job) -> bool:
-        """Gives the job a sequence: the kept conversation that already holds the longest part of its prompt, taken
-        back to its mark if the prompt parts from it after that, or a new one. It has room for the prompt; the reply
-        makes more as it grows (fits). False: no room until a job ends."""
-        ids, best, at = job.ids, None, 0
-        for conv in self.idle:
+        """Gives the job a sequence. The conversation, kept or open, that holds the longest beginning of its prompt up
+        to one of its marks is found: the job goes on in it (a kept one whose tokens the prompt continues, or which
+        loses little by being taken back to the mark), or in a copy of it up to the mark (an open one, or one with
+        much after the mark: another session with the same system prompt), or in a new sequence. It has room for the
+        prompt; the reply makes more as it grows (fits). False: not yet (no room until a job ends, or an open request
+        is still feeding what this prompt begins with)."""
+        ids, best, at, used = job.ids, None, 0, False
+        for conv, busy in [(conv, False) for conv in self.idle] + [(other.conv, True) for other in self.active]:
             n = common(conv.ids, ids)
-            if n == len(conv.ids) and n < len(ids):
+            if not busy and n == len(conv.ids) and n < len(ids):
                 reach = n
             else:
-                reach = conv.mark[0] if conv.mark is not None and conv.mark[0] <= min(n, len(ids) - 1) else 0
+                reach = max((p for p in conv.marks if p <= min(n, len(ids) - 1)), default=0)
             if reach > at:
-                best, at = conv, reach
+                best, at, used = conv, reach, busy
+        for other in self.active:
+            shared = min(common(other.ids, ids), len(ids) - 1)
+            if shared >= at + WAIT and other.at < min(shared, len(other.ids)):
+                return False
         need = min(self.context, -(-(len(ids) + 1) // CHUNK) * CHUNK)
-        extra = need - best.seq.capacity if best is not None else need
-        if extra > 0 and not self._fit(extra, best):
-            return False
-        if best is None:
-            best = Conversation(self.decoder.sequence(need))
-        else:
+        if best is not None and (used or len(best.ids) - at > TAIL) and self.room() >= need and self._fit(need):
+            source, best = best, Conversation(self.decoder.clone(best.seq, need))
+            best.ids = source.ids[:at]
+            best.keep({p: kept for p, kept in source.marks.items() if p <= at}, source.pinned)
+            self.decoder.switch(best.seq)
+            self.decoder.restore(best.marks[at])
+        elif best is not None and not used:
+            extra = need - best.seq.capacity
+            if extra > 0 and not self._fit(extra, best):
+                return False
             self.idle.remove(best)
             self.decoder.switch(best.seq)
             if at < len(best.ids):
-                self.decoder.restore(best.mark[1])
-                del best.ids[at:]
+                self.decoder.restore(best.marks[at])
+                best.back(at)
             if extra > 0:
                 self.decoder.resize(best.seq, need)
+        else:
+            if not self._fit(need):
+                return False
+            best, at = Conversation(self.decoder.sequence(need)), 0
         job.conv, job.at, job.reused = best, at, at
         return True
 
@@ -350,11 +403,18 @@ def request_job(body: dict, engine: Engine, think: bool, effort: str, max_tokens
             raise Refused(400, f"reasoning_effort: one of {', '.join(EFFORTS)}")
         effort = EFFORTS[body["reasoning_effort"]]
         think, effort = think and effort is not None, effort or "low"
-    messages = []
+    messages, pins = [], 0
     for msg in body["messages"]:
         msg = dict(msg)
-        if isinstance(msg.get("content"), list):  # content parts: the text ones
-            msg["content"] = "".join(part.get("text", "") for part in msg["content"] if part.get("type") == "text")
+        if isinstance(msg.get("content"), list):  # content parts: the text ones; a mark is asked for after a part
+            text = ""
+            for part in msg["content"]:
+                text += part.get("text", "") if part.get("type") == "text" else ""
+                if part.get("cache_control"):
+                    text, pins = text + f"\ue000{pins}\ue001", pins + 1
+            msg["content"] = text
+        if msg.pop("cache_control", None) and isinstance(msg.get("content"), str):  # or after the message
+            msg["content"], pins = msg["content"] + f"\ue000{pins}\ue001", pins + 1
         messages.append(msg)
     tools = body.get("tools") if body.get("tool_choice") != "none" else None
     if tools:  # upstream's encoding lists them in the system message
@@ -365,15 +425,24 @@ def request_job(body: dict, engine: Engine, think: bool, effort: str, max_tokens
         text = encode_messages(messages, "thinking" if think else "chat", reasoning_effort=effort)
     except (AssertionError, NotImplementedError, KeyError, TypeError, AttributeError) as e:
         raise Refused(400, f"messages: {type(e).__name__}: {e}")
+    pieces = PIN.split(text)  # the text without the stand-ins, and where they stood
+    text, cuts = "".join(pieces), [sum(len(piece) for piece in pieces[:k + 1]) for k in range(len(pieces) - 1)]
     with engine.lock:
-        ids = engine.tok.encode(text, add_special_tokens=False)
+        if cuts and engine.tok.is_fast:
+            coded = engine.tok(text, add_special_tokens=False, return_offsets_mapping=True)
+            ids, ends = coded["input_ids"], [end for _, end in coded["offset_mapping"]]
+            cuts = [bisect.bisect_right(ends, cut) for cut in cuts]  # the tokens that end by there
+        else:
+            ids, cuts = engine.tok.encode(text, add_special_tokens=False), []
+    turns = [i for i, token in enumerate(ids) if token == engine.user and i >= 32]  # not the start of the prompt itself
+    pins = [at for at in cuts[-8:] + turns[:1] if 0 < at < len(ids)]
     if len(ids) >= engine.context:
         raise Refused(400, f"the prompt has {len(ids)} tokens; the context holds {engine.context}")
     asked = body.get("max_completion_tokens") or body.get("max_tokens") or max_tokens
     stop = body.get("stop") or ()
     temperature, top_p = (1.0 if body.get(k) is None else float(body[k]) for k in ("temperature", "top_p"))
     return Job(ids, min(int(asked), max_tokens, engine.context - len(ids)), temperature, top_p,
-               (stop,) if isinstance(stop, str) else tuple(stop), body.get("seed"), bool(tools))
+               (stop,) if isinstance(stop, str) else tuple(stop), body.get("seed"), bool(tools), turns, pins)
 
 
 class Handler(BaseHTTPRequestHandler):

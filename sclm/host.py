@@ -1,6 +1,7 @@
 # Token-by-token decode on one device: upstream's Transformer with every block resident and its routed experts on two
 # tiers (sclm.tiered). PyTorch hosts the always-on path for now; the engine core computes the RAM tier and reads the SSD tier.
 import os
+from collections import defaultdict
 from functools import lru_cache
 
 import numpy as np
@@ -467,6 +468,14 @@ class Host:
         """A new, empty sequence with room for `capacity` tokens; switch() to it before its first token."""
         return Sequence(self.net, capacity)
 
+    def clone(self, seq: Sequence, capacity: int) -> Sequence:
+        """A new sequence with room for `capacity` tokens that holds what `seq` holds, as far as it has room."""
+        new = Sequence(self.net, capacity)
+        for (_, _, old), (_, _, t) in zip(seq.state, new.state):
+            rows = min(old.size(1), t.size(1))
+            t[:, :rows].copy_(old[:, :rows])
+        return new
+
     def resize(self, seq: Sequence, capacity: int) -> None:
         """Gives `seq` room for `capacity` tokens; what it holds stays. A tensor at a time: the device never holds two
         whole states."""
@@ -575,15 +584,17 @@ class Host:
     WORK = 5 << 29  # device memory a part of that length works in (2.5 GiB), lent by the expert cache meanwhile
 
     @torch.inference_mode()
-    def prefill(self, ids: list, start_pos: int) -> torch.Tensor:
+    def prefill(self, ids: list, start_pos: int, marks: tuple = ()) -> tuple:
         """The logits after the tokens `ids`, which continue the sequence at start_pos (V4-Flash-0731), for a long run
         of them: PART tokens at a time go through each layer as tensors, as upstream computes a prompt, and the MoE
         with the original experts, each read from the checkpoint once for all the tokens routed to it
         (TieredMoE.together). A part takes the time of reading the model's experts, about 22 s, whatever its length;
         below a few hundred tokens feed() is faster. The numbers are upstream's for these tokens, not the tiered
-        model's: the prompt is computed with the original weights. The state is left for any form to go on from."""
+        model's: the prompt is computed with the original weights. The state is left for any form to go on from.
+        marks: positions (tokens of the sequence, past start_pos) after which the state is wanted, as snapshot() gives
+        it; they come back with the logits as {position: snapshot}, kept in RAM."""
         assert V4 and ids
-        net, out = self.net, None
+        net, kept = self.net, {}
         if start_pos == 0:  # as logits(): the last sequence's groups are not this one's
             for module in net.modules():
                 if isinstance(module, m.Compressor):
@@ -602,20 +613,25 @@ class Host:
                     part = torch.tensor([ids[at:at + self.PART]])
                     h = net.embed(part).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1)
                     part = part.to(self.device)
+                    gpu.marks = ([p for p in marks if start_pos + at < p <= start_pos + at + part.size(1)], defaultdict(dict))
                     for layer in net.layers:
                         h = layer.together(h, start_pos + at, part)
+                    for p, parts in gpu.marks[1].items():  # in the order of Sequence.kept
+                        kept[p] = [parts[module, name] for module, name, _ in self.seq.state
+                                   if name != "kv_cache" or isinstance(module, m.Attention)]
                     self.clock += part.size(1)
                 h = layer.hc_head(h[:, -1:], net.hc_head_fn, net.hc_head_scale, net.hc_head_base)
-                return net.head(net.norm(h))
+                return net.head(net.norm(h)), kept
         finally:
-            gpu.together = False
+            gpu.together, gpu.marks = False, None
             if self.cache.n_slots != slots:
                 del h
                 self._resize(slots)
 
-    def snapshot(self) -> list:
-        """The attention state of the sequence at this point (V4-Flash-0731). restore() takes the sequence back to it."""
-        return [t.clone() for t in self.seq.kept()]
+    def snapshot(self, device=None) -> list:
+        """The attention state of the sequence at this point (V4-Flash-0731), kept on `device` (default: the model's):
+        17 MiB with the released model. restore() takes the sequence back to it."""
+        return [t.to(device, copy=True) for t in self.seq.kept()]
 
     def restore(self, kept: list) -> None:
         """Takes the sequence back to a snapshot(): the next token continues from that position. The compressed

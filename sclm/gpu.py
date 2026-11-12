@@ -15,6 +15,9 @@ active = False  # the host turns this on around a forward whose single-token ste
 # the host turns this on around a forward of many tokens that continue a sequence (Host.prefill): attention computes
 # them as tensors (host_v4.V4Attention.together), and the MoE with the original experts (TieredMoE.together)
 together = False
+# with `together`: (positions, {position: {(module, buffer name): tensor}}) of the states to keep on the way, each as
+# the sequence is after so many tokens; None: none
+marks = None
 _lib = None
 
 

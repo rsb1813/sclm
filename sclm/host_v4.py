@@ -42,6 +42,11 @@ class Lane:
         return self.bound[ffn, guess]
 
 
+def marked(start_pos: int, n: int) -> list:
+    """The positions among the n tokens from start_pos after which the state is to be kept (gpu.marks)."""
+    return [] if gpu.marks is None else [at for at in gpu.marks[0] if start_pos < at <= start_pos + n]
+
+
 class V4Attention(m.Attention):
     """upstream Attention; decoding one token with the kernels on, the engine computes the query, the token's
     key/value, the compressed key/value and the index's keys when the token completes a group, the attention itself
@@ -104,6 +109,14 @@ class V4Attention(m.Attention):
         kv, score = comp.wkv(x.float())[0], comp.wgate(x.float())[0] + comp.ape[at % ratio]
         held = start_pos % ratio + (ratio if comp.overlap else 0)  # rows of the state these tokens' groups pool
         kv, score = torch.cat([comp.kv_state[0, :held], kv]), torch.cat([comp.score_state[0, :held], score])
+        for at in marked(start_pos, n):  # the state after `at` tokens: the group under way then, and the one before
+            base, done = held - start_pos % ratio, at // ratio * ratio  # `done`: where that group begins
+            row = held - start_pos  # a position's row of kv and score
+            k, s = comp.kv_state.clone(), comp.score_state.clone()
+            if comp.overlap:
+                k[0, :ratio], s[0, :ratio] = kv[row + done - ratio:row + done], score[row + done - ratio:row + done]
+            k[0, base:base + at - done], s[0, base:base + at - done] = kv[row + done:row + at], score[row + done:row + at]
+            gpu.marks[1][at][comp, "kv_state"], gpu.marks[1][at][comp, "score_state"] = k.cpu(), s.cpu()
         full = kv.size(0) // ratio * ratio  # rows in whole groups
         groups = full // ratio - comp.overlap  # groups completed (with overlap, the first whole one is the one before)
         if groups > 0:
@@ -163,6 +176,10 @@ class V4Attention(m.Attention):
         rows = torch.cat([cache[(start_pos - seen + torch.arange(seen, device=dev)) % win], kv[0]])
         idxs = seen + torch.arange(n, device=dev)[:, None] - torch.arange(win - 1, -1, -1, device=dev)
         idxs = torch.where(idxs < 0, -1, idxs)
+        for at in marked(start_pos, n):  # the window ring after `at` tokens
+            ring, last = self.kv_cache[:, :win].clone(), torch.arange(max(start_pos, at - win), at, device=dev)
+            ring[0, last % win] = kv[0, last - start_pos]
+            gpu.marks[1][at][self, "kv_cache"] = ring.cpu()
         if ratio:
             self.squeeze(self.compressor, x, start_pos, cache[win:])
             count = (pos + 1) // ratio  # the compressed positions each token sees
