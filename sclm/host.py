@@ -342,6 +342,21 @@ def load_checkpoint_(net: "m.Transformer", ckpt: Checkpoint, device: str = "cuda
     net.head = Bf16Head(ckpt.get("head.weight").to(device))
 
 
+def extend_positions_(net: "m.Transformer", args: "m.ModelArgs", positions: int) -> None:
+    """Gives every attention of V4-Flash-0731 rotations for `positions` positions: upstream's table, which the model's
+    max_seq_len only cuts short. A sequence can then be longer than the state the model was built with (Sequence),
+    which is better built small: its memory is not given back whole when it is no longer in use."""
+    tables = {}
+    for layer in net.layers:
+        attn = layer.attn  # as upstream's Attention chooses its table
+        key = (args.original_seq_len, args.compress_rope_theta) if attn.compress_ratio else (0, args.rope_theta)
+        if key not in tables:
+            with torch.device(attn.freqs_cis.device):  # where upstream computes it: the values are the device's
+                tables[key] = m.precompute_freqs_cis.__wrapped__(attn.rope_head_dim, positions, *key, args.rope_factor,
+                                                                 args.beta_fast, args.beta_slow)
+        attn.freqs_cis = tables[key]
+
+
 def attach_tiers_(net: "m.Transformer", args: "m.ModelArgs", ckpt: Checkpoint, codes_dir: str | None, slots: int, lam: float,
                   device: str = "cuda", background: int = 0) -> ssd.ExpertCache:
     """Gives every block its coded experts (codes_dir/layer_NN.safetensors, held in RAM) and the shared cache of

@@ -10,6 +10,7 @@ import torch
 from . import ACT_BLOCK, MODEL
 
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclm_gpu.dll")
+ATTENDED = 2304  # the most positions sparse_attn takes (engine/gpu.cu)
 active = False  # the host turns this on around a forward whose single-token steps should use the kernels
 _lib = None
 

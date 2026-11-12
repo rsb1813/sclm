@@ -196,8 +196,7 @@ class Engine:
         self.inbox, self.lock = queue.Queue(), threading.Lock()  # the lock: the tokenizer is used by every thread
         self.active, self.waiting, self.idle = [], [], []  # jobs taking turns, jobs without room yet, conversations kept
         self.stopping = False
-        # the sequence in use while nothing is served; the state the model was built with (room for `context` tokens)
-        # goes back to the allocator here, and the sequences are made from it
+        # the sequence in use while nothing is served, in place of the state the model was built with
         self.blank = decoder.sequence(128)
         decoder.switch(self.blank)
         self.base = self.reserve = reserve
@@ -511,7 +510,8 @@ def main() -> None:
     ap.add_argument("--guess", type=int, default=3)
     ap.add_argument("--touch", type=int, default=8)
     cli = ap.parse_args()
-    cli.ram_share, cli.max_seq_len = 0.0, cli.context
+    # the model's own state is built small: the sequences are made as requests come
+    cli.ram_share, cli.max_seq_len, cli.positions = 0.0, CHUNK, cli.context
     print("모델을 올리는 중입니다…", flush=True)
     import transformers
 

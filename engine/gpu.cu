@@ -10,6 +10,9 @@
 namespace {
 
 const int SCRATCH = 1 << 16;  // widest vector a call handles
+// most positions a token attends to: the window and every compressed position of a layer that keeps them all
+// (DeepSeek-V4-Flash-0731 at 262,144 tokens: 128 + 2,048)
+const int ATTENDED = 2304;
 const int NORM_MAX = 8192;  // longest vector norm_quant handles (it keeps it in shared memory)
 
 // How the model at hand quantizes (sclm_gpu_set_model). The defaults are DeepSeek-V4.1-Flash's; DeepSeek-V4-Flash-0731
@@ -224,7 +227,7 @@ __device__ __forceinline__ float bf16_at(uint64_t w, int i) { return from_bf16(u
 
 __global__ void sparse_attn_k(const uint16_t* q, const uint16_t* window, const uint16_t* compressed, const int* idx,
                               const float* sink, uint16_t* out, int count, int d, int win, float scale) {
-    __shared__ float p[1024];
+    __shared__ float p[ATTENDED];
     __shared__ float part[4096];  // the output's partial sums: [share of the positions][d]
     const uint16_t* qh = q + size_t(blockIdx.x) * d;
     const int lane = threadIdx.x & 31;
@@ -1115,7 +1118,7 @@ API int sclm_gpu_index_pick(const uint8_t* wb, const uint8_t* sb, const uint16_t
 // out[heads * d] (bf16) = kernel.sparse_attn of one token's q over the `count` positions idx names (see sparse_attn_k).
 API int sclm_gpu_sparse_attn(const uint16_t* q, const uint16_t* window, const uint16_t* compressed, const int* idx,
                              const float* sink, uint16_t* out, int heads, int d, int count, int win, float scale) {
-    if (count > 1024 || d % 4 || d > 4096) return -1;
+    if (count > ATTENDED || d % 4 || d > 4096) return -1;
     sparse_attn_k<<<heads, 1024>>>(q, window, compressed, idx, sink, out, count, d, win, scale);
     return cudaGetLastError();
 }

@@ -75,12 +75,14 @@ def test_lossless_host_gives_upstream_logits(models):
 def test_kernel_decode_follows_upstream(models, synced):
     """synced: before every decode token the host's attention state (window and compressed key/values, the
     compressors' groups, the index's keys) is set to upstream's, so each token is compared from the same state: the
-    window ring wrapping, groups of 4 and 16 completing, the index choosing. Not synced: the two run on their own,
-    and what differs is rounding that the random model magnifies over the tokens."""
+    window ring wrapping, groups of 4 and 16 completing, the index choosing, and the layer without an index attending
+    to more compressed positions than an index keeps. Not synced: the two run on their own, and what differs is
+    rounding that the random model magnifies over the tokens."""
     args, ref, net, cache = models
     decoder = host.Host(net, cache, device=DEV)
     assert decoder.kernels
-    n, split = 90, 20  # past the window (16) and past what the index keeps (8 groups of 4)
+    # past the window (16) and past what the index keeps (8 groups of 4); synced, past 8 groups of 16 as well
+    n, split = 160 if synced else 90, 20
     x = torch.randint(0, args.vocab_size, (1, n), generator=torch.Generator().manual_seed(3))
     outs = {"ref": [], "host": []}
     for name, model in (("ref", ref), ("host", net)):
@@ -190,3 +192,18 @@ def test_the_expert_cache_gives_up_slots_for_the_sequences(models, kernels):
     assert 1 <= fewer < cache.n_slots and cache.store.size(0) == cache.n_slots + args.n_activated_experts
     got += feed(x[:, 40:], 40)
     assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+def test_longer_rotation_tables_let_a_sequence_pass_the_models_own_length(models):
+    args, _, net, cache = models
+    built = [layer.attn.freqs_cis for layer in net.layers]
+    host.extend_positions_(net, args, 4 * args.max_seq_len)
+    for layer, table in zip(net.layers, built):  # upstream's rows, and more of them
+        assert layer.attn.freqs_cis.size(0) == 4 * table.size(0) and torch.equal(layer.attn.freqs_cis[:table.size(0)], table)
+    assert len({id(layer.attn.freqs_cis) for layer in net.layers}) == 2  # one for the layers that compress, one for the others
+    decoder = host.Host(net, cache, device=DEV)
+    x = torch.randint(0, args.vocab_size, (1, args.max_seq_len + 40), generator=torch.Generator().manual_seed(2))
+    want = [decoder.logits(x[:, i:i + 1], i).float().clone() for i in range(args.max_seq_len)]  # in the model's own state
+    decoder.switch(decoder.sequence(2 * args.max_seq_len))
+    got = [decoder.logits(x[:, i:i + 1], i).float().clone() for i in range(x.size(1))]
+    assert all(torch.equal(a, b) for a, b in zip(got, want)) and all(bool(t.isfinite().all()) for t in got[len(want):])

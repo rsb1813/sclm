@@ -47,6 +47,10 @@ class V4Attention(m.Attention):
 
         ratio = self.compress_ratio
         index = self.indexer if ratio else None
+        # the compressed positions a token attends to at most: what the index keeps, or without an index all of them,
+        # up to the last position the rotations reach
+        kept = self.index_topk if index is not None else self.freqs_cis.size(0) // ratio if ratio else 0
+        assert win + kept <= gpu.ATTENDED
         if index is not None:  # the window ring, then the compressed positions the index picks
             picked = torch.arange(win + self.index_topk, device=x.device, dtype=torch.int32)
             pick = gpu.bind("index_pick", index.wq_b.weight, index.wq_b.scale, qr, index.weights_proj.weight, later, later,
@@ -62,7 +66,7 @@ class V4Attention(m.Attention):
                      self.n_local_groups, self.wo_a.fp8.size(0), dim),  # freqs
             pool(self.compressor, cache[win:]) if ratio else None,
             pool(index.compressor, index.kv_cache[0]) if index is not None else None,
-            self.freqs_cis.data_ptr(), cache.data_ptr(), attended(win, self.index_topk, x.device),
+            self.freqs_cis.data_ptr(), cache.data_ptr(), attended(win, kept, x.device),
             pick if index is not None else None, out.view(1, 1, -1))
         return self.bound
 
