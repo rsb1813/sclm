@@ -291,6 +291,60 @@ def test_tokens_fed_together_give_what_they_give_one_by_one(models, start, count
     assert all(torch.equal(t, s) for (_, _, t), s in zip(decoder.seq.state, state))
 
 
+def test_tokens_of_several_sequences_go_through_the_layers_together(models):
+    """step() takes one token of each of several sequences through the layers together. Each sequence's logits, and
+    the state it is left with, are those of the sequence fed alone one token at a time. The sequences are at
+    different positions (groups of 4 and 16 complete in one of them at a time, the window ring wraps, the index
+    starts choosing in the first and the third while the second is past that), one is made larger between two steps,
+    one begins from rows and a snapshot, one joins later and they end one after the other, their order in a step
+    changes, and the sequence in use is one of them or none. Five cache slots: the tokens take each other's slots."""
+    args, _, net, cache = models
+    decoder = host.Host(net, cache, device=DEV)
+    g = torch.Generator().manual_seed(17)
+    texts = [torch.randint(0, args.vocab_size, (1, n), generator=g) for n in (90, 70, 60)]
+
+    def alone(text, start, end):  # in the sequence in use
+        return [decoder.logits(text[:, i:i + 1], i).float().clone() for i in range(start, end)]
+
+    want, states = [], []
+    for n, text in enumerate(texts):
+        seq = decoder.sequence(128)
+        decoder.switch(seq)
+        logits = alone(text, 0, 38)
+        if n == 1:
+            mark, rows = decoder.snapshot("cpu"), decoder.rows(seq, 0, 38)
+        want.append(logits + alone(text, 38, text.size(1)))
+        states.append([t.clone() for _, _, t in seq.state])
+
+    first, second, third, other = decoder.sequence(48), decoder.sequence(128), decoder.sequence(128), decoder.sequence(128)
+    decoder.put(second, 0, rows)
+    decoder.switch(second)
+    decoder.restore(mark)
+    decoder.switch(first)
+    got = [alone(texts[0], 0, 1), want[1][:38], None]
+    at = [1, 38, 5]  # each one's next position
+    for r in range(89):
+        if r == 20:  # the third joins, its first tokens fed alone; it stays the one in use for a while
+            decoder.switch(third)
+            got[2] = alone(texts[2], 0, 5)
+        if r == 40:
+            decoder.switch(other)
+        if at[0] == 45:  # before position 48, where its room ends
+            decoder.resize(first, 128)
+        tokens = [(n, seq) for n, seq in enumerate((first, second, third)) if got[n] is not None and at[n] < texts[n].size(1)]
+        if r % 2:
+            tokens.reverse()
+        logits = decoder.step([(seq, int(texts[n][0, at[n]]), at[n]) for n, seq in tokens])
+        assert len(logits) == len(tokens) == (2 if r < 20 or 32 <= r < 75 else 3 if r < 32 else 1)
+        for (n, _), out in zip(tokens, logits):
+            got[n].append(out.float().clone())
+            at[n] += 1
+    assert decoder.seq is other
+    for n, seq in enumerate((first, second, third)):
+        assert len(got[n]) == len(want[n]) and all(torch.equal(a, b) for a, b in zip(got[n], want[n])), n
+        assert all(torch.equal(t, s) for (_, _, t), s in zip(seq.state, states[n])), n
+
+
 def test_a_long_run_is_computed_with_the_original_experts_as_upstream_computes_it(models):
     """prefill() takes runs of tokens through the layers as tensors, its experts read from the checkpoint for the
     run: upstream's logits for the same tokens (it one at a time), from the sequence's start and from inside it, in

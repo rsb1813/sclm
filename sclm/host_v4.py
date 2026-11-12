@@ -204,12 +204,15 @@ class V4Attention(m.Attention):
             out.append(self.wo_b(o.flatten(2)))
         return torch.cat(out, dim=1)
 
-    def forward(self, x: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor, start_pos: int, bound: tuple | None = None):
+        """bound: the kernels of another sequence than the one in use (bind() while its state was in place), for a
+        decode token of that sequence: they hold its state's addresses, and nothing of the module's own is read."""
         if gpu.together:
             return self.together(x, start_pos)
         if not (gpu.active and x.size(0) * x.size(1) == 1 and start_pos):  # position 0 is upstream's prefill case
+            assert bound is None
             return super().forward(x, start_pos)
-        attn_q, attn_kv, sparse_attn, attn_out, pool, index_pool, freqs, cache, rows, pick, out = self.bound or self.bind(x)
+        attn_q, attn_kv, sparse_attn, attn_out, pool, index_pool, freqs, cache, rows, pick, out = bound or self.bound or self.bind(x)
         rd, win, ratio = self.rope_head_dim, self.window_size, self.compress_ratio
         at_pos = freqs + start_pos * rd * 4  # the position's row: rd / 2 complex64
         token = x.contiguous()
@@ -288,9 +291,10 @@ class V4Block(m.Block):
         ffn_post(y.data_ptr())
         return out
 
-    def start(self, lane: Lane, h: int, start_pos: int, token: int) -> tuple:
+    def start(self, lane: Lane, h: int, start_pos: int, token: int, attn: tuple | None = None) -> tuple:
         """The first half of forward for a lane's token whose stream is at address h: attention, and the MoE as far
-        as it goes without the routing (TieredMoE.begin). Nothing is waited for."""
+        as it goes without the routing (TieredMoE.begin). Nothing is waited for. attn: the attention's kernels of the
+        token's sequence, if that is not the one in use (V4Attention.forward)."""
         attn_mix, attn_in, _, _, _, _, a, f, _ = self.bound or self.bind(lane.out)
         if self not in lane.bound:
             hc, dim, mix = self.hc_mult, lane.out.size(-1), self.shared[2]
@@ -304,7 +308,7 @@ class V4Block(m.Block):
         attn_post, ffn_mix, ffn_in, _ = lane.bound[self]
         attn_mix(h)
         attn_in(h)
-        y = self.attn(a, start_pos).contiguous()
+        y = self.attn(a, start_pos, attn).contiguous()
         attn_post(y.data_ptr(), h)
         ffn_mix()
         ffn_in()

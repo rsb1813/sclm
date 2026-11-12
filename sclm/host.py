@@ -566,34 +566,73 @@ class Host:
                 for i, token in enumerate(ids):
                     out = self.logits(torch.tensor([[token]]), start_pos + i)
                 return out
+        for at in range(0, len(ids), self.LANES):
+            part = ids[at:at + self.LANES]
+            out = self._together([(token, start_pos + at + k, None) for k, token in enumerate(part)])[-1]
+        return out if not ids else self._head(out)
+
+    def _head(self, out: torch.Tensor) -> torch.Tensor:
+        """The logits of a token from its stream after the last block (a lane's `out`)."""
+        net = self.net
+        return net.head(net.norm(net.layers[-1].hc_head(out.view(1, 1, net.hc_mult, -1), net.hc_head_fn, net.hc_head_scale, net.hc_head_base)))
+
+    def _together(self, tokens: list) -> list:
+        """Takes up to LANES tokens through the layers together, each in a lane (host_v4.Lane): (token id, position,
+        its sequence's attention kernels; None: the sequence in use, which the tokens then continue in this order).
+        Returns each token's stream after the last block, which holds until the lanes' next tokens."""
         net, layers = self.net, self.net.layers
+        lanes = self._lanes()[:len(tokens)]
+        gpu.active, m.linear = True, kernel_linear
+        try:
+            for k, (lane, (token, _, _)) in enumerate(zip(lanes, tokens)):
+                lane.token = self.clock + k
+                lane.h = net.embed(torch.tensor([[token]])).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1).contiguous()
+            self.clock += len(tokens)
+            begun = [layers[0].start(lane, lane.h.data_ptr(), pos, token, attn and attn[0])
+                     for lane, (token, pos, attn) in zip(lanes, tokens)]
+            for i, layer in enumerate(layers):
+                layer.ffn.read_for(lanes)
+                for k, (lane, (token, pos, attn)) in enumerate(zip(lanes, tokens)):
+                    layer.end(lane, begun[k])
+                    if i + 1 < len(layers):
+                        begun[k] = layers[i + 1].start(lane, lane.out.data_ptr(), pos, token, attn and attn[i + 1])
+            return [lane.out for lane in lanes]
+        finally:
+            gpu.active, m.linear = False, _upstream_linear
+
+    def _lanes(self) -> list:
         if not self.lanes:
             from sclm.host_v4 import Lane
 
-            self.lanes = [Lane(k + 1, net.hc_mult, net.embed.weight.size(1), layers[0].ffn.gate.topk, self.device)
+            net = self.net
+            self.lanes = [Lane(k + 1, net.hc_mult, net.embed.weight.size(1), net.layers[0].ffn.gate.topk, self.device)
                           for k in range(self.LANES)]
-        gpu.active, m.linear = True, kernel_linear
+        return self.lanes
+
+    def attention(self, seq: Sequence) -> list:
+        """Every layer's attention kernels with `seq`'s state bound (V4Attention.bind): made while that state is in
+        the modules, at the sequence's first such use and again after a resize. They hold the state's addresses."""
+        layers = self.net.layers
+        if seq is not self.seq and all(bound is not None for bound in seq.bound):
+            return seq.bound
+        was, like = self.seq, self._lanes()[0].out
+        self.switch(seq)
         try:
-            for at in range(0, len(ids), self.LANES):
-                part = ids[at:at + self.LANES]
-                lanes, pos = self.lanes[:len(part)], start_pos + at
-                for k, (lane, token) in enumerate(zip(lanes, part)):
-                    lane.token = self.clock + k
-                    lane.h = net.embed(torch.tensor([[token]])).to(self.device).unsqueeze(2).repeat(1, 1, net.hc_mult, 1).contiguous()
-                self.clock += len(part)
-                begun = [layers[0].start(lane, lane.h.data_ptr(), pos + k, part[k]) for k, lane in enumerate(lanes)]
-                for i, layer in enumerate(layers):
-                    layer.ffn.read_for(lanes)
-                    for k, lane in enumerate(lanes):
-                        layer.end(lane, begun[k])
-                        if i + 1 < len(layers):
-                            begun[k] = layers[i + 1].start(lane, lane.out.data_ptr(), pos + k, part[k])
-                out = lanes[-1].out.view(1, 1, net.hc_mult, -1)
-            if not ids:
-                return out
-            return net.head(net.norm(layers[-1].hc_head(out, net.hc_head_fn, net.hc_head_scale, net.hc_head_base)))
+            return [layer.attn.bound or layer.attn.bind(like) for layer in layers]
         finally:
-            gpu.active, m.linear = False, _upstream_linear
+            self.switch(was)  # which leaves the kernels with `seq`
+
+    @torch.inference_mode()
+    def step(self, tokens: list) -> list:
+        """One more token for each of several sequences (V4-Flash-0731, with the kernels): (sequence, token id, its
+        position, past 0) of up to LANES different sequences. Returns the logits after each. The tokens go through the
+        layers together as feed()'s do, to the result each gives alone: while the CPU computes one token's tier the
+        device computes the other tokens' attention and experts, and a layer's experts are read for all of them when
+        the first one enters it. Whichever sequence is in use stays in use."""
+        assert V4 and self.kernels and 0 < len(tokens) <= self.LANES and all(pos > 0 for _, _, pos in tokens)
+        assert len({id(seq) for seq, _, _ in tokens}) == len(tokens), "a sequence takes one token a step"
+        outs = self._together([(token, pos, self.attention(seq)) for seq, token, pos in tokens])
+        return [self._head(out) for out in outs]
 
     PART = 4096  # tokens prefill() takes through the layers at a time
     WORK = 5 << 29  # device memory a part of that length works in (2.5 GiB), lent by the expert cache meanwhile

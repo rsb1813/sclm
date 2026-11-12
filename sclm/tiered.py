@@ -138,7 +138,10 @@ class TieredMoE(nn.Module):
         if lane is not None and any(self.layer_id * cache.n_experts + ids[k] not in cache.held for k in ssd):
             # an expert is about to be copied into a slot: the kernels queued for the tokens before, which read the
             # slots as they were, come first
+            t = perf_counter()
             torch.cuda.synchronize()
+            stats["sync_s"] += perf_counter() - t
+            stats["syncs"] += 1
         slots, pending = cache.request(self.layer_id, [ids[k] for k in ssd], at, wait)
         if not final:  # lossy: the token goes on without the light experts that are not in the cache yet
             ssd, slots = [k for k, s in zip(ssd, slots) if s is not None], [s for s in slots if s is not None]
