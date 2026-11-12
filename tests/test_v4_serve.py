@@ -218,7 +218,7 @@ def test_a_long_prompt_goes_in_as_runs_up_to_its_last_token(tok, tmp_path):
 
 
 def test_another_question_on_the_same_document_goes_on_from_the_documents_last_run(tok, tmp_path):
-    from scripts.serve import RUN, Job
+    from scripts.serve import PIECE, RUN, Job
 
     engine, decoder = made(tok, tmp_path, context=4 * RUN)
     document = [11] * (2 * RUN + 700)
@@ -232,6 +232,9 @@ def test_another_question_on_the_same_document_goes_on_from_the_documents_last_r
     # the first question's conversation had little after that mark: the second one's takes its place
     assert len(engine.idle) == 1 == folders(engine) and decoder.made[1].fed == engine.idle[0].ids == second + [23]
     assert sorted(engine.idle[0].marks) == [RUN, 2 * RUN, 2 * RUN + 709, 2 * RUN + 711]
+    # its rows: the first question's file up to the mark, as a link, and its own from there
+    assert PIECE == 2 * RUN and [piece[:2] for piece in engine.idle[0].chunks] == [[0, PIECE], [PIECE, 2 * RUN + 711]]
+    assert sorted(os.stat(os.path.join(engine.idle[0].home, name)).st_nlink for _, _, name in engine.idle[0].chunks) == [1, 1]
 
 
 def test_the_prompt_cache_outlives_the_server(tok, tmp_path):
@@ -405,38 +408,45 @@ def test_stop_strings_and_the_token_limit_end_a_reply(tok, tmp_path):
     assert cut[1] == cut[2]["content"] == tok.decode(reply[:3])
 
 
-def test_a_tool_call_is_parsed_out_of_the_answer(tok, tmp_path):
+@pytest.mark.parametrize("think", [False, True])
+def test_a_tool_call_is_parsed_out_of_the_answer(tok, tmp_path, think):
     import sclm.upstream  # noqa: F401
     from encoding_dsv4 import encode_messages
     from scripts.serve import request_job
 
     enc = lambda text: tok.encode(text, add_special_tokens=False)  # noqa: E731
     engine, decoder = made(tok, tmp_path)
+    mode, switch = ("thinking", {"type": "enabled"}) if think else ("chat", {"type": "disabled"})
     tools = [{"type": "function", "function": {"name": "get_weather", "description": "Weather of a city.", "parameters": {
         "type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}]
     messages = [{"role": "user", "content": "서울 날씨 알려 줘."}]
     call = {"type": "function", "function": {"name": "get_weather", "arguments": json.dumps({"city": "Seoul", "days": 2})}}
-    said = {"role": "assistant", "content": "확인해 보겠습니다.", "tool_calls": [call]}
+    said = {"role": "assistant", "content": "확인해 보겠습니다.", "tool_calls": [call],
+            **({"reasoning_content": "The weather tool gives this."} if think else {})}
     # upstream's own text for the assistant's turn: what follows the prompt in the encoding of the conversation with it
     system = {"role": "system", "content": "", "tools": tools}
-    prompt = encode_messages([system] + messages, "chat")
-    text = encode_messages([system] + messages + [said], "chat")
+    prompt = encode_messages([system] + messages, mode)
+    text = encode_messages([system] + messages + [said], mode)
     assert text.startswith(prompt)
-    job = request_job({"messages": messages, "tools": tools, "temperature": 0, "thinking": {"type": "disabled"}}, engine, True, "low", 500)
+    job = request_job({"messages": messages, "tools": tools, "temperature": 0, "thinking": switch}, engine, True, "low", 500)
     assert job.ids == enc(prompt)
-    decoder.scripts.append((list(job.ids), enc(text[len(prompt):])[:-1]))  # without the end-of-turn token
-    _, streamed, result = serve(engine, job)[0]
+    reply = enc(text[len(prompt):])[:-1]  # without the end-of-turn token
+    decoder.scripts.append((list(job.ids), reply))
+    thought, streamed, result = serve(engine, job)[0]
     assert streamed == result["content"] == "확인해 보겠습니다." and result["finish_reason"] == "tool_calls"
+    assert thought == result["reasoning_content"] == said.get("reasoning_content", "")
     (got,) = result["tool_calls"]
     assert got["id"].startswith("call_") and got["function"]["name"] == "get_weather"
     assert json.loads(got["function"]["arguments"]) == {"city": "Seoul", "days": 2}
-    # the next request carries the call and its result back: the sequence goes on from what it holds
+    # the next request carries the call (with its thinking, which upstream keeps before a tool's result) and the
+    # result back: it goes on from the end of the reply
     messages += [{**said, "tool_calls": [got]}, {"role": "tool", "tool_call_id": got["id"], "content": "맑음, 3도"}]
-    job = request_job({"messages": messages, "tools": tools, "temperature": 0, "thinking": {"type": "disabled"}}, engine, True, "low", 500)
-    decoder.scripts.append((list(job.ids), enc("맑고 3도입니다.")))
+    job = request_job({"messages": messages, "tools": tools, "temperature": 0, "thinking": switch}, engine, True, "low", 500)
+    thinking = enc("Clear, three degrees.") + [tok.convert_tokens_to_ids("</think>")] if think else []
+    decoder.scripts.append((list(job.ids), thinking + enc("맑고 3도입니다.")))
     _, streamed, result = serve(engine, job)[0]
     assert streamed == "맑고 3도입니다." and result["tool_calls"] == [] and result["finish_reason"] == "stop"
-    assert result["usage"]["prompt_tokens_details"]["cached_tokens"] > len(enc(prompt))
+    assert result["usage"]["prompt_tokens_details"]["cached_tokens"] == len(enc(prompt)) + len(reply)
 
 
 def test_the_http_layer_answers_as_the_openai_api_does(tok, tmp_path):

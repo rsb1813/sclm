@@ -30,6 +30,7 @@ FEED = 16  # tokens of a prompt fed in one step: the decoder takes them through 
 RUN = 4096  # tokens of a long prompt fed in one step, as a run computed with the original experts (Host.prefill)
 MARKS = 40  # the most positions a conversation can be taken back to (a file of 17 MiB each)
 TAIL = 2048  # a kept conversation with at most this many tokens after the mark a request goes on from is replaced by it
+PIECE = 8192  # tokens whose rows go in one file (55 MiB): a request reads and links the files up to its mark, not all
 FORMAT = 1  # of what a conversation's folder holds: in the cache folder's name
 WAIT = 1024  # tokens an open request has yet to feed of what a new prompt begins with that are worth waiting for
 PIN = re.compile("\ue000\\d+\ue001")  # stands in a message's text where the request asks for a mark (cache_control)
@@ -89,8 +90,8 @@ class Conversation:
     tokens. A request whose prompt begins as this conversation does goes on from the last mark before the two part:
     this is the prompt cache. Marks are kept where prompts tend to part: where each user turn begins (the first: after
     the system prompt and the tools), at the end of each run of a long prompt, before the last prompt token (the
-    reply's thinking leaves the context there), after a reply without thinking, and where a request asks for one
-    (`pinned`, with the first turn's).
+    reply's thinking leaves the context there), at the conversation's end, and where a request asks for one (`pinned`,
+    with the first turn's).
     A folder is written while its request is open and is whole once it has meta.json, written last; from then on
     nothing in it changes. A request that goes on from it gets a folder of its own that links to its files."""
 
@@ -158,11 +159,12 @@ class Conversation:
 
     def flush(self, decoder) -> None:
         """Writes what is not on disk yet: the rows of the tokens since `saved`, the tokens, and last the list."""
-        if len(self.ids) > self.saved:
-            name = f"rows_{self.saved}_{len(self.ids)}_{uuid.uuid4().hex[:8]}.pt"
-            save(decoder.rows(self.seq, self.saved, len(self.ids)), os.path.join(self.home, name))
-            self.chunks.append([self.saved, len(self.ids), name])
-            self.saved = len(self.ids)
+        while len(self.ids) > self.saved:  # a file ends where a piece does
+            end = min(len(self.ids), (self.saved // PIECE + 1) * PIECE)
+            name = f"rows_{self.saved}_{end}_{uuid.uuid4().hex[:8]}.pt"
+            save(decoder.rows(self.seq, self.saved, end), os.path.join(self.home, name))
+            self.chunks.append([self.saved, end, name])
+            self.saved = end
         save(torch.tensor(self.ids, dtype=torch.int32), os.path.join(self.home, "ids.pt"))
         with open(os.path.join(self.home, "meta.tmp"), "w", encoding="utf-8") as f:
             json.dump({"marks": sorted(self.marks), "pinned": sorted(self.pinned), "chunks": self.chunks, "saved": self.saved}, f)
@@ -465,8 +467,9 @@ class Engine:
         if keep and self.budget and len(conv.ids) > job.reused:
             try:
                 self.decoder.switch(conv.seq)
-                if job.kind is not None and job.ids[-1] != self.think_start and len(conv.ids) not in conv.marks:
-                    conv.keep({len(conv.ids): self.decoder.snapshot("cpu")})  # a reply without thinking: the next turn goes on here
+                if len(conv.ids) not in conv.marks:  # a prompt that continues all of it goes on from its end: a reply
+                    # without thinking, one whose thinking comes back (a tool call's), a prompt cut off while it was fed
+                    conv.keep({len(conv.ids): self.decoder.snapshot("cpu")})
                 conv.flush(self.decoder)
                 kept = True
             except Exception as e:
@@ -718,8 +721,10 @@ def main() -> None:
     transformers.logging.set_verbosity_error()  # the tokenizer's note about a model type it does not know
     with contextlib.redirect_stdout(io.StringIO()):  # the loader's own progress lines
         tok, cache, decoder, info = load_runtime(cli, background=28)
-    engine = Engine(tok, decoder, cli.context, os.path.join(cli.cache_dir, f"{os.path.basename(cli.ckpt)}-{os.path.basename(cli.codes or 'none')}-{FORMAT}"),
-                    cli.slice, cli.cache_gb, min(cli.reserve, cli.context))
+    # a folder per model, codes and lossy setting: what one of them computed is not another's beginning
+    lossy = (f"-ws{cli.wait_share:g}" if cli.wait_share else "") + (f"-topk{cli.topk}" if cli.topk else "")
+    folder = f"{os.path.basename(cli.ckpt)}-{os.path.basename(cli.codes or 'none')}{lossy}-{FORMAT}"
+    engine = Engine(tok, decoder, cli.context, os.path.join(cli.cache_dir, folder), cli.slice, cli.cache_gb, min(cli.reserve, cli.context))
     engine.long = cli.long
     server = ThreadingHTTPServer((cli.host, cli.port), Handler)
     server.daemon_threads = True
