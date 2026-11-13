@@ -19,3 +19,4 @@ data/v4/*
 *.npz
 *.npy
 .claude/worktrees/
+sclmd/
